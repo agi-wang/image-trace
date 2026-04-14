@@ -20,12 +20,9 @@ export default function Dashboard() {
   const loadProjects = useCallback(async () => {
     setLoading(true);
     try {
-      console.log("开始加载项目列表...");
       const data = await getProjects();
-      console.log("项目列表加载成功:", data);
       setProjects(data);
     } catch (error) {
-      console.error("加载项目列表失败:", error);
       const err = error as APIError;
       toast({
         title: t("common.loadFailed"),

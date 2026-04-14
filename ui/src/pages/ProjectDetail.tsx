@@ -8,20 +8,15 @@ import {
   smartCompare as smartCompareApi,
   SmartCompareResult as SmartCompareResultType,
   getComparisonResults,
-  visualizeMatch,
   getPairwiseMatrix,
   getAnalysisRuns,
   getAnalysisRunDetail,
-  getSystemInfo,
-  getFeatureStatus,
   type Project,
   type Image,
   type AnalysisResult,
   type HashType,
   type AnalysisRun,
   type PairwiseMatrixResult,
-  type SystemInfo,
-  type FeatureStatus,
 } from "@/lib/api";
 import { copyErrorToClipboard, APIError } from "@/lib/errorHandler";
 import { ImageUploadZone } from "@/components/ImageUploadZone";
@@ -39,6 +34,23 @@ import { useToast } from "@/hooks/use-toast";
 import { ArrowLeft, Loader2, Image as ImageIcon, RefreshCw, Copy, FileText, Search, ChevronDown, ChevronUp } from "lucide-react";
 import { SmartCompareResultView } from "@/components/SmartCompareResult";
 
+const ALGORITHM_LABELS: Record<string, string> = {
+  phash: "pHash",
+  dhash: "dHash",
+  ahash: "aHash",
+  whash: "wHash",
+  colorhash: "ColorHash",
+  orb: "ORB",
+  brisk: "BRISK",
+  sift: "SIFT",
+  akaze: "AKAZE",
+  kaze: "KAZE",
+  ssim: "SSIM",
+  histogram: "Histogram",
+  template: "Template",
+  auto: "Auto (Hybrid)",
+};
+
 export default function ProjectDetail() {
   const { projectId } = useParams<{ projectId: string }>();
   const navigate = useNavigate();
@@ -49,10 +61,7 @@ export default function ProjectDetail() {
   const [images, setImages] = useState<Image[]>([]);
   const [compareResult, setCompareResult] = useState<AnalysisResult | null>(null);
   const [smartResult, setSmartResult] = useState<SmartCompareResultType | null>(null);
-  const [prefetching, setPrefetching] = useState(false);
   const [matchPair, setMatchPair] = useState<{ aId: number; bId: number; aName: string; bName: string } | null>(null);
-  const [matchLoadingGroup, setMatchLoadingGroup] = useState<number | null>(null);
-  const [lastAlgo, setLastAlgo] = useState<HashType>("phash");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [matchAlgo, setMatchAlgo] = useState<HashType>("orb");
   const [runs, setRuns] = useState<AnalysisRun[]>([]);
@@ -61,12 +70,32 @@ export default function ProjectDetail() {
   const [analyzing, setAnalyzing] = useState(false);
   const [smartComparing, setSmartComparing] = useState(false);
   const [pairwiseData, setPairwiseData] = useState<PairwiseMatrixResult | null>(null);
-  const [allPairwise, setAllPairwise] = useState<Record<string, PairwiseMatrixResult>>({});
-  const [selectedAlgo, setSelectedAlgo] = useState<HashType>("phash");
   const [loadingPairwise, setLoadingPairwise] = useState(false);
-  const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
-  const [featureStatus, setFeatureStatus] = useState<FeatureStatus | null>(null);
   const locale = i18n.language?.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
+
+  const showErrorToast = useCallback((err: APIError, title: string) => {
+    toast({
+      title,
+      description: err.message,
+      variant: "destructive",
+      action: (
+        <Button
+          variant="secondary"
+          size="sm"
+          className="bg-white/10 hover:bg-white/20 text-white border-white/20"
+          onClick={async () => {
+            const success = await copyErrorToClipboard(err);
+            if (success) {
+              toast({ title: t("project.copyDetail") });
+            }
+          }}
+        >
+          <Copy className="h-3 w-3 mr-1" />
+          {t("common.copy")}
+        </Button>
+      ),
+    });
+  }, [t, toast]);
 
   const loadProject = useCallback(async () => {
     if (!projectId) return;
@@ -80,43 +109,24 @@ export default function ProjectDetail() {
       setProject(projectData);
       setImages(imagesData);
     } catch (error) {
-      const err = error as APIError;
-      toast({
-        title: t("project.loadFailed"),
-        description: err.message,
-        variant: "destructive",
-        action: (
-          <Button
-            variant="secondary"
-            size="sm"
-            className="bg-white/10 hover:bg-white/20 text-white border-white/20"
-            onClick={async () => {
-              const success = await copyErrorToClipboard(err);
-              if (success) {
-                toast({ title: t("project.copyDetail") });
-              }
-            }}
-          >
-            <Copy className="h-3 w-3 mr-1" />
-            {t("common.copy")}
-          </Button>
-        ),
-      });
+      showErrorToast(error as APIError, t("project.loadFailed"));
     } finally {
       setLoading(false);
     }
-  }, [projectId, t, toast]);
+  }, [projectId, showErrorToast, t]);
 
   const prefetchResult = useCallback(async () => {
     if (!projectId) return;
-    setPrefetching(true);
     try {
       const res = await getComparisonResults(projectId);
       setCompareResult(res);
+      const matrix = await getPairwiseMatrix(projectId, "orb");
+      setPairwiseData(matrix);
+      setMatchAlgo("orb");
     } catch {
       // 忽略拉取失败，保持静默
     } finally {
-      setPrefetching(false);
+      // no-op
     }
   }, [projectId]);
 
@@ -137,11 +147,6 @@ export default function ProjectDetail() {
     loadProject();
     prefetchResult();
     loadRuns();
-    // Load system info and feature status
-    getSystemInfo().then(setSystemInfo).catch(() => { });
-    if (projectId) {
-      getFeatureStatus(projectId).then(setFeatureStatus).catch(() => { });
-    }
   }, [loadProject, prefetchResult, loadRuns, projectId]);
 
   const handleImagesUploaded = (uploadedImages: Image[]) => {
@@ -154,88 +159,70 @@ export default function ProjectDetail() {
     loadProject();
   };
 
-  const getAlgorithmLabel = (algo: HashType) => {
-    const labels: Record<string, string> = {
-      phash: "pHash",
-      dhash: "dHash",
-      ahash: "aHash",
-      whash: "wHash",
-      colorhash: "ColorHash",
-      orb: "ORB",
-      brisk: "BRISK",
-      sift: "SIFT",
-      akaze: "AKAZE",
-      kaze: "KAZE",
-      ssim: "SSIM",
-      histogram: "Histogram",
-      template: "Template",
-      auto: "Auto (Hybrid)",
-    };
-    return labels[algo] || algo;
-  };
+  const descriptorMatchAlgo = useCallback((algo: HashType): HashType => {
+    return ["sift", "orb", "brisk", "akaze", "kaze"].includes(algo) ? algo : "orb";
+  }, []);
 
-  const ALL_ALGOS: HashType[] = ["phash", "dhash", "ahash", "whash", "ssim", "histogram", "sift", "orb", "brisk", "akaze", "kaze"];
+  const loadPairwiseForAlgo = useCallback(async (algo: HashType) => {
+    if (!projectId) return;
+    setLoadingPairwise(true);
+    try {
+      const data = await getPairwiseMatrix(projectId, algo);
+      setPairwiseData(data);
+    } catch {
+      setPairwiseData(null);
+    } finally {
+      setLoadingPairwise(false);
+    }
+    setMatchAlgo(descriptorMatchAlgo(algo));
+  }, [descriptorMatchAlgo, projectId]);
 
-  const handleAnalyze = async (algo: HashType, rotationInvariant: boolean = false) => {
+  const handleAnalyze = useCallback(async (algo: HashType, rotationInvariant: boolean = false) => {
     if (!projectId) return;
     setAnalyzing(true);
     try {
-      // Run analysis with auto to get grouping result
-      const res = await analyzeImages(projectId, "auto", 0.85, rotationInvariant);
+      const res = await analyzeImages(projectId, algo, 0.85, rotationInvariant);
       setCompareResult(res);
-      setLastAlgo("auto");
-
-      // Fetch ALL pairwise matrices in parallel
-      setLoadingPairwise(true);
-      const results: Record<string, PairwiseMatrixResult> = {};
-      const promises = ALL_ALGOS.map(async (a) => {
-        try {
-          const data = await getPairwiseMatrix(projectId, a);
-          results[a] = data;
-        } catch {
-          // skip failed
-        }
-      });
-      await Promise.all(promises);
-      setAllPairwise(results);
-      // Set first available as active
-      const firstAlgo = ALL_ALGOS.find(a => results[a]) || "phash";
-      setSelectedAlgo(firstAlgo);
-      setPairwiseData(results[firstAlgo] || null);
-      setLoadingPairwise(false);
-
-      // Refresh feature status
-      getFeatureStatus(projectId).then(setFeatureStatus).catch(() => { });
+      await loadPairwiseForAlgo(algo);
 
       toast({ title: t("project.analyzeSuccess"), description: t("project.analyzeSuccessDesc", { total: res.total_images, groups: res.groups.length }) });
       loadRuns();
     } catch (error) {
-      const err = error as APIError;
-      toast({
-        title: t("project.analyzeFailed"),
-        description: err.message,
-        variant: "destructive",
-        action: (
-          <Button
-            variant="secondary"
-            size="sm"
-            className="bg-white/10 hover:bg-white/20 text-white border-white/20"
-            onClick={async () => {
-              const success = await copyErrorToClipboard(err);
-              if (success) {
-                toast({ title: t("project.copyDetail") });
-              }
-            }}
-          >
-            <Copy className="h-3 w-3 mr-1" />
-            {t("common.copy")}
-          </Button>
-        ),
-      });
+      showErrorToast(error as APIError, t("project.analyzeFailed"));
     } finally {
       setAnalyzing(false);
     }
-  };
+  }, [loadPairwiseForAlgo, projectId, showErrorToast, t, toast, loadRuns]);
+
+  const handleSmartCompare = useCallback(async () => {
+    if (!projectId) return;
+    setSmartComparing(true);
+    setSmartResult(null);
+    try {
+      const result = await smartCompareApi(projectId);
+      setSmartResult(result);
+      if (result.features_pending) {
+        toast({ title: "特征计算中", description: result.summary });
+      } else {
+        toast({ title: "查重完成", description: result.summary });
+      }
+    } catch (error) {
+      const err = error as APIError;
+      toast({ title: "查重失败", description: err.message, variant: "destructive" });
+    } finally {
+      setSmartComparing(false);
+    }
+  }, [projectId, toast]);
+
+  const handleSmartCompareRetry = useCallback(async () => {
+    if (!projectId) return;
+    setSmartComparing(true);
+    try {
+      const r = await smartCompareApi(projectId);
+      setSmartResult(r);
+    } catch { /* ignore */ }
+    setSmartComparing(false);
+  }, [projectId]);
 
   const similarityMatrix = useMemo(() => {
     if (!compareResult) return null;
@@ -358,7 +345,7 @@ export default function ProjectDetail() {
                           const { result } = await getAnalysisRunDetail(r.id);
                           if (result) {
                             setCompareResult(result);
-                            setLastAlgo(r.hash_type);
+                            await loadPairwiseForAlgo(r.hash_type);
                             toast({ title: t("project.runLoaded"), description: t("project.runId", { id: r.id }) });
                           } else {
                             toast({ title: t("project.runNoResult"), description: t("project.runId", { id: r.id }), variant: "destructive" });
@@ -452,38 +439,29 @@ export default function ProjectDetail() {
 
         {/* ─── Smart Compare: 一键智能查重 ─── */}
         {images.length > 1 && (
+          <AnalysisPanel
+            hasImages={images.length > 1}
+            loading={analyzing}
+            onAnalyze={handleAnalyze}
+          />
+        )}
+
+        {/* ─── Smart Compare: 一键智能查重 ─── */}
+        {images.length > 1 && (
           <Card className="border-primary/30">
             <CardContent className="py-6">
               <div className="flex flex-col sm:flex-row items-center gap-4">
                 <div className="flex-1">
                   <h3 className="text-base font-semibold mb-1">智能查重</h3>
                   <p className="text-sm text-muted-foreground">
-                    使用 11 种算法（含 8 方向旋转检测）自动比对所有图片，特征已在上传时预计算完成
+                    使用 10 种算法（含 8 方向旋转检测）自动比对所有图片，特征已在上传时预计算完成
                   </p>
                 </div>
                 <Button
                   size="lg"
                   className="gap-2 px-8"
                   disabled={smartComparing}
-                  onClick={async () => {
-                    if (!projectId) return;
-                    setSmartComparing(true);
-                    setSmartResult(null);
-                    try {
-                      const result = await smartCompareApi(projectId);
-                      setSmartResult(result);
-                      if (result.features_pending) {
-                        toast({ title: "特征计算中", description: result.summary });
-                      } else {
-                        toast({ title: "查重完成", description: result.summary });
-                      }
-                    } catch (error) {
-                      const err = error as APIError;
-                      toast({ title: "查重失败", description: err.message, variant: "destructive" });
-                    } finally {
-                      setSmartComparing(false);
-                    }
-                  }}
+                  onClick={handleSmartCompare}
                 >
                   {smartComparing ? (
                     <Loader2 className="h-5 w-5 animate-spin" />
@@ -498,20 +476,31 @@ export default function ProjectDetail() {
         )}
 
         {/* Smart Compare Results */}
-        {smartResult && <SmartCompareResultView result={smartResult} />}
+         {smartResult && (
+           <SmartCompareResultView
+             result={smartResult}
+             projectId={projectId}
+             onRetry={handleSmartCompareRetry}
+           />
+         )}
 
         {/* ─── Advanced View (collapsed) ─── */}
         {compareResult && similarityMatrix && (
           <Card>
-            <CardHeader className="cursor-pointer" onClick={() => setShowAdvanced((v) => !v)}>
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-sm flex items-center gap-2">
-                  高级分析视图
-                  {showAdvanced ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-                </CardTitle>
-                <span className="text-xs text-muted-foreground">相似度矩阵 · 网络图</span>
-              </div>
-            </CardHeader>
+              <CardHeader className="cursor-pointer" onClick={() => setShowAdvanced((v) => !v)}>
+                <div className="flex items-center justify-between">
+                  <CardTitle className="text-sm flex items-center gap-2">
+                    高级分析视图
+                    {showAdvanced ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                  </CardTitle>
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    {loadingPairwise && <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />}
+                    <span>
+                      相似度矩阵 · 网络图 · {ALGORITHM_LABELS[(pairwiseData?.algorithm as HashType) || "auto"] || pairwiseData?.algorithm}
+                    </span>
+                  </div>
+                </div>
+              </CardHeader>
             {showAdvanced && (
               <CardContent className="space-y-4">
                 {pairwiseData && pairwiseData.matrix.length > 0 ? (

@@ -12,10 +12,13 @@ Feature Matrix Engine — 预计算特征矩阵 + 矩阵级比对
   - gray_flat (16384维 uint8)  → 灰度缩略图，余弦相似度
 """
 
+import logging
 import os
 import base64
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
+
+logger = logging.getLogger(__name__)
 
 try:
     import cv2
@@ -35,31 +38,44 @@ except ImportError:
 # ============================================================================
 
 # Feature algorithms to compute for each image variant
-HASH_FEATURES = ['phash_bits', 'dhash_bits', 'ahash_bits', 'whash_bits']
-DESCRIPTOR_FEATURES = ['sift_pooled', 'orb_pooled', 'brisk_pooled', 'akaze_pooled', 'kaze_pooled']
-PIXEL_FEATURES = ['histogram_hsv', 'gray_flat']
+HASH_FEATURES = ["phash_bits", "dhash_bits", "ahash_bits", "whash_bits"]
+DESCRIPTOR_FEATURES = [
+    "sift_pooled",
+    "orb_pooled",
+    "brisk_pooled",
+    "akaze_pooled",
+    "kaze_pooled",
+]
+PIXEL_FEATURES = ["histogram_hsv", "gray_flat"]
 ALL_FEATURES = HASH_FEATURES + DESCRIPTOR_FEATURES + PIXEL_FEATURES
 
 # Mapping from feature name to comparison algorithm name used in UI
 FEATURE_TO_ALGO = {
-    'phash_bits': 'phash', 'dhash_bits': 'dhash', 'ahash_bits': 'ahash', 'whash_bits': 'whash',
-    'sift_pooled': 'sift', 'orb_pooled': 'orb', 'brisk_pooled': 'brisk',
-    'akaze_pooled': 'akaze', 'kaze_pooled': 'kaze',
-    'histogram_hsv': 'histogram', 'gray_flat': 'ssim',
+    "phash_bits": "phash",
+    "dhash_bits": "dhash",
+    "ahash_bits": "ahash",
+    "whash_bits": "whash",
+    "sift_pooled": "sift",
+    "orb_pooled": "orb",
+    "brisk_pooled": "brisk",
+    "akaze_pooled": "akaze",
+    "kaze_pooled": "kaze",
+    "histogram_hsv": "histogram",
+    "gray_flat": "ssim",
 }
 ALGO_TO_FEATURE = {v: k for k, v in FEATURE_TO_ALGO.items()}
 
 DESCRIPTOR_ALGO_MAP = {
-    'sift_pooled': ('sift', 128),
-    'orb_pooled': ('orb', 32),
-    'brisk_pooled': ('brisk', 64),
-    'akaze_pooled': ('akaze', 61),
-    'kaze_pooled': ('kaze', 61),
+    "sift_pooled": ("sift", 128),
+    "orb_pooled": ("orb", 32),
+    "brisk_pooled": ("brisk", 64),
+    "akaze_pooled": ("akaze", 61),
+    "kaze_pooled": ("kaze", 61),
 }
 
 # Orientation variants (index → PIL transform)
 VARIANT_TRANSFORMS = [
-    None,                                    # 0: original
+    None,  # 0: original
     PILImage.Transpose.ROTATE_90 if PILImage else None,
     PILImage.Transpose.ROTATE_180 if PILImage else None,
     PILImage.Transpose.ROTATE_270 if PILImage else None,
@@ -76,9 +92,10 @@ GRAY_FLAT_SIZE = 128  # 128×128 → 16384 dim
 #  Serialization: numpy ↔ base64 string (for SQLite TEXT column)
 # ============================================================================
 
+
 def vector_to_b64(arr: np.ndarray) -> str:
     """Serialize numpy array to base64 string for DB storage."""
-    return base64.b64encode(arr.tobytes()).decode('ascii')
+    return base64.b64encode(arr.tobytes()).decode("ascii")
 
 
 def b64_to_vector(b64_str: str, dtype=np.float32, shape=None) -> np.ndarray:
@@ -93,6 +110,7 @@ def b64_to_vector(b64_str: str, dtype=np.float32, shape=None) -> np.ndarray:
 # ============================================================================
 #  Hash → Binary Vector
 # ============================================================================
+
 
 def hash_str_to_bits(hash_str: str) -> np.ndarray:
     """Convert hex hash string (e.g. 'a3f1...') to 64-dim uint8 bit vector."""
@@ -113,7 +131,10 @@ def hash_str_to_bits(hash_str: str) -> np.ndarray:
 #  Precompute Feature Matrix for a Single Image
 # ============================================================================
 
-def _compute_single_variant_features(image_path: str) -> Dict[str, Tuple[np.ndarray, int]]:
+
+def _compute_single_variant_features(
+    image_path: str,
+) -> Dict[str, Tuple[np.ndarray, int]]:
     """
     Compute ALL feature vectors for a single image file.
     Returns dict of { feature_name: (vector, dimensions) }
@@ -124,14 +145,29 @@ def _compute_single_variant_features(image_path: str) -> Dict[str, Tuple[np.ndar
     if PILImage and imagehash:
         try:
             img = PILImage.open(image_path)
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            features['phash_bits'] = (hash_str_to_bits(str(imagehash.phash(img, hash_size=8))), 64)
-            features['dhash_bits'] = (hash_str_to_bits(str(imagehash.dhash(img, hash_size=8))), 64)
-            features['ahash_bits'] = (hash_str_to_bits(str(imagehash.average_hash(img, hash_size=8))), 64)
-            features['whash_bits'] = (hash_str_to_bits(str(imagehash.whash(img, hash_size=8))), 64)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            features["phash_bits"] = (
+                hash_str_to_bits(str(imagehash.phash(img, hash_size=8))),
+                64,
+            )
+            features["dhash_bits"] = (
+                hash_str_to_bits(str(imagehash.dhash(img, hash_size=8))),
+                64,
+            )
+            features["ahash_bits"] = (
+                hash_str_to_bits(str(imagehash.average_hash(img, hash_size=8))),
+                64,
+            )
+            features["whash_bits"] = (
+                hash_str_to_bits(str(imagehash.whash(img, hash_size=8))),
+                64,
+            )
             img.close()
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Hash feature computation failed for %s: %s", image_path, exc
+            )
             for h in HASH_FEATURES:
                 features[h] = (np.zeros(64, dtype=np.uint8), 64)
 
@@ -141,9 +177,12 @@ def _compute_single_variant_features(image_path: str) -> Dict[str, Tuple[np.ndar
             gray = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
             if gray is not None:
                 gray = cv2.resize(gray, (GRAY_FLAT_SIZE, GRAY_FLAT_SIZE))
-                features['gray_flat'] = (gray.flatten().astype(np.uint8), GRAY_FLAT_SIZE * GRAY_FLAT_SIZE)
-        except Exception:
-            pass
+                features["gray_flat"] = (
+                    gray.flatten().astype(np.uint8),
+                    GRAY_FLAT_SIZE * GRAY_FLAT_SIZE,
+                )
+        except Exception as exc:
+            logger.warning("Gray flat feature failed for %s: %s", image_path, exc)
 
     # --- Histogram HSV ---
     if cv2 is not None:
@@ -157,22 +196,29 @@ def _compute_single_variant_features(image_path: str) -> Dict[str, Tuple[np.ndar
                 hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
                 hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
                 cv2.normalize(hist, hist)
-                features['histogram_hsv'] = (hist.flatten().astype(np.float32), 3000)
-        except Exception:
-            pass
+                features["histogram_hsv"] = (hist.flatten().astype(np.float32), 3000)
+        except Exception as exc:
+            logger.warning("Histogram HSV feature failed for %s: %s", image_path, exc)
 
     # --- Descriptor pooled ---
     if cv2 is not None:
         for feat_name, (algo, dim) in DESCRIPTOR_ALGO_MAP.items():
             try:
                 from app.image_processor import compute_descriptor
+
                 desc, norm = compute_descriptor(image_path, algo, max_features=512)
                 if desc is not None and len(desc) > 0:
                     pooled = desc.mean(axis=0).astype(np.float32)
                     features[feat_name] = (pooled, len(pooled))
                 else:
                     features[feat_name] = (np.zeros(dim, dtype=np.float32), dim)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "Descriptor feature %s failed for %s: %s",
+                    feat_name,
+                    image_path,
+                    exc,
+                )
                 features[feat_name] = (np.zeros(dim, dtype=np.float32), dim)
 
     return features
@@ -198,6 +244,7 @@ def precompute_feature_matrix(image_id: int, image_path: str, session) -> bool:
     try:
         # Clear any existing features for this image
         from sqlmodel import select
+
         existing = session.exec(
             select(FeatureStore).where(FeatureStore.image_id == image_id)
         ).all()
@@ -237,12 +284,19 @@ def precompute_feature_matrix(image_id: int, image_path: str, session) -> bool:
         return True
 
     except Exception as e:
+        logger.warning(
+            "Precompute failed for image %s (%s): %s", image_id, image_path, e
+        )
         try:
             image.feature_status = "pending"
             session.add(image)
             session.commit()
-        except Exception:
-            pass
+        except Exception as rollback_exc:
+            logger.warning(
+                "Failed to reset feature_status for image %s: %s",
+                image_id,
+                rollback_exc,
+            )
         return False
 
 
@@ -254,8 +308,8 @@ def _generate_variant_paths(image_path: str) -> List[str]:
     paths = [image_path]
     try:
         img = PILImage.open(image_path)
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
+        if img.mode != "RGB":
+            img = img.convert("RGB")
 
         base, ext = os.path.splitext(image_path)
         transforms = [
@@ -286,8 +340,8 @@ def _generate_variant_paths(image_path: str) -> List[str]:
         paths.append(v7_path)
 
         img.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Variant generation failed for %s: %s", image_path, exc)
 
     return paths
 
@@ -295,7 +349,6 @@ def _generate_variant_paths(image_path: str) -> List[str]:
 # ============================================================================
 #  Matrix Comparison Engine — Batch NumPy (BLAS-accelerated)
 # ============================================================================
-
 
 
 def load_feature_vectors(
@@ -316,13 +369,10 @@ def load_feature_vectors(
     if variants is None:
         variants = [0]
 
-    stmt = (
-        select(FeatureStore)
-        .where(
-            FeatureStore.image_id.in_(image_ids),
-            FeatureStore.algorithm == feature_name,
-            FeatureStore.variant_idx.in_(variants),
-        )
+    stmt = select(FeatureStore).where(
+        FeatureStore.image_id.in_(image_ids),
+        FeatureStore.algorithm == feature_name,
+        FeatureStore.variant_idx.in_(variants),
     )
     rows = session.exec(stmt).all()
 
@@ -330,7 +380,11 @@ def load_feature_vectors(
     for row in rows:
         if row.image_id not in result:
             result[row.image_id] = {}
-        dtype = np.uint8 if feature_name.endswith('_bits') or feature_name == 'gray_flat' else np.float32
+        dtype = (
+            np.uint8
+            if feature_name.endswith("_bits") or feature_name == "gray_flat"
+            else np.float32
+        )
         result[row.image_id][row.variant_idx] = b64_to_vector(row.vector, dtype=dtype)
 
     return result
@@ -380,7 +434,9 @@ def compute_hash_similarity_matrix(
         all_variants.update(d.keys())
 
     if not rotation_invariant:
-        all_variants = {0} if 0 in all_variants else {min(all_variants)} if all_variants else {0}
+        all_variants = (
+            {0} if 0 in all_variants else {min(all_variants)} if all_variants else {0}
+        )
 
     best_sim = np.eye(n, dtype=np.float64)
 
@@ -416,7 +472,9 @@ def compute_cosine_similarity_matrix(
         all_variants.update(d.keys())
 
     if not rotation_invariant:
-        all_variants = {0} if 0 in all_variants else {min(all_variants)} if all_variants else {0}
+        all_variants = (
+            {0} if 0 in all_variants else {min(all_variants)} if all_variants else {0}
+        )
 
     best_sim = np.eye(n, dtype=np.float64)
 
@@ -458,7 +516,7 @@ def compute_similarity_matrix_fast(
 
     vectors = load_feature_vectors(session, image_ids, algorithm, variants)
 
-    if feature_name.endswith('_bits'):
+    if feature_name.endswith("_bits"):
         return compute_hash_similarity_matrix(vectors, image_ids, rotation_invariant)
     else:
         return compute_cosine_similarity_matrix(vectors, image_ids, rotation_invariant)
@@ -467,10 +525,16 @@ def compute_similarity_matrix_fast(
 def are_features_ready(session, image_ids: List[int]) -> bool:
     """Check if all images have pre-computed features (feature_status='ready')."""
     from sqlmodel import select
+    from sqlalchemy import func
     from app.models import Image
-    for img_id in image_ids:
-        img = session.get(Image, img_id)
-        if img is None or img.feature_status != 'ready':
-            return False
-    return True
 
+    if not image_ids:
+        return True
+
+    unique_ids = list(dict.fromkeys(image_ids))
+    statement = select(func.count(Image.id)).where(
+        Image.id.in_(unique_ids),
+        Image.feature_status == "ready",
+    )
+    ready_count = session.exec(statement).one()
+    return int(ready_count) == len(unique_ids)

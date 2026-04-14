@@ -1,16 +1,21 @@
 import hashlib
+import logging
 import os
 import threading
 import uuid
+from collections import OrderedDict
 from typing import List, Tuple, Dict, Any, Optional
 from pathlib import Path
 import numpy as np
 from PIL import Image as PILImage
 import imagehash
 
+logger = logging.getLogger(__name__)
+
 # ---------- 自动注册 HEIF/AVIF 插件 ----------
 try:
     from pillow_heif import register_heif_opener
+
     register_heif_opener()
 except ImportError:
     pass  # pillow-heif 未安装时静默跳过
@@ -26,7 +31,7 @@ try:
 except ImportError:
     _rawpy = None
 
-RAW_EXTENSIONS = {'.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', '.raf'}
+RAW_EXTENSIONS = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2", ".raf"}
 
 try:
     import cv2
@@ -41,55 +46,92 @@ except Exception:
 
 # ---------- 所有支持的比对算法 ----------
 # Tier 1: 感知哈希（毫秒级）
-HASH_ALGOS = {'phash', 'dhash', 'ahash', 'whash', 'colorhash'}
+HASH_ALGOS = {"phash", "dhash", "ahash", "whash", "colorhash"}
 # Tier 2: 像素/结构级（百毫秒级）
-PIXEL_ALGOS = {'ssim', 'histogram', 'template'}
+PIXEL_ALGOS = {"ssim", "histogram", "template"}
 # Tier 3: 特征描述子（秒级）
-DESCRIPTOR_ALGOS = {'orb', 'brisk', 'sift', 'akaze', 'kaze'}
+DESCRIPTOR_ALGOS = {"orb", "brisk", "sift", "akaze", "kaze"}
 # 融合模式
-FUSION_ALGOS = {'auto'}
+FUSION_ALGOS = {"auto"}
 ALL_ALGOS = HASH_ALGOS | PIXEL_ALGOS | DESCRIPTOR_ALGOS | FUSION_ALGOS
 
 # ---------- 支持的图像格式（全品种） ----------
 SUPPORTED_IMAGE_EXTENSIONS = {
     # 常用格式
-    '.jpg', '.jpeg', '.jfif', '.jpe',
-    '.png', '.apng',
-    '.gif',
-    '.bmp', '.dib',
-    '.tif', '.tiff',
-    '.webp',
+    ".jpg",
+    ".jpeg",
+    ".jfif",
+    ".jpe",
+    ".png",
+    ".apng",
+    ".gif",
+    ".bmp",
+    ".dib",
+    ".tif",
+    ".tiff",
+    ".webp",
     # JPEG 2000 系列
-    '.jp2', '.j2k', '.j2c', '.jpf', '.jpx', '.jpc',
+    ".jp2",
+    ".j2k",
+    ".j2c",
+    ".jpf",
+    ".jpx",
+    ".jpc",
     # 专业/设计格式
-    '.psd',      # Adobe Photoshop
-    '.eps', '.ps',  # Encapsulated PostScript
-    '.svg',      # SVG (矢量，仅记录支持，实际需 cairosvg 转换)
+    ".psd",  # Adobe Photoshop
+    ".eps",
+    ".ps",  # Encapsulated PostScript
+    ".svg",  # SVG (矢量，仅记录支持，实际需 cairosvg 转换)
     # 图标格式
-    '.ico', '.cur', '.icns',
+    ".ico",
+    ".cur",
+    ".icns",
     # Targa 系列
-    '.tga', '.vda', '.icb', '.vst',
+    ".tga",
+    ".vda",
+    ".icb",
+    ".vst",
     # 科学图像
-    '.fits', '.fit', '.fts',
+    ".fits",
+    ".fit",
+    ".fts",
     # 传统格式
-    '.pcx', '.dcx',
-    '.dds',      # DirectDraw Surface
-    '.qoi',      # Quite Ok Image
-    '.mpo',      # Multi-Picture Object
+    ".pcx",
+    ".dcx",
+    ".dds",  # DirectDraw Surface
+    ".qoi",  # Quite Ok Image
+    ".mpo",  # Multi-Picture Object
     # NetPBM 系列
-    '.pbm', '.pgm', '.ppm', '.pnm',
+    ".pbm",
+    ".pgm",
+    ".ppm",
+    ".pnm",
     # SGI 系列
-    '.sgi', '.rgb', '.rgba', '.bw',
+    ".sgi",
+    ".rgb",
+    ".rgba",
+    ".bw",
     # Sun Raster
-    '.ras',
+    ".ras",
     # 动画帧
-    '.flc', '.fli',
+    ".flc",
+    ".fli",
     # X Window
-    '.xbm', '.xpm',
+    ".xbm",
+    ".xpm",
     # RAW 相机格式（需要 rawpy/libraw，记录支持但降级处理）
-    '.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', '.raf',
+    ".cr2",
+    ".cr3",
+    ".nef",
+    ".arw",
+    ".dng",
+    ".orf",
+    ".rw2",
+    ".raf",
     # HEIF/AVIF（需要 pillow-heif/pillow-avif 插件）
-    '.heic', '.heif', '.avif',
+    ".heic",
+    ".heif",
+    ".avif",
 }
 
 
@@ -115,8 +157,8 @@ def compute_image_features(image_path: str) -> Dict[str, Any]:
     features = {}
 
     # 文件哈希
-    features['file_hash'] = compute_file_md5(image_path)
-    features['file_size'] = os.path.getsize(image_path)
+    features["file_hash"] = compute_file_md5(image_path)
+    features["file_size"] = os.path.getsize(image_path)
 
     _, ext = os.path.splitext(image_path.lower())
 
@@ -131,18 +173,18 @@ def compute_image_features(image_path: str) -> Dict[str, Any]:
 
         with img:
             # 获取图像尺寸
-            features['width'], features['height'] = img.size
+            features["width"], features["height"] = img.size
 
             # 转换为RGB模式（如果需要）
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
+            if img.mode != "RGB":
+                img = img.convert("RGB")
 
             # 计算各种感知哈希
-            features['phash'] = str(imagehash.phash(img, hash_size=8))
-            features['dhash'] = str(imagehash.dhash(img, hash_size=8))
-            features['ahash'] = str(imagehash.average_hash(img, hash_size=8))
-            features['whash'] = str(imagehash.whash(img, hash_size=8))
-            features['colorhash'] = str(imagehash.colorhash(img))
+            features["phash"] = str(imagehash.phash(img, hash_size=8))
+            features["dhash"] = str(imagehash.dhash(img, hash_size=8))
+            features["ahash"] = str(imagehash.average_hash(img, hash_size=8))
+            features["whash"] = str(imagehash.whash(img, hash_size=8))
+            features["colorhash"] = str(imagehash.colorhash(img))
 
     except Exception as e:
         raise ValueError(f"无法处理图像文件 {image_path}: {str(e)}")
@@ -186,7 +228,9 @@ def calculate_similarity(hash1: str, hash2: str, max_bits: int = 64) -> float:
 
 def _ensure_cv2():
     if cv2 is None:
-        raise RuntimeError("未安装 OpenCV（cv2），无法使用特征描述子算法。请安装 opencv-contrib-python-headless。")
+        raise RuntimeError(
+            "未安装 OpenCV（cv2），无法使用特征描述子算法。请安装 opencv-contrib-python-headless。"
+        )
 
 
 def _create_extractor(algo: str, max_features: int = 512):
@@ -197,7 +241,9 @@ def _create_extractor(algo: str, max_features: int = 512):
     _ensure_cv2()
     algo = algo.lower()
     if algo == "orb":
-        return cv2.ORB_create(nfeatures=max_features, scaleFactor=1.2, nlevels=8), cv2.NORM_HAMMING
+        return cv2.ORB_create(
+            nfeatures=max_features, scaleFactor=1.2, nlevels=8
+        ), cv2.NORM_HAMMING
     elif algo == "brisk":
         return cv2.BRISK_create(), cv2.NORM_HAMMING
     elif algo == "sift":
@@ -209,7 +255,9 @@ def _create_extractor(algo: str, max_features: int = 512):
     elif algo == "kaze":
         return cv2.KAZE_create(), cv2.NORM_L2
     elif algo == "surf":
-        if not hasattr(cv2, "xfeatures2d") or not hasattr(cv2.xfeatures2d, "SURF_create"):
+        if not hasattr(cv2, "xfeatures2d") or not hasattr(
+            cv2.xfeatures2d, "SURF_create"
+        ):
             raise RuntimeError("当前 OpenCV 未包含 SURF。")
         return cv2.xfeatures2d.SURF_create(), cv2.NORM_L2
     else:
@@ -245,17 +293,15 @@ def compute_descriptor_with_kp(image_path: str, algo: str, max_features: int = 5
     return kps, desc, norm
 
 
-# 缓存目录（磁盘）与内存缓存
-DESC_DIR = Path(os.getenv("DESCRIPTOR_DIR", "data/descriptors"))
-DESC_DIR.mkdir(parents=True, exist_ok=True)
-
 # 内存缓存：键 (algo, file_hash) -> (descriptor, norm)
 _DESC_CACHE: Dict[Tuple[str, str], Tuple[Any, int]] = {}
 _DESC_LOCK = threading.Lock()
 
 
 def _disk_path(algo: str, file_hash: str) -> Path:
-    return DESC_DIR / algo / f"{file_hash}.npz"
+    from app.runtime import get_desc_dir
+
+    return get_desc_dir() / algo / f"{file_hash}.npz"
 
 
 def _load_descriptor_from_disk(algo: str, file_hash: str) -> Optional[Tuple[Any, int]]:
@@ -267,7 +313,8 @@ def _load_descriptor_from_disk(algo: str, file_hash: str) -> Optional[Tuple[Any,
         desc = data["desc"]
         norm = int(data["norm"])
         return desc, norm
-    except Exception:
+    except Exception as exc:
+        logger.debug("Descriptor disk load failed for %s/%s: %s", algo, file_hash, exc)
         return None
 
 
@@ -276,12 +323,15 @@ def _save_descriptor_to_disk(algo: str, file_hash: str, desc, norm: int):
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         np.savez_compressed(path, desc=desc, norm=norm)
-    except Exception:
-        # 忽略持久化失败，不阻塞主流程
-        pass
+    except Exception as exc:
+        logger.warning(
+            "Descriptor disk save failed for %s/%s: %s", algo, file_hash, exc
+        )
 
 
-def get_cached_descriptor(image_path: str, file_hash: str, algo: str, max_features: int = 512):
+def get_cached_descriptor(
+    image_path: str, file_hash: str, algo: str, max_features: int = 512
+):
     key = (algo, file_hash)
     with _DESC_LOCK:
         if key in _DESC_CACHE:
@@ -328,19 +378,24 @@ def draw_feature_matches(
     image_path_a: str,
     image_path_b: str,
     algo: str = "orb",
-    output_dir: Path = Path("data/visualizations"),
+    output_dir: Optional[Path] = None,
     max_features: int = 512,
-    max_matches: int = 40
+    max_matches: int = 40,
 ) -> Path:
-    """
-    生成特征点匹配可视化图，返回文件路径。
-    """
     _ensure_cv2()
+    if output_dir is None:
+        from app.runtime import get_static_dir
+
+        output_dir = get_static_dir() / "visualizations"
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    kps1, desc1, norm = compute_descriptor_with_kp(image_path_a, algo, max_features=max_features)
-    kps2, desc2, _ = compute_descriptor_with_kp(image_path_b, algo, max_features=max_features)
+    kps1, desc1, norm = compute_descriptor_with_kp(
+        image_path_a, algo, max_features=max_features
+    )
+    kps2, desc2, _ = compute_descriptor_with_kp(
+        image_path_b, algo, max_features=max_features
+    )
 
     if desc1 is None or desc2 is None:
         raise ValueError("未能提取到足够的特征点")
@@ -351,7 +406,15 @@ def draw_feature_matches(
 
     img1 = cv2.imread(str(image_path_a))
     img2 = cv2.imread(str(image_path_b))
-    match_vis = cv2.drawMatches(img1, kps1, img2, kps2, matches, None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
+    match_vis = cv2.drawMatches(
+        img1,
+        kps1,
+        img2,
+        kps2,
+        matches,
+        None,
+        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS,
+    )
 
     fname = f"match_{algo}_{uuid.uuid4().hex[:8]}.jpg"
     out_path = output_dir / fname
@@ -363,7 +426,7 @@ def find_similar_images(
     query_image: Dict[str, Any],
     image_list: List[Dict[str, Any]],
     threshold: float = 0.85,
-    hash_type: str = 'phash'
+    hash_type: str = "phash",
 ) -> List[Tuple[Dict[str, Any], float]]:
     """
     查找与查询图像相似的图像
@@ -389,7 +452,7 @@ def find_similar_images(
             continue
 
         # 跳过与自身比较
-        if img['file_hash'] == query_image['file_hash']:
+        if img["file_hash"] == query_image["file_hash"]:
             continue
 
         similarity = calculate_similarity(query_hash, img_hash)
@@ -404,9 +467,7 @@ def find_similar_images(
 
 
 def group_similar_images(
-    images: List[Dict[str, Any]],
-    threshold: float = 0.85,
-    hash_type: str = 'phash'
+    images: List[Dict[str, Any]], threshold: float = 0.85, hash_type: str = "phash"
 ) -> Tuple[List[List[Dict[str, Any]]], List[Dict[str, Any]]]:
     """
     将相似的图像分组
@@ -429,7 +490,7 @@ def group_similar_images(
 
     for i, query_img in enumerate(images):
         # 跳过已处理的图像
-        if query_img['file_hash'] in processed_hashes:
+        if query_img["file_hash"] in processed_hashes:
             continue
 
         # 查找相似图像
@@ -441,12 +502,12 @@ def group_similar_images(
             groups.append(group)
 
             # 标记已处理的图像
-            processed_hashes.add(query_img['file_hash'])
+            processed_hashes.add(query_img["file_hash"])
             for img, _ in similar:
-                processed_hashes.add(img['file_hash'])
+                processed_hashes.add(img["file_hash"])
 
     # 找出未分组的图像
-    ungrouped = [img for img in images if img['file_hash'] not in processed_hashes]
+    ungrouped = [img for img in images if img["file_hash"] not in processed_hashes]
 
     return groups, ungrouped
 
@@ -458,9 +519,7 @@ def is_image_file(file_path: str) -> bool:
 
 
 def resize_image_if_needed(
-    image_path: str,
-    max_size: int = 1024,
-    output_path: str = None
+    image_path: str, max_size: int = 1024, output_path: str = None
 ) -> str:
     """
     如果图像尺寸过大，调整图像大小
@@ -503,27 +562,36 @@ def resize_image_if_needed(
 # ============================================================================
 
 # Per-file feature caches: keyed by (file_path, max_side) → numpy array
-# LRU eviction when > MAX_T2_CACHE entries to bound memory
+# LRU eviction when > MAX_T2_CACHE entries or _t2_bytes > MAX_T2_BYTES to bound memory
 MAX_T2_CACHE = 200
-_GRAY_CACHE: Dict[Tuple[str, int], 'np.ndarray'] = {}
-_COLOR_CACHE: Dict[Tuple[str, int], 'np.ndarray'] = {}
-_HIST_CACHE: Dict[str, 'np.ndarray'] = {}       # path → normalized HSV histogram
+MAX_T2_BYTES = 512 * 1024 * 1024  # 512 MB total memory cap for T2 caches
+_GRAY_CACHE: OrderedDict = OrderedDict()
+_COLOR_CACHE: OrderedDict = OrderedDict()
+_HIST_CACHE: OrderedDict = OrderedDict()
+_t2_bytes: int = 0  # cumulative nbytes across all T2 caches
 _T2_LOCK = threading.Lock()
 
 
-def _evict_if_needed(cache: dict, max_size: int = MAX_T2_CACHE):
-    """Simple eviction: drop first half when cache is full."""
-    if len(cache) > max_size:
-        keys = list(cache.keys())
-        for k in keys[:len(keys) // 2]:
-            del cache[k]
+def _evict_if_needed(cache: OrderedDict, max_size: int = MAX_T2_CACHE):
+    """LRU eviction: pop oldest entries when cache exceeds count or byte limit."""
+    global _t2_bytes
+    while len(cache) > max_size and cache:
+        _, v = cache.popitem(last=False)
+        _t2_bytes -= getattr(v, "nbytes", 0)
+    while _t2_bytes > MAX_T2_BYTES and cache:
+        _, v = cache.popitem(last=False)
+        _t2_bytes -= getattr(v, "nbytes", 0)
+    if _t2_bytes < 0:
+        _t2_bytes = 0
 
 
-def _load_gray_resized(path: str, max_side: int = 512) -> 'np.ndarray':
-    """加载灰度图并限制最大尺寸（带内存缓存）。"""
+def _load_gray_resized(path: str, max_side: int = 512) -> "np.ndarray":
+    """加载灰度图并限制最大尺寸（带 LRU 内存缓存）。"""
+    global _t2_bytes
     key = (path, max_side)
     with _T2_LOCK:
         if key in _GRAY_CACHE:
+            _GRAY_CACHE.move_to_end(key)
             return _GRAY_CACHE[key]
 
     _ensure_cv2()
@@ -538,14 +606,17 @@ def _load_gray_resized(path: str, max_side: int = 512) -> 'np.ndarray':
     with _T2_LOCK:
         _evict_if_needed(_GRAY_CACHE)
         _GRAY_CACHE[key] = img
+        _t2_bytes += getattr(img, "nbytes", 0)
     return img
 
 
-def _load_color_resized(path: str, max_side: int = 512) -> 'np.ndarray':
-    """加载彩色图并限制最大尺寸（带内存缓存）。"""
+def _load_color_resized(path: str, max_side: int = 512) -> "np.ndarray":
+    """加载彩色图并限制最大尺寸（带 LRU 内存缓存）。"""
+    global _t2_bytes
     key = (path, max_side)
     with _T2_LOCK:
         if key in _COLOR_CACHE:
+            _COLOR_CACHE.move_to_end(key)
             return _COLOR_CACHE[key]
 
     _ensure_cv2()
@@ -560,13 +631,16 @@ def _load_color_resized(path: str, max_side: int = 512) -> 'np.ndarray':
     with _T2_LOCK:
         _evict_if_needed(_COLOR_CACHE)
         _COLOR_CACHE[key] = img
+        _t2_bytes += getattr(img, "nbytes", 0)
     return img
 
 
-def _get_cached_histogram(path: str) -> 'np.ndarray':
+def _get_cached_histogram(path: str) -> "np.ndarray":
     """计算并缓存 HSV H+S 二维直方图（per-file，避免重复计算）。"""
+    global _t2_bytes
     with _T2_LOCK:
         if path in _HIST_CACHE:
+            _HIST_CACHE.move_to_end(path)
             return _HIST_CACHE[path]
 
     _ensure_cv2()
@@ -578,19 +652,27 @@ def _get_cached_histogram(path: str) -> 'np.ndarray':
     with _T2_LOCK:
         _evict_if_needed(_HIST_CACHE)
         _HIST_CACHE[path] = hist
+        _t2_bytes += getattr(hist, "nbytes", 0)
     return hist
 
 
 def invalidate_feature_cache(path: str):
     """清除指定文件的所有 Tier 2 特征缓存（用于文件删除/更新时）。"""
+    global _t2_bytes
     with _T2_LOCK:
         keys_to_remove = [k for k in _GRAY_CACHE if k[0] == path]
         for k in keys_to_remove:
+            _t2_bytes -= getattr(_GRAY_CACHE[k], "nbytes", 0)
             del _GRAY_CACHE[k]
         keys_to_remove = [k for k in _COLOR_CACHE if k[0] == path]
         for k in keys_to_remove:
+            _t2_bytes -= getattr(_COLOR_CACHE[k], "nbytes", 0)
             del _COLOR_CACHE[k]
-        _HIST_CACHE.pop(path, None)
+        removed = _HIST_CACHE.pop(path, None)
+        if removed is not None:
+            _t2_bytes -= getattr(removed, "nbytes", 0)
+        if _t2_bytes < 0:
+            _t2_bytes = 0
 
 
 def calculate_ssim_similarity(path_a: str, path_b: str) -> float:
@@ -599,7 +681,9 @@ def calculate_ssim_similarity(path_a: str, path_b: str) -> float:
     返回 0-1，1 表示完全相同。
     """
     if _ssim_fn is None:
-        raise RuntimeError("未安装 scikit-image，无法使用 SSIM。请: pip install scikit-image")
+        raise RuntimeError(
+            "未安装 scikit-image，无法使用 SSIM。请: pip install scikit-image"
+        )
 
     img_a = _load_gray_resized(path_a)
     img_b = _load_gray_resized(path_b)
@@ -654,10 +738,13 @@ def calculate_template_similarity(path_a: str, path_b: str) -> float:
 #  融合模式
 # ============================================================================
 
+
 def calculate_hybrid_similarity(
-    path_a: str, path_b: str,
-    features_a: Dict[str, Any], features_b: Dict[str, Any],
-    weights: Optional[Dict[str, float]] = None
+    path_a: str,
+    path_b: str,
+    features_a: Dict[str, Any],
+    features_b: Dict[str, Any],
+    weights: Optional[Dict[str, float]] = None,
 ) -> float:
     """
     多算法加权融合评分（auto 模式）。
@@ -666,7 +753,7 @@ def calculate_hybrid_similarity(
     返回 0-1。
     """
     if weights is None:
-        weights = {'phash': 0.3, 'ssim': 0.3, 'orb': 0.4}
+        weights = {"phash": 0.3, "ssim": 0.3, "orb": 0.4}
 
     total_weight = 0.0
     total_score = 0.0
@@ -681,12 +768,12 @@ def calculate_hybrid_similarity(
                     total_score += score * w
                     total_weight += w
 
-            elif algo == 'ssim':
+            elif algo == "ssim":
                 score = calculate_ssim_similarity(path_a, path_b)
                 total_score += score * w
                 total_weight += w
 
-            elif algo == 'histogram':
+            elif algo == "histogram":
                 score = calculate_histogram_similarity(path_a, path_b)
                 total_score += score * w
                 total_weight += w
@@ -697,9 +784,10 @@ def calculate_hybrid_similarity(
                 score = calculate_descriptor_similarity(desc_a, desc_b, norm_a)
                 total_score += score * w
                 total_weight += w
-        except Exception:
-            # 某个算法失败时跳过，不影响整体
-            pass
+        except Exception as exc:
+            logger.debug(
+                "Algorithm %s failed during hybrid comparison, skipping: %s", algo, exc
+            )
 
     if total_weight == 0:
         return 0.0
@@ -712,12 +800,12 @@ def calculate_hybrid_similarity(
 
 # 8 种方向变体: 4 旋转 × (原图 + 水平翻转)
 _ORIENTATIONS = [
-    None,                                    # 原图
-    PILImage.Transpose.ROTATE_90,            # 旋转 90°
-    PILImage.Transpose.ROTATE_180,           # 旋转 180°
-    PILImage.Transpose.ROTATE_270,           # 旋转 270°
-    PILImage.Transpose.FLIP_LEFT_RIGHT,      # 水平翻转
-    (PILImage.Transpose.FLIP_LEFT_RIGHT, PILImage.Transpose.ROTATE_90),   # 翻转 + 90°
+    None,  # 原图
+    PILImage.Transpose.ROTATE_90,  # 旋转 90°
+    PILImage.Transpose.ROTATE_180,  # 旋转 180°
+    PILImage.Transpose.ROTATE_270,  # 旋转 270°
+    PILImage.Transpose.FLIP_LEFT_RIGHT,  # 水平翻转
+    (PILImage.Transpose.FLIP_LEFT_RIGHT, PILImage.Transpose.ROTATE_90),  # 翻转 + 90°
     (PILImage.Transpose.FLIP_LEFT_RIGHT, PILImage.Transpose.ROTATE_180),  # 翻转 + 180°
     (PILImage.Transpose.FLIP_LEFT_RIGHT, PILImage.Transpose.ROTATE_270),  # 翻转 + 270°
 ]
@@ -733,8 +821,8 @@ def _generate_orientation_variants(image_path: str) -> List[str]:
     """
     paths = [image_path]  # 第一个始终是原图
     img = PILImage.open(image_path)
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
+    if img.mode != "RGB":
+        img = img.convert("RGB")
 
     for orient in _ORIENTATIONS[1:]:  # 跳过 None（原图）
         variant = img.copy()
@@ -744,7 +832,7 @@ def _generate_orientation_variants(image_path: str) -> List[str]:
         else:
             variant = variant.transpose(orient)
 
-        fd, tmp_path = _tempfile.mkstemp(suffix='.png')
+        fd, tmp_path = _tempfile.mkstemp(suffix=".png")
         os.close(fd)
         variant.save(tmp_path)
         paths.append(tmp_path)
@@ -787,7 +875,8 @@ def compare_with_orientations(
                 # 如果已达到 0.95+，提前退出（完美匹配不需要继续）
                 if best_score >= 0.95:
                     break
-            except Exception:
+            except Exception as exc:
+                logger.debug("Variant comparison failed, continuing: %s", exc)
                 continue
     finally:
         # 清理临时文件（跳过第一个，那是原图）
@@ -824,6 +913,7 @@ def compute_features_for_variants(image_path: str) -> List[Dict[str, Any]]:
 # ============================================================================
 #  Pairwise Similarity Cache Layer
 # ============================================================================
+
 
 def _cache_key(file_hash_a: str, file_hash_b: str):
     """Return ordered (min, max) hash pair to canonicalize A↔B."""
@@ -865,6 +955,7 @@ def get_or_compute_similarity(
         try:
             from sqlmodel import select as _sel
             from app.models import SimilarityCache
+
             stmt = _sel(SimilarityCache).where(
                 SimilarityCache.hash_a == ha,
                 SimilarityCache.hash_b == hb,
@@ -874,8 +965,8 @@ def get_or_compute_similarity(
             cached = session.exec(stmt).first()
             if cached is not None:
                 return cached.score
-        except Exception:
-            pass  # table might not exist yet; fall through
+        except Exception as exc:
+            logger.debug("Similarity cache read failed: %s", exc)
 
     # ---------- 2. Compute ----------
     score = _raw_similarity(path_a, path_b, algorithm, features_a, features_b)
@@ -886,8 +977,14 @@ def get_or_compute_similarity(
                 path_a, path_b, algorithm, features_a, features_b
             )
             score = max(score, ri_score)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug(
+                "Rotation invariant comparison failed for %s vs %s [%s]: %s",
+                path_a,
+                path_b,
+                algorithm,
+                exc,
+            )
 
     score = round(score, 4)
 
@@ -895,25 +992,31 @@ def get_or_compute_similarity(
     if session is not None:
         try:
             from app.models import SimilarityCache
+
             entry = SimilarityCache(
-                hash_a=ha, hash_b=hb,
+                hash_a=ha,
+                hash_b=hb,
                 algorithm=algorithm,
                 rotation_invariant=rotation_invariant,
                 score=score,
             )
             session.add(entry)
             session.commit()
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                "Similarity cache write failed for %s↔%s [%s]: %s", ha, hb, algorithm, e
+            )
             try:
                 session.rollback()
-            except Exception:
-                pass
+            except Exception as rollback_exc:
+                logger.debug("Rollback failed: %s", rollback_exc)
 
     return score
 
 
 def _raw_similarity(
-    path_a: str, path_b: str,
+    path_a: str,
+    path_b: str,
     algorithm: str,
     features_a: Dict[str, Any],
     features_b: Dict[str, Any],
@@ -921,30 +1024,30 @@ def _raw_similarity(
     """Compute similarity score without caching (pure computation)."""
     if algorithm in HASH_ALGOS:
         return calculate_similarity(
-            features_a.get(algorithm, ''),
-            features_b.get(algorithm, '')
+            features_a.get(algorithm, ""), features_b.get(algorithm, "")
         )
     elif algorithm in DESCRIPTOR_ALGOS:
         desc_a, norm_a = get_cached_descriptor(
-            path_a, features_a.get('file_hash', ''), algorithm
+            path_a, features_a.get("file_hash", ""), algorithm
         )
         desc_b, _ = get_cached_descriptor(
-            path_b, features_b.get('file_hash', ''), algorithm
+            path_b, features_b.get("file_hash", ""), algorithm
         )
         return calculate_descriptor_similarity(desc_a, desc_b, norm_a)
-    elif algorithm == 'ssim':
+    elif algorithm == "ssim":
         return calculate_ssim_similarity(path_a, path_b)
-    elif algorithm == 'histogram':
+    elif algorithm == "histogram":
         return calculate_histogram_similarity(path_a, path_b)
-    elif algorithm == 'template':
+    elif algorithm == "template":
         return calculate_template_similarity(path_a, path_b)
-    elif algorithm == 'auto':
+    elif algorithm == "auto":
         return calculate_hybrid_similarity(path_a, path_b, features_a, features_b)
     return 0.0
 
 
 def calculate_rotation_invariant_similarity(
-    path_a: str, path_b: str,
+    path_a: str,
+    path_b: str,
     algorithm: str,
     features_a: Dict[str, Any],
     features_b: Dict[str, Any],
@@ -955,14 +1058,15 @@ def calculate_rotation_invariant_similarity(
         best = 0.0
         for bf in b_features_list:
             s = calculate_similarity(
-                features_a.get(algorithm, ''),
-                bf.get(algorithm, '')
+                features_a.get(algorithm, ""), bf.get(algorithm, "")
             )
             best = max(best, s)
         return best
     else:
+
         def scorer(fa, fb):
             return _raw_similarity(path_a, path_b, algorithm, fa, fb)
+
         return compare_with_orientations(path_a, path_b, scorer, features_a=features_a)
 
 
@@ -971,14 +1075,19 @@ def invalidate_similarity_cache(session, file_hash: str):
     try:
         from sqlmodel import select as _sel
         from app.models import SimilarityCache
+
         stmt = _sel(SimilarityCache).where(
-            (SimilarityCache.hash_a == file_hash) | (SimilarityCache.hash_b == file_hash)
+            (SimilarityCache.hash_a == file_hash)
+            | (SimilarityCache.hash_b == file_hash)
         )
         for entry in session.exec(stmt).all():
             session.delete(entry)
         session.commit()
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "Similarity cache invalidation failed for hash %s: %s", file_hash, e
+        )
         try:
             session.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_exc:
+            logger.debug("Rollback failed during cache invalidation: %s", rollback_exc)

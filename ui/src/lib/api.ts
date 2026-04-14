@@ -302,23 +302,6 @@ export const extractDocument = async (projectId: string, filePath: string): Prom
   };
 };
 
-// Get document status
-export const getDocument = async (documentId: string): Promise<Document> => {
-  // 简化后端没有文档状态接口，直接返回 completed
-  return {
-    id: documentId,
-    filename: "",
-    status: "completed",
-    project_id: 0,
-    extracted_images_count: 0,
-  };
-};
-
-// Get project documents
-export const getProjectDocuments = async (projectId: string): Promise<Document[]> => {
-  return [];
-};
-
 export const getProjectImages = async (projectId: string): Promise<Image[]> => {
   const endpoint = `${API_BASE_URL}/images/${projectId}`;
   const response = await fetch(endpoint, { headers: await getAuthHeaders() });
@@ -442,12 +425,6 @@ export const getAnalysisResult = async (
   return getComparisonResults(analysisId, hashType, threshold);
 };
 
-// Legacy function for backward compatibility
-export const getAnalysisResults = async (projectId: string): Promise<AnalysisResult[]> => {
-  const r = await analyzeImages(projectId, "phash");
-  return [r];
-};
-
 // ─── Smart Compare: 一键智能查重 ───────────────────────────────────
 
 export interface SmartCompareGroup {
@@ -470,18 +447,38 @@ export interface SmartCompareResult {
 
 export const smartCompare = async (
   projectId: string,
-  threshold = 0.85,
+  threshold?: number,
 ): Promise<SmartCompareResult> => {
-  const fd = new FormData();
-  fd.append("threshold", String(threshold));
+  const params = new URLSearchParams();
+  if (typeof threshold === "number") {
+    params.set("threshold", String(threshold));
+  }
+  const endpoint = `${API_BASE_URL}/smart_compare/${projectId}${params.toString() ? `?${params.toString()}` : ""}`;
   const response = await fetch(
-    `${API_BASE_URL}/smart_compare/${projectId}?threshold=${threshold}&min_agree=2`,
+    endpoint,
     { method: "POST" },
   );
   if (!response.ok) {
     const detail = await response.json().catch(() => null);
     throw new APIError(
       detail?.detail || `Smart compare failed (${response.status})`,
+      response.status,
+    );
+  }
+  return response.json();
+};
+
+export const recomputeFeatures = async (
+  projectId: string,
+): Promise<{ triggered: number; message: string }> => {
+  const response = await fetch(
+    `${API_BASE_URL}/recompute_features/${projectId}`,
+    { method: "POST" },
+  );
+  if (!response.ok) {
+    const detail = await response.json().catch(() => null);
+    throw new APIError(
+      detail?.detail || `Recompute failed (${response.status})`,
       response.status,
     );
   }
@@ -619,4 +616,3 @@ export const getFeatureStatus = async (projectId: string): Promise<FeatureStatus
   if (!response.ok) throw new Error("Failed to get feature status");
   return response.json();
 };
-

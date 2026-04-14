@@ -1,26 +1,15 @@
+import logging
 import os
-import uuid
 from pathlib import Path
 from typing import List, Optional, Union, Callable, Any
 import shutil
 
-from sqlmodel import Session, create_engine, select
+logger = logging.getLogger(__name__)
+
+from sqlmodel import Session, create_engine
 from sqlmodel.pool import StaticPool
 
-from .models import Project, Image, ImageRead, ComparisonResult, SimilarGroup, ProjectRead, AnalysisRun
-import json
-from .image_processor import (
-    compute_image_features, calculate_similarity,
-    find_similar_images, group_similar_images,
-    HASH_ALGOS, PIXEL_ALGOS, DESCRIPTOR_ALGOS, FUSION_ALGOS, ALL_ALGOS,
-    get_cached_descriptor, calculate_descriptor_similarity,
-    calculate_ssim_similarity, calculate_histogram_similarity,
-    calculate_template_similarity, calculate_hybrid_similarity,
-    compare_with_orientations,
-)
-
-# 静态文件根目录（存储 uploads/extracted），默认 data
-STATIC_DIR = Path(os.getenv("STATIC_DIR", "data"))
+from .models import Project
 
 
 def get_database_url(db_path: str = "data/database.db"):
@@ -48,17 +37,42 @@ def create_db_and_tables(engine):
     SQLModel.metadata.create_all(engine)
 
 
-def get_session(database_url: str):
-    """获取数据库会话"""
+_ENGINE_CACHE: dict[str, Any] = {}
+
+
+def _build_engine(database_url: str):
     engine = create_engine(
         database_url,
         poolclass=StaticPool,
         connect_args={
             "check_same_thread": False,
         },
-        echo=False  # 设置为True可以看到SQL日志
+        echo=False,  # 设置为True可以看到SQL日志
     )
     create_db_and_tables(engine)
+    return engine
+
+
+def _is_in_memory_sqlite(database_url: str) -> bool:
+    return database_url in {"sqlite://", "sqlite:///:memory:"}
+
+
+def get_engine(database_url: Optional[str] = None):
+    """获取应用级复用 engine；内存 SQLite 保持独立实例。"""
+    resolved_url = database_url or get_database_url()
+    if _is_in_memory_sqlite(resolved_url):
+        return _build_engine(resolved_url)
+
+    engine = _ENGINE_CACHE.get(resolved_url)
+    if engine is None:
+        engine = _build_engine(resolved_url)
+        _ENGINE_CACHE[resolved_url] = engine
+    return engine
+
+
+def get_session(database_url: Optional[str] = None):
+    """获取数据库会话"""
+    engine = get_engine(database_url)
     return Session(engine)
 
 
@@ -69,9 +83,33 @@ def ensure_directory(directory: Union[str, Path]) -> Path:
     return dir_path
 
 
-def generate_unique_filename(original_filename: str, directory: Union[str, Path]) -> str:
+def sanitize_filename(filename: str) -> str:
+    """清理客户端传入文件名，阻止路径穿越。"""
+    cleaned = Path(filename).name.strip().replace("\x00", "")
+    if cleaned in {"", ".", ".."}:
+        raise ValueError("文件名无效")
+    return cleaned
+
+
+def resolve_path_within(
+    base_dir: Union[str, Path], relative_path: Union[str, Path]
+) -> Path:
+    """将相对路径解析到指定目录内，越界时抛出异常。"""
+    base = Path(base_dir).resolve()
+    candidate = (base / relative_path).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError as exc:
+        raise ValueError("文件路径越界") from exc
+    return candidate
+
+
+def generate_unique_filename(
+    original_filename: str, directory: Union[str, Path]
+) -> str:
     """生成唯一的文件名，避免冲突"""
     directory = Path(directory)
+    original_filename = sanitize_filename(original_filename)
     name, ext = os.path.splitext(original_filename)
 
     # 如果文件不存在，直接使用原名
@@ -125,13 +163,14 @@ def format_file_size(size_bytes: int) -> str:
 def is_supported_image_format(filename: str) -> bool:
     """检查是否为支持的图像格式（全品种）"""
     from .image_processor import SUPPORTED_IMAGE_EXTENSIONS
+
     _, ext = os.path.splitext(filename.lower())
     return ext in SUPPORTED_IMAGE_EXTENSIONS
 
 
 def is_supported_document_format(filename: str) -> bool:
     """检查是否为支持的文档格式"""
-    doc_extensions = {'.pdf', '.docx', '.pptx'}
+    doc_extensions = {".pdf", ".docx", ".pptx"}
     _, ext = os.path.splitext(filename.lower())
     return ext in doc_extensions
 
@@ -144,320 +183,87 @@ def delete_file_if_exists(file_path: Union[str, Path]) -> bool:
             file_path.unlink()
             return True
         return False
-    except Exception:
+    except Exception as exc:
+        logger.debug("File deletion failed for %s: %s", file_path, exc)
         return False
 
 
-def cleanup_project_files(project: Project, upload_dir: str = "data/uploads", extract_dir: str = "data/extracted") -> dict:
+def cleanup_project_files(
+    project: Project,
+    upload_dir: str = "data/uploads",
+    extract_dir: str = "data/extracted",
+) -> dict:
     """清理项目相关的文件"""
-    results = {
-        'deleted_files': [],
-        'errors': []
-    }
+    results = {"deleted_files": [], "errors": []}
 
     try:
         # 删除项目中的图像文件
         for image in project.images:
             if delete_file_if_exists(image.file_path):
-                results['deleted_files'].append(image.file_path)
+                results["deleted_files"].append(image.file_path)
 
         # 注意：这里不删除原始上传文件，因为可能被多个项目使用
         # 可以根据需要调整这个策略
 
     except Exception as e:
-        results['errors'].append(str(e))
+        results["errors"].append(str(e))
 
     return results
 
 
 def group_similar_by_metric(
-    images: List[dict],
-    threshold: float,
-    scorer: Callable[[dict, dict], float]
+    images: List[dict], threshold: float, scorer: Callable[[dict, dict], float]
 ) -> tuple[list[list[dict]], list[dict]]:
     """
-    通用分组：基于自定义相似度 scorer。
+    通用分组：基于自定义相似度 scorer 构建连通分量。
     返回 (groups, ungrouped)
     """
+    n = len(images)
+    if n <= 1:
+        return [], images.copy()
+
+    parent = list(range(n))
+    rank = [0] * n
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(a: int, b: int) -> None:
+        ra = find(a)
+        rb = find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            parent[ra] = rb
+        elif rank[ra] > rank[rb]:
+            parent[rb] = ra
+        else:
+            parent[rb] = ra
+            rank[ra] += 1
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim = scorer(images[i], images[j])
+            if sim >= threshold:
+                union(i, j)
+
+    groups_map: dict[int, list[dict]] = {}
+    for idx, image in enumerate(images):
+        root = find(idx)
+        groups_map.setdefault(root, []).append(image)
+
     groups: list[list[dict]] = []
     ungrouped: list[dict] = []
-    visited = set()
-
-    for i, img in enumerate(images):
-        if img['id'] in visited:
+    for idx in range(n):
+        members = groups_map.get(idx)
+        if not members:
             continue
-        group = [img]
-        visited.add(img['id'])
-        for j in range(i + 1, len(images)):
-            other = images[j]
-            if other['id'] in visited:
-                continue
-            sim = scorer(img, other)
-            if sim >= threshold:
-                group.append(other)
-                visited.add(other['id'])
-        if len(group) > 1:
-            groups.append(group)
+        if len(members) > 1:
+            groups.append(members)
         else:
-            ungrouped.append(img)
-
-    # 补上未访问的（理论上无）
-    for img in images:
-        if img['id'] not in visited:
-            ungrouped.append(img)
+            ungrouped.extend(members)
 
     return groups, ungrouped
-
-
-def compare_images_in_project(
-    session: Session,
-    project_id: int,
-    threshold: float = 0.85,
-    hash_type: str = 'orb',
-    rotation_invariant: bool = False,
-) -> ComparisonResult:
-    """
-    比对项目中的所有图像
-
-    Args:
-        session: 数据库会话
-        project_id: 项目ID
-        threshold: 相似度阈值
-        hash_type: 使用的哈希类型
-
-    Returns:
-        比对结果
-    """
-    # 获取项目
-    project = session.get(Project, project_id)
-    if not project:
-        raise ValueError(f"项目不存在: {project_id}")
-
-    # 获取项目中的所有图像
-    statement = select(Image).where(Image.project_id == project_id)
-    images = session.exec(statement).all()
-
-    if not images:
-        return ComparisonResult(
-            project_id=project_id,
-            total_images=0,
-            groups=[],
-            unique_images=[]
-        )
-
-    # 转换为字典格式
-    image_dicts = []
-    for img in images:
-        image_dict = {
-            'id': img.id,
-            'filename': img.filename,
-            'file_path': img.file_path,
-            'file_hash': img.file_hash,
-            'phash': img.phash,
-            'dhash': img.dhash,
-            'ahash': img.ahash,
-            'whash': img.whash,
-            'colorhash': getattr(img, 'colorhash', None),
-            'extracted_from': img.extracted_from,
-            'file_size': img.file_size,
-            'width': img.width,
-            'height': img.height,
-            'created_at': img.created_at
-        }
-        image_dicts.append(image_dict)
-
-    # 特征类算法需要读取文件计算描述子
-    if hash_type in DESCRIPTOR_ALGOS:
-        for img in image_dicts:
-            try:
-                fp = STATIC_DIR / img['file_path']
-                desc, norm = get_cached_descriptor(str(fp), img['file_hash'], hash_type)
-                img['descriptor'] = desc
-                img['descriptor_norm'] = norm
-            except Exception:
-                img['descriptor'] = None
-                img['descriptor_norm'] = None
-
-    # 执行相似度分组
-    if hash_type in DESCRIPTOR_ALGOS:
-        def scorer(a: dict, b: dict) -> float:
-            if rotation_invariant:
-                pa = str(STATIC_DIR / a['file_path'])
-                pb = str(STATIC_DIR / b['file_path'])
-                def _desc_scorer(p_a, p_b):
-                    from .image_processor import compute_descriptor
-                    da, na = compute_descriptor(p_a, hash_type)
-                    db, _ = compute_descriptor(p_b, hash_type)
-                    return calculate_descriptor_similarity(da, db, na)
-                return compare_with_orientations(pa, pb, _desc_scorer)
-            return calculate_descriptor_similarity(
-                a.get('descriptor'),
-                b.get('descriptor'),
-                a.get('descriptor_norm') or b.get('descriptor_norm') or 4
-            )
-        groups, ungrouped = group_similar_by_metric(image_dicts, threshold, scorer)
-
-    elif hash_type in PIXEL_ALGOS:
-        # Tier 2: 像素/结构级比对
-        pixel_fn_map = {
-            'ssim': calculate_ssim_similarity,
-            'histogram': calculate_histogram_similarity,
-            'template': calculate_template_similarity,
-        }
-        pixel_fn = pixel_fn_map[hash_type]
-
-        def scorer(a: dict, b: dict) -> float:
-            try:
-                pa = str(STATIC_DIR / a['file_path'])
-                pb = str(STATIC_DIR / b['file_path'])
-                if rotation_invariant:
-                    return compare_with_orientations(pa, pb, pixel_fn)
-                return pixel_fn(pa, pb)
-            except Exception:
-                return 0.0
-        groups, ungrouped = group_similar_by_metric(image_dicts, threshold, scorer)
-
-    elif hash_type in FUSION_ALGOS:
-        # 融合模式 (auto)
-        def scorer(a: dict, b: dict) -> float:
-            try:
-                pa = str(STATIC_DIR / a['file_path'])
-                pb = str(STATIC_DIR / b['file_path'])
-                if rotation_invariant:
-                    def _fusion_scorer(p_a, p_b):
-                        from .image_processor import compute_image_features as _cif
-                        fa = _cif(p_a)
-                        fb = _cif(p_b)
-                        return calculate_hybrid_similarity(p_a, p_b, fa, fb)
-                    return compare_with_orientations(pa, pb, _fusion_scorer)
-                return calculate_hybrid_similarity(pa, pb, a, b)
-            except Exception:
-                return 0.0
-        groups, ungrouped = group_similar_by_metric(image_dicts, threshold, scorer)
-
-    else:
-        # Tier 1: 哈希类算法
-        if rotation_invariant:
-            # 对每张图的 8 种变体计算哈希，比对时取最高分
-            from .image_processor import compute_features_for_variants
-            variant_cache = {}  # file_hash -> [features_list]
-            def scorer(a: dict, b: dict) -> float:
-                fh_b = b['file_hash']
-                if fh_b not in variant_cache:
-                    pb = str(STATIC_DIR / b['file_path'])
-                    variant_cache[fh_b] = compute_features_for_variants(pb)
-                best = 0.0
-                for vf in variant_cache[fh_b]:
-                    s = calculate_similarity(
-                        a.get(hash_type, ''),
-                        vf.get(hash_type, '')
-                    )
-                    best = max(best, s)
-                    if best >= 0.95:
-                        break
-                return best
-            groups, ungrouped = group_similar_by_metric(image_dicts, threshold, scorer)
-        else:
-            groups, ungrouped = group_similar_images(image_dicts, threshold, hash_type)
-
-    # 转换为响应格式
-    similar_groups = []
-    for group in groups:
-        # 计算组的平均相似度
-        if len(group) > 1:
-            total_similarity = 0
-            count = 0
-            for i in range(len(group)):
-                for j in range(i + 1, len(group)):
-                    if hash_type in DESCRIPTOR_ALGOS or hash_type in PIXEL_ALGOS or hash_type in FUSION_ALGOS:
-                        similarity = scorer(group[i], group[j])
-                    else:
-                        similarity = calculate_similarity(
-                            group[i].get(hash_type, ''),
-                            group[j].get(hash_type, '')
-                        )
-                    total_similarity += similarity
-                    count += 1
-            avg_similarity = total_similarity / count if count > 0 else 1.0
-        else:
-            avg_similarity = 1.0
-
-        # 转换图片格式
-        group_images = []
-        for img_dict in group:
-            img_read = ImageRead(
-                id=img_dict['id'],
-                filename=img_dict['filename'],
-                project_id=img_dict.get('project_id', project_id),
-                file_path=img_dict['file_path'],
-                file_hash=img_dict['file_hash'],
-                phash=img_dict['phash'],
-                dhash=img_dict.get('dhash'),
-                ahash=img_dict.get('ahash'),
-                whash=img_dict.get('whash'),
-                colorhash=img_dict.get('colorhash'),
-                extracted_from=img_dict.get('extracted_from'),
-                file_size=img_dict.get('file_size'),
-                width=img_dict.get('width'),
-                height=img_dict.get('height'),
-                created_at=img_dict['created_at']
-            )
-            group_images.append(img_read)
-
-        similar_groups.append(SimilarGroup(
-            group_id=len(similar_groups) + 1,
-            similarity_score=avg_similarity,
-            images=group_images
-        ))
-
-    # 转换未分组图片格式
-    unique_images = []
-    for img_dict in ungrouped:
-        img_read = ImageRead(
-            id=img_dict['id'],
-            filename=img_dict['filename'],
-            project_id=img_dict.get('project_id', project_id),
-            file_path=img_dict['file_path'],
-            file_hash=img_dict['file_hash'],
-            phash=img_dict['phash'],
-            dhash=img_dict.get('dhash'),
-            ahash=img_dict.get('ahash'),
-            whash=img_dict.get('whash'),
-            extracted_from=img_dict.get('extracted_from'),
-            file_size=img_dict.get('file_size'),
-            width=img_dict.get('width'),
-            height=img_dict.get('height'),
-            created_at=img_dict['created_at']
-        )
-        unique_images.append(img_read)
-
-    result = ComparisonResult(
-        project_id=project_id,
-        total_images=len(images),
-        groups=similar_groups,
-        unique_images=unique_images
-    )
-
-    # 落库存储概要（不含大对象）
-    try:
-        run = AnalysisRun(
-            project_id=project_id,
-            hash_type=hash_type,
-            threshold=threshold,
-            total_images=len(images),
-            groups_count=len(similar_groups),
-            unique_count=len(unique_images),
-            summary=json.dumps(result.model_dump(), default=str)
-        )
-        session.add(run)
-        session.commit()
-        session.refresh(run)
-        # 附加 run_id 以便前端引用
-        result_dict = result.model_dump()
-        result_dict["run_id"] = run.id
-        return ComparisonResult.model_validate(result_dict)
-    except Exception as e:
-        # 持久化失败不影响主流程
-        import logging
-        logging.getLogger(__name__).warning(f"Failed to save AnalysisRun: {e}")
-        return result

@@ -7,7 +7,6 @@ import { Zap, Cpu, Layers, Play, Eye, BarChart3, Blend, type LucideIcon } from "
 import { HashType } from "@/lib/api";
 
 interface AnalysisPanelProps {
-  projectId: string;
   hasImages: boolean;
   loading?: boolean;
   onAnalyze: (hashType: HashType, rotationInvariant: boolean) => void;
@@ -48,7 +47,7 @@ const allAlgos: { tier: string; algos: AlgoItem[] }[] = [
   },
 ];
 
-export function AnalysisPanel({ projectId, hasImages, onAnalyze, loading }: AnalysisPanelProps) {
+export function AnalysisPanel({ hasImages, onAnalyze, loading }: AnalysisPanelProps) {
   const [rotationInvariant, setRotationInvariant] = useState(false);
 
   const handleFullAnalysis = () => {

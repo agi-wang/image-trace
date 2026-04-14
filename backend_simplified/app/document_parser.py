@@ -1,9 +1,12 @@
+import logging
 import os
 import uuid
 import zipfile
 from typing import List, Dict, Any, Tuple
 from pathlib import Path
 import io
+
+logger = logging.getLogger(__name__)
 
 # PDF处理
 import fitz  # PyMuPDF
@@ -17,7 +20,9 @@ from .image_processor import compute_image_features, is_image_file
 class DocumentParser:
     """文档解析器，支持从PDF、DOCX、PPTX中提取图片"""
 
-    def __init__(self, upload_dir: str = "data/uploads", extract_dir: str = "data/extracted"):
+    def __init__(
+        self, upload_dir: str = "data/uploads", extract_dir: str = "data/extracted"
+    ):
         self.upload_dir = Path(upload_dir)
         self.extract_dir = Path(extract_dir)
         # data 目录（用于生成相对路径：uploads/...、extracted/...）
@@ -29,8 +34,8 @@ class DocumentParser:
         """将路径转换为相对于 data 目录的路径字符串"""
         try:
             return str(path.resolve().relative_to(self.base_dir.resolve()))
-        except Exception:
-            # 兜底：尽量给出可读路径
+        except Exception as exc:
+            logger.debug("Path relativization failed for %s: %s", path, exc)
             return str(path)
 
     def extract_images_from_document(self, file_path: str) -> List[Dict[str, Any]]:
@@ -46,9 +51,9 @@ class DocumentParser:
         file_path = Path(file_path)
         ext = file_path.suffix.lower()
 
-        if ext == '.pdf':
+        if ext == ".pdf":
             return self._extract_from_pdf(file_path)
-        elif ext in ['.docx', '.pptx']:
+        elif ext in [".docx", ".pptx"]:
             return self._extract_from_office(file_path)
         else:
             raise ValueError(f"不支持的文档格式: {ext}")
@@ -84,19 +89,21 @@ class DocumentParser:
                             f.write(image_bytes)
 
                         # 如果是PDF格式，转换为JPEG
-                        if image_ext.lower() == 'pdf':
+                        if image_ext.lower() == "pdf":
                             save_path = self._convert_to_jpeg(save_path)
 
                         # 计算特征
                         features = compute_image_features(str(save_path))
-                        features.update({
-                            'filename': filename,
-                            'file_path': self._rel_to_base(save_path),
-                            'extracted_from': self._rel_to_base(pdf_path),
-                            'extraction_method': 'embedded',
-                            'page_number': page_num + 1,
-                            'image_index': img_index
-                        })
+                        features.update(
+                            {
+                                "filename": filename,
+                                "file_path": self._rel_to_base(save_path),
+                                "extracted_from": self._rel_to_base(pdf_path),
+                                "extraction_method": "embedded",
+                                "page_number": page_num + 1,
+                                "image_index": img_index,
+                            }
+                        )
 
                         extracted_images.append(features)
                         img_index += 1
@@ -143,14 +150,16 @@ class DocumentParser:
 
                     # 计算特征
                     features = compute_image_features(str(save_path))
-                    features.update({
-                        'filename': filename,
-                        'file_path': self._rel_to_base(save_path),
-                        'extracted_from': self._rel_to_base(pdf_path),
-                        'extraction_method': 'rendered',
-                        'page_number': page_num + 1,
-                        'image_index': 0
-                    })
+                    features.update(
+                        {
+                            "filename": filename,
+                            "file_path": self._rel_to_base(save_path),
+                            "extracted_from": self._rel_to_base(pdf_path),
+                            "extraction_method": "rendered",
+                            "page_number": page_num + 1,
+                            "image_index": 0,
+                        }
+                    )
 
                     rendered_images.append(features)
             finally:
@@ -169,12 +178,13 @@ class DocumentParser:
 
         try:
             # Office文档实际上是ZIP文件
-            with zipfile.ZipFile(file_path, 'r') as zip_file:
+            with zipfile.ZipFile(file_path, "r") as zip_file:
                 # 查找媒体文件
                 media_files = []
                 for file_info in zip_file.filelist:
-                    if file_info.filename.startswith('word/media/') or \
-                       file_info.filename.startswith('ppt/media/'):
+                    if file_info.filename.startswith(
+                        "word/media/"
+                    ) or file_info.filename.startswith("ppt/media/"):
                         media_files.append(file_info)
 
                 # 提取媒体文件
@@ -200,22 +210,24 @@ class DocumentParser:
                             f.write(file_data)
 
                         # 如果是PDF格式，转换为JPEG
-                        if ext.lower() == '.pdf':
+                        if ext.lower() == ".pdf":
                             save_path = self._convert_to_jpeg(save_path)
-                            ext = '.jpg'
+                            ext = ".jpg"
                             filename = save_path.name
 
                         # 计算特征
                         features = compute_image_features(str(save_path))
-                        features.update({
-                            'filename': filename,
-                            'file_path': self._rel_to_base(save_path),
-                            'extracted_from': self._rel_to_base(file_path),
-                            'extraction_method': f'{file_type}_media',
-                            'page_number': None,
-                            'image_index': idx,
-                            'media_path': file_info.filename
-                        })
+                        features.update(
+                            {
+                                "filename": filename,
+                                "file_path": self._rel_to_base(save_path),
+                                "extracted_from": self._rel_to_base(file_path),
+                                "extraction_method": f"{file_type}_media",
+                                "page_number": None,
+                                "image_index": idx,
+                                "media_path": file_info.filename,
+                            }
+                        )
 
                         extracted_images.append(features)
 
@@ -226,31 +238,31 @@ class DocumentParser:
 
     def _guess_image_extension(self, file_data: bytes) -> str:
         """根据文件头猜测图像格式"""
-        if file_data.startswith(b'\xFF\xD8\xFF'):
-            return '.jpg'
-        elif file_data.startswith(b'\x89PNG\r\n\x1a\n'):
-            return '.png'
-        elif file_data.startswith(b'GIF87a') or file_data.startswith(b'GIF89a'):
-            return '.gif'
-        elif file_data.startswith(b'BM'):
-            return '.bmp'
-        elif file_data.startswith(b'II*\x00') or file_data.startswith(b'MM\x00*'):
-            return '.tiff'
-        elif file_data.startswith(b'%PDF'):
-            return '.pdf'
+        if file_data.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        elif file_data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        elif file_data.startswith(b"GIF87a") or file_data.startswith(b"GIF89a"):
+            return ".gif"
+        elif file_data.startswith(b"BM"):
+            return ".bmp"
+        elif file_data.startswith(b"II*\x00") or file_data.startswith(b"MM\x00*"):
+            return ".tiff"
+        elif file_data.startswith(b"%PDF"):
+            return ".pdf"
         else:
-            return '.jpg'  # 默认为JPEG
+            return ".jpg"  # 默认为JPEG
 
     def _convert_to_jpeg(self, image_path: Path) -> Path:
         """将图片转换为JPEG格式"""
         try:
             with PILImage.open(image_path) as img:
                 # 转换为RGB模式（如果需要）
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
 
                 # 生成新文件名
-                new_path = image_path.with_suffix('.jpg')
+                new_path = image_path.with_suffix(".jpg")
 
                 # 保存为JPEG
                 img.save(new_path, "JPEG", quality=85, optimize=True)
@@ -282,7 +294,7 @@ class DocumentParser:
 
         # 检查文件类型
         ext = file_path.suffix.lower()
-        if ext not in ['.pdf', '.docx', '.pptx']:
+        if ext not in [".pdf", ".docx", ".pptx"]:
             raise ValueError(f"不支持的文档格式: {ext}")
 
         # 提取图片
@@ -290,19 +302,19 @@ class DocumentParser:
             extracted_images = self.extract_images_from_document(file_path)
 
             return {
-                'status': 'success',
-                'document_path': self._rel_to_base(file_path),
-                'document_name': file_path.name,
-                'document_type': ext[1:].upper(),
-                'extracted_count': len(extracted_images),
-                'images': extracted_images
+                "status": "success",
+                "document_path": self._rel_to_base(file_path),
+                "document_name": file_path.name,
+                "document_type": ext[1:].upper(),
+                "extracted_count": len(extracted_images),
+                "images": extracted_images,
             }
 
         except Exception as e:
             return {
-                'status': 'error',
-                'document_path': self._rel_to_base(file_path),
-                'error': str(e),
-                'extracted_count': 0,
-                'images': []
+                "status": "error",
+                "document_path": self._rel_to_base(file_path),
+                "error": str(e),
+                "extracted_count": 0,
+                "images": [],
             }

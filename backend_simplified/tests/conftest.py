@@ -8,11 +8,13 @@ from pathlib import Path
 
 import pytest
 from PIL import Image as PILImage
+from PIL import ImageDraw
 from sqlmodel import Session, SQLModel, create_engine
 from sqlmodel.pool import StaticPool
 from fastapi.testclient import TestClient
 
 # -- 目录 fixtures ----------------------------------------------------------
+
 
 @pytest.fixture
 def tmp_dir(tmp_path):
@@ -35,6 +37,7 @@ def extract_dir(tmp_dir):
 
 
 # -- 图片 fixtures ----------------------------------------------------------
+
 
 @pytest.fixture
 def sample_image(tmp_dir) -> Path:
@@ -68,7 +71,7 @@ def sample_image_pair(tmp_dir):
     """生成两张图片：一张相同内容（重复），一张不同内容。"""
     img_a = PILImage.new("RGB", (100, 100), color=(128, 64, 32))
     img_b = PILImage.new("RGB", (100, 100), color=(128, 64, 32))  # 同色
-    img_c = PILImage.new("RGB", (100, 100), color=(0, 255, 0))     # 不同色
+    img_c = PILImage.new("RGB", (100, 100), color=(0, 255, 0))  # 不同色
 
     path_a = tmp_dir / "pair_a.png"
     path_b = tmp_dir / "pair_b.png"
@@ -80,6 +83,7 @@ def sample_image_pair(tmp_dir):
 
 
 # -- 数据库 fixtures --------------------------------------------------------
+
 
 @pytest.fixture
 def db_session():
@@ -96,16 +100,24 @@ def db_session():
 
 # -- FastAPI TestClient fixture ---------------------------------------------
 
+
 class _SyncASGIClient:
     """httpx.AsyncClient 的同步包装，用于测试 ASGI 应用。"""
 
     def __init__(self, app):
         import httpx
+
+        self._app = app
         self._transport = httpx.ASGITransport(app=app)
-        self._client = httpx.AsyncClient(transport=self._transport, base_url="http://testserver")
+        self._client = httpx.AsyncClient(
+            transport=self._transport, base_url="http://testserver"
+        )
+        self._lifespan = app.router.lifespan_context(app)
+        self._run(self._lifespan.__aenter__())
 
     def _run(self, coro):
         import asyncio
+
         loop = asyncio.new_event_loop()
         try:
             return loop.run_until_complete(coro)
@@ -125,7 +137,12 @@ class _SyncASGIClient:
         return self._run(self._client.delete(url, **kwargs))
 
     def close(self):
-        self._run(self._client.aclose())
+        try:
+            self._run(self._client.aclose())
+        finally:
+            if self._lifespan is not None:
+                self._run(self._lifespan.__aexit__(None, None, None))
+                self._lifespan = None
 
 
 @pytest.fixture
@@ -163,19 +180,73 @@ def client(tmp_dir):
     c.close()
 
     # 清理环境变量
-    for key in ["UPLOAD_DIR", "EXTRACT_DIR", "STATIC_DIR", "DATABASE_URL", "DESCRIPTOR_DIR"]:
+    for key in [
+        "UPLOAD_DIR",
+        "EXTRACT_DIR",
+        "STATIC_DIR",
+        "DATABASE_URL",
+        "DESCRIPTOR_DIR",
+    ]:
         os.environ.pop(key, None)
 
 
 # -- 辅助函数 ---------------------------------------------------------------
 
-def make_upload_bytes(filename: str = "test.png", size=(100, 100), color=(128, 64, 32)) -> tuple:
+
+def make_upload_bytes(
+    filename: str = "test.png", size=(100, 100), color=(128, 64, 32)
+) -> tuple:
     """生成用于 TestClient 上传的 (filename, BytesIO, content_type) 元组。"""
     buf = BytesIO()
     img = PILImage.new("RGB", size, color=color)
     ext = filename.rsplit(".", 1)[-1].lower()
-    fmt = {"png": "PNG", "jpg": "JPEG", "jpeg": "JPEG", "tif": "TIFF", "tiff": "TIFF", "bmp": "BMP"}.get(ext, "PNG")
+    fmt = {
+        "png": "PNG",
+        "jpg": "JPEG",
+        "jpeg": "JPEG",
+        "tif": "TIFF",
+        "tiff": "TIFF",
+        "bmp": "BMP",
+    }.get(ext, "PNG")
     img.save(buf, format=fmt)
     buf.seek(0)
-    ct = {"png": "image/png", "jpg": "image/jpeg", "tif": "image/tiff"}.get(ext, "image/png")
+    ct = {"png": "image/png", "jpg": "image/jpeg", "tif": "image/tiff"}.get(
+        ext, "image/png"
+    )
+    return (filename, buf, ct)
+
+
+def make_pattern_upload_bytes(filename: str = "pattern.png", size=(240, 240)) -> tuple:
+    """生成带有明显特征点的测试图片。"""
+    buf = BytesIO()
+    img = PILImage.new("RGB", size, color=(245, 245, 245))
+    draw = ImageDraw.Draw(img)
+
+    draw.rectangle((20, 20, size[0] - 20, size[1] - 20), outline=(30, 30, 30), width=4)
+    draw.line((20, 20, size[0] - 20, size[1] - 20), fill=(220, 40, 40), width=5)
+    draw.line((size[0] - 20, 20, 20, size[1] - 20), fill=(40, 90, 220), width=5)
+    draw.ellipse((70, 50, 170, 150), outline=(30, 160, 70), width=6)
+    draw.rectangle(
+        (95, 95, 145, 145), fill=(250, 190, 40), outline=(20, 20, 20), width=3
+    )
+
+    ext = filename.rsplit(".", 1)[-1].lower()
+    fmt = {
+        "png": "PNG",
+        "jpg": "JPEG",
+        "jpeg": "JPEG",
+        "tif": "TIFF",
+        "tiff": "TIFF",
+        "bmp": "BMP",
+    }.get(ext, "PNG")
+    img.save(buf, format=fmt)
+    buf.seek(0)
+    ct = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "tif": "image/tiff",
+        "tiff": "image/tiff",
+        "bmp": "image/bmp",
+    }.get(ext, "image/png")
     return (filename, buf, ct)
