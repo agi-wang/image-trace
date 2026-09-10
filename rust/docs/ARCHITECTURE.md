@@ -12,7 +12,7 @@
 | 描述子 | OpenCV（ORB/BRISK/SIFT/AKAZE/KAZE） | 纯 Rust ORB + AKAZE；SIFT 预留 trait 插槽 |
 | 矩阵引擎 | numpy BLAS | rayon 并行 + 位运算 XOR/popcount |
 | 文档解析 | PyMuPDF + zipfile | lopdf（PDF 内嵌图）+ zip（OOXML media） |
-| 存储 | SQLModel/SQLite，feature 向量 base64 TEXT | rusqlite，feature 向量 BLOB（二进制，免编解码） |
+| 存储 | SQLModel/SQLite，feature 向量 base64 TEXT | rusqlite（元数据/特征 BLOB）+ `BlobStore` 抽象：本地 fs 或 MinIO/S3 对象存储 |
 | 缓存 | 进程内 LRU + SQLite 双写 | 统一走 `feature_store` + `pair_cache` 表 |
 | 部署 | PyInstaller/Nuitka 打包 | `cargo build --release` 一个文件 |
 
@@ -21,12 +21,31 @@
 ```
 crates/
   itrace-core    纯计算库：解码、哈希、像素指标、ORB/AKAZE、变体、分组、切片匹配
-  itrace-store   rusqlite 持久化：projects/images/features/pair_cache/analysis_runs
+  itrace-store   rusqlite 持久化 + BlobStore（fs | s3）：projects/images/features/pair_cache/analysis_runs
   itrace-server  axum HTTP API（docs/openapi.yaml 的实现）
   itrace-cli     clap 命令行：init/add/compare/smart/report/serve
 ```
 
-数据目录布局与原版一致：`data/uploads` `data/extracted` `data/thumbnails` `data/visualizations`，数据库 `data/image-trace.db`。
+## 存储后端（BlobStore）
+
+文件负载（uploads/extracted/thumbnails/visualizations）走 `BlobStore` trait 抽象，
+元数据与特征向量始终在 SQLite。`ITRACE_STORAGE` 选择后端：
+
+- `fs`（默认）：与原版一致，`data/` 目录直存，`local_path()` 直通文件系统。
+- `s3`：MinIO 或任意 S3 兼容端点（`object_store::aws`）。env：`S3_ENDPOINT`
+  `S3_BUCKET` `S3_REGION` `S3_ACCESS_KEY` `S3_SECRET_KEY`（含 S3_FORCE_PATH_STYLE）。
+  对象 key 与 fs 路径同构（`uploads/x.jpg`）；`local_path()` 返回 `None`，
+  调用方一律走 `read_file`/`write_file`/`delete_file`。docker-compose 附带
+  MinIO + 自动建桶。
+
+## 特征提取（FeatureExtractor 注册表）
+
+每个存储特征是一个 `FeatureExtractor` 插件（`features.rs::EXTRACTORS`）：
+`compute`（gray,rgb→bytes）与 `similarity`（bytes×bytes→score）自含于
+单个实现中，矩阵引擎 `generic_similarity_matrix` 统一做变体-max + rayon
+并行打分。新增特征（如 DINOv2 嵌入）= 实现 trait + 加一条注册项，
+无需改动比对/存储路径。算法名 → 特征经 `extractor_for_algo` 解析
+（`ssim`/`template` 共享 `gray_flat`，`orb` 预筛用 `orb_pooled`）。
 
 ## 算法栈（识别能力设计）
 

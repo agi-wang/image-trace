@@ -139,12 +139,19 @@ pub fn gray_orientation_variants(gray: &GrayImage) -> Vec<GrayImage> {
     ]
 }
 
-/// Save an RGB buffer as JPEG for thumbnails / visualizations.
-pub fn save_jpeg(img: &RgbImage, path: &std::path::Path, quality: u8) -> anyhow::Result<()> {
+/// Encode an RGB buffer as JPEG bytes.
+pub fn encode_jpeg(img: &RgbImage, quality: u8) -> anyhow::Result<Vec<u8>> {
     let buf: ImageBuffer<image::Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_raw(img.width, img.height, img.data.clone())
             .ok_or_else(|| anyhow::anyhow!("invalid rgb buffer"))?;
-    buf.save_with_format(path, image::ImageFormat::Jpeg)?;
-    let _ = quality;
+    let mut cur = std::io::Cursor::new(Vec::new());
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, quality);
+    enc.encode_image(&buf)?;
+    Ok(cur.into_inner())
+}
+
+/// Save an RGB buffer as JPEG for thumbnails / visualizations.
+pub fn save_jpeg(img: &RgbImage, path: &std::path::Path, quality: u8) -> anyhow::Result<()> {
+    std::fs::write(path, encode_jpeg(img, quality)?)?;
     Ok(())
 }

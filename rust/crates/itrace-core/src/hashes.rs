@@ -268,9 +268,16 @@ pub fn compute_image_features(
     path: &std::path::Path,
 ) -> anyhow::Result<crate::ImageFeatures> {
     let bytes = std::fs::read(path)?;
-    let file_hash = blake3::hash(&bytes).to_hex().to_string();
+    compute_image_features_bytes(&bytes)
+}
+
+/// Same, from bytes (works with object-storage backends).
+pub fn compute_image_features_bytes(
+    bytes: &[u8],
+) -> anyhow::Result<crate::ImageFeatures> {
+    let file_hash = blake3::hash(bytes).to_hex().to_string();
     let file_size = bytes.len() as u64;
-    let img = image_io::decode(&bytes)?;
+    let img = image_io::decode(bytes)?;
     let (width, height) = image::GenericImageView::dimensions(&img);
     let gray = image_io::to_gray(&img);
     let rgb = image_io::to_rgb(&img);

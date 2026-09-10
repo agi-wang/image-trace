@@ -1,12 +1,17 @@
 //! SQLite store: projects / images / feature vectors / pair cache / runs.
+//! File payloads go through `blob::BlobStore` — local fs or MinIO/S3.
+
+pub mod blob;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use itrace_core::features::FeatureMap;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+
+pub use blob::BlobStore;
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -118,17 +123,45 @@ pub struct AnalysisRunRecord {
 pub struct Store {
     conn: Mutex<Connection>,
     data_dir: PathBuf,
+    blobs: Arc<dyn BlobStore>,
 }
 
 impl Store {
     pub fn open(data_dir: &std::path::Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(data_dir.join("uploads"))?;
-        std::fs::create_dir_all(data_dir.join("extracted"))?;
-        std::fs::create_dir_all(data_dir.join("thumbnails"))?;
-        std::fs::create_dir_all(data_dir.join("visualizations"))?;
+        std::fs::create_dir_all(data_dir)?;
         let conn = Connection::open(data_dir.join("image-trace.db"))?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn: Mutex::new(conn), data_dir: data_dir.to_path_buf() })
+        let blobs = blob::blob_store_from_env(data_dir)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            data_dir: data_dir.to_path_buf(),
+            blobs,
+        })
+    }
+
+    /// Explicit backend override (tests).
+    pub fn with_blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
+    pub fn blobs(&self) -> &Arc<dyn BlobStore> {
+        &self.blobs
+    }
+    pub fn storage_kind(&self) -> &'static str {
+        self.blobs.kind()
+    }
+    pub fn write_file(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.blobs.put(key, data)
+    }
+    pub fn read_file(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.blobs.get(key)
+    }
+    pub fn delete_file(&self, key: &str) -> anyhow::Result<()> {
+        self.blobs.delete(key)
+    }
+    pub fn file_exists(&self, key: &str) -> bool {
+        self.blobs.exists(key)
     }
 
     pub fn data_dir(&self) -> &std::path::Path {
@@ -141,16 +174,11 @@ impl Store {
         self.data_dir.join("extracted")
     }
 
-    /// Resolve a stored relative path (e.g. "uploads/x.jpg") into data dir,
-    /// rejecting traversal.
+    /// Resolve a stored key (e.g. "uploads/x.jpg") to a real fs path when the
+    /// blob backend is local; None under object storage — use read_file instead.
     pub fn resolve(&self, rel: &str) -> Option<PathBuf> {
         let rel = rel.strip_prefix("data/").unwrap_or(rel);
-        let p = self.data_dir.join(rel);
-        // lexical check: no .. components remain after join
-        if rel.split('/').any(|c| c == "..") {
-            return None;
-        }
-        Some(p)
+        self.blobs.local_path(rel)
     }
 
     // ---------- projects ----------

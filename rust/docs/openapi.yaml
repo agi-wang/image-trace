@@ -550,6 +550,10 @@ components:
       properties:
         version: { type: string }
         engine: { type: string, example: rust-native }
+        storage:
+          type: string
+          enum: [fs, s3]
+          description: 文件负载存储后端（ITRACE_STORAGE）
         algorithms:
           type: array
           items: { $ref: '#/components/schemas/Algorithm' }

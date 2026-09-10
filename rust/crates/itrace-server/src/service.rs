@@ -13,7 +13,7 @@ use itrace_core::{documents, hashes, image_io, slice};
 use itrace_core::{HASH_GATE_ALGOS, SMART_ALGOS};
 use itrace_store::{ImageRecord, NewImage, NewRun, Project, Store};
 
-use crate::{enqueue_precompute, rel_to_data, unique_path, ApiError, ApiResult, AppState};
+use crate::{enqueue_precompute, unique_key, ApiError, ApiResult, AppState};
 
 // ---------- upload ----------
 
@@ -24,14 +24,13 @@ pub fn handle_upload(
     data: Vec<u8>,
 ) -> ApiResult<Value> {
     let store = &state.store;
-    let dest = unique_path(&store.upload_dir(), filename);
-    std::fs::write(&dest, &data)?;
-    let rel = rel_to_data(store, &dest);
+    let rel = unique_key(store, "uploads", filename);
+    store.write_file(&rel, &data)?;
     let file_size = data.len() as i64;
 
     if image_io::is_supported_image(filename) {
-        let rec = insert_one_image(store, project_id, &dest, None)?;
-        enqueue_precompute(state, rec.id, dest.clone());
+        let rec = insert_one_image(store, project_id, &rel, filename, None)?;
+        enqueue_precompute(state, rec.id, rel.clone());
         return Ok(json!({
             "project_id": project_id, "filename": filename, "file_path": rel,
             "file_size": file_size, "file_type": "image",
@@ -44,15 +43,15 @@ pub fn handle_upload(
     }
 
     if image_io::is_supported_document(filename) {
-        let extracted = documents::extract(&dest)
+        let extracted = documents::extract_named(filename, &data)
             .map_err(|e| ApiError::unprocessable(format!("文档解析失败: {e:#}")))?;
         let mut processed = Vec::new();
         for img in extracted {
-            let out_path = unique_path(&store.extract_dir(), &img.filename);
-            std::fs::write(&out_path, &img.data)?;
-            match insert_one_image(store, project_id, &out_path, Some(&rel)) {
+            let key = unique_key(store, "extracted", &img.filename);
+            store.write_file(&key, &img.data)?;
+            match insert_one_image(store, project_id, &key, &img.filename, Some(&rel)) {
                 Ok(rec) => {
-                    enqueue_precompute(state, rec.id, out_path.clone());
+                    enqueue_precompute(state, rec.id, key.clone());
                     processed.push(json!({
                         "id": rec.id, "filename": rec.filename,
                         "file_path": rec.file_path, "type": "extracted_from_document"
@@ -68,23 +67,22 @@ pub fn handle_upload(
         }));
     }
 
-    let _ = std::fs::remove_file(&dest);
+    let _ = store.delete_file(&rel);
     Err(ApiError::bad(format!("不支持的文件格式: {filename}")))
 }
 
 fn insert_one_image(
     store: &Store,
     project_id: i64,
-    path: &std::path::Path,
+    key: &str,
+    filename: &str,
     extracted_from: Option<&str>,
 ) -> anyhow::Result<ImageRecord> {
-    let feats = hashes::compute_image_features(path)?;
-    let rel = rel_to_data(store, path);
-    let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("image").to_string();
+    let feats = hashes::compute_image_features_bytes(&store.read_file(key)?)?;
     store.insert_image(&NewImage {
         project_id,
-        filename,
-        file_path: rel,
+        filename: filename.to_string(),
+        file_path: key.to_string(),
         file_hash: feats.file_hash,
         phash: Some(hashes::to_hex(feats.hashes.phash)),
         dhash: Some(hashes::to_hex(feats.hashes.dhash)),
@@ -110,8 +108,8 @@ fn load_prepared(
     images
         .par_iter()
         .filter_map(|img| {
-            let path = store.resolve(&img.file_path)?;
-            Prepared::load(&path, &desc_algos, rot_inv).ok()
+            let bytes = store.read_file(&img.file_path).ok()?;
+            Prepared::from_bytes(&bytes, &desc_algos, rot_inv).ok()
         })
         .collect()
 }
@@ -424,8 +422,8 @@ fn chrono_now() -> String {
 // ---------- match data / visualize / slices ----------
 
 fn load_gray(store: &Store, img: &ImageRecord) -> anyhow::Result<itrace_core::GrayImage> {
-    let path = store.resolve(&img.file_path).context("图像文件不存在")?;
-    let decoded = image_io::decode_file(&path)?;
+    let bytes = store.read_file(&img.file_path).context("图像文件不存在")?;
+    let decoded = image_io::decode(&bytes)?;
     let small = image_io::resize_max_side(&decoded, 1024);
     Ok(image_io::to_gray(&small))
 }
@@ -493,12 +491,8 @@ pub fn visualize(
     let store = &state.store;
     let ext = descriptors::extractor_for(algo)
         .ok_or_else(|| ApiError::bad(format!("算法 {algo} 在此构建中不可用")))?;
-    let path_a = store.resolve(&ia.file_path).filter(|p| p.exists())
-        .ok_or_else(|| ApiError::not_found("图像文件不存在"))?;
-    let path_b = store.resolve(&ib.file_path).filter(|p| p.exists())
-        .ok_or_else(|| ApiError::not_found("图像文件不存在"))?;
-    let imga = image_io::decode_file(&path_a)?;
-    let imgb = image_io::decode_file(&path_b)?;
+    let imga = image_io::decode(&store.read_file(&ia.file_path).map_err(|_| ApiError::not_found("图像文件不存在"))?)?;
+    let imgb = image_io::decode(&store.read_file(&ib.file_path).map_err(|_| ApiError::not_found("图像文件不存在"))?)?;
     let imga = image_io::resize_max_side(&imga, 640);
     let imgb = image_io::resize_max_side(&imgb, 640);
     let ga = image_io::to_gray(&imga);
@@ -512,11 +506,8 @@ pub fn visualize(
     let rb = image_io::to_rgb(&imgb);
     let vis = crate::draw::draw_matches(&ra, &rb, &da, &db, &matches);
 
-    let dir = store.data_dir().join("visualizations");
-    std::fs::create_dir_all(&dir)?;
     let fname = format!("match_{}_{}.jpg", algo, uuid_short());
-    let out = dir.join(&fname);
-    image_io::save_jpeg(&vis, &out, 90)?;
+    store.write_file(&format!("visualizations/{fname}"), &image_io::encode_jpeg(&vis, 90)?)?;
     Ok(json!({
         "file_path": format!("visualizations/{fname}"),
         "media_type": "image/jpeg"

@@ -7,13 +7,15 @@
 - **智能查重**：10 算法 → 阈值命中 → `min_agree` 投票 + 哈希门控 → Union-Find 连通分量分组。
 - **文档提取**：DOCX/PPTX（zip media）、PDF 内嵌图（DCTDecode/FlateDecode）。
 - **SQLite + WAL**：特征向量以 BLOB 存储（8 变体 × 特征），`pair_cache` 相似度缓存、`analysis_runs` 审计。
+- **可插拔存储**：文件负载走 `BlobStore` 抽象 —— 本地 `fs`（默认）或 MinIO/S3（`object_store`），元数据恒在 SQLite。
+- **模块化特征提取**：`FeatureExtractor` 注册表，每特征自含编码器与相似度度量；新特征（如 DINOv2）只需加一个注册项。
 
 ## 架构
 
 ```
 crates/
   itrace-core    图像 IO / 哈希 / 像素指标 / 描述子 / 切片匹配 / 文档提取 / 分组
-  itrace-store   SQLite 持久层（projects / images / feature_store / pair_cache / analysis_runs）
+  itrace-store   SQLite 持久层 + BlobStore 文件后端（fs | s3）
   itrace-server  axum HTTP API（/v1，详见 docs/openapi.yaml）
   itrace-cli     离线 CLI（add / compare / smart / report / slice）
 docs/
@@ -32,7 +34,13 @@ cargo build --release --features akaze -p itrace-server
 ## 运行
 
 ```bash
-# HTTP 服务（默认 0.0.0.0:8000）
+# HTTP 服务（默认 0.0.0.0:8000，fs 存储）
+DATA_DIR=data PORT=8000 ./target/release/itrace-server
+
+# MinIO/S3 存储：先起对象存储（docker-compose 自带 minio + 建桶 itrace）
+docker compose up -d minio init-bucket
+ITRACE_STORAGE=s3 S3_ENDPOINT=http://localhost:9000 \
+S3_BUCKET=itrace S3_ACCESS_KEY=minioadmin S3_SECRET_KEY=minioadmin \
 DATA_DIR=data PORT=8000 ./target/release/itrace-server
 
 # CLI

@@ -37,24 +37,32 @@ pub fn sniff_extension(data: &[u8]) -> &'static str {
 
 /// Dispatch by extension.
 pub fn extract(path: &Path) -> anyhow::Result<Vec<ExtractedImage>> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
+    let data = std::fs::read(path)?;
+    extract_named(
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("doc"),
+        &data,
+    )
+}
+
+/// Extract from in-memory bytes; `name` supplies the extension.
+pub fn extract_named(name: &str, data: &[u8]) -> anyhow::Result<Vec<ExtractedImage>> {
+    let ext = name
+        .rsplit('.')
+        .next()
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
+    let stem = name.rsplit('.').nth(1).unwrap_or("doc");
     match ext.as_str() {
-        "docx" | "pptx" => extract_office(path),
-        "pdf" => extract_pdf(path),
+        "docx" | "pptx" => extract_office(stem, data),
+        "pdf" => extract_pdf(stem, data),
         other => anyhow::bail!("不支持的文档格式: {other}"),
     }
 }
 
 // ---------- OOXML ----------
 
-fn extract_office(path: &Path) -> anyhow::Result<Vec<ExtractedImage>> {
-    let file = std::fs::File::open(path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
+fn extract_office(stem: &str, data: &[u8]) -> anyhow::Result<Vec<ExtractedImage>> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data))?;
     let mut out = Vec::new();
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
@@ -92,9 +100,8 @@ fn extract_office(path: &Path) -> anyhow::Result<Vec<ExtractedImage>> {
 /// Handles DCTDecode (JPEG) and FlateDecode (raw RGB/Gray → re-encoded PNG).
 /// Page-render fallback (for PDFs with zero embedded images) is not included
 /// in the pure-Rust build — requires a pdfium/mupdf backend feature.
-fn extract_pdf(path: &Path) -> anyhow::Result<Vec<ExtractedImage>> {
-    let doc = lopdf::Document::load(path)?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("doc");
+fn extract_pdf(stem: &str, data: &[u8]) -> anyhow::Result<Vec<ExtractedImage>> {
+    let doc = lopdf::Document::load_mem(data)?;
     let mut out = Vec::new();
     let pages = doc.get_pages();
     let mut idx = 0u32;

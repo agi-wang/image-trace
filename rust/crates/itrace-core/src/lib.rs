@@ -30,8 +30,10 @@ pub const SMART_ALGOS: &[&str] = &[
 ];
 
 /// Algorithms that must contribute at least one vote for a confirmed duplicate
-/// pair in smart-compare (cheap and robust gate).
-pub const HASH_GATE_ALGOS: &[&str] = &["phash", "dhash", "ahash", "whash"];
+/// pair in smart-compare (cheap and robust gate). ahash/colorhash are excluded:
+/// 64-bit ahash collides on ~half of unrelated real photos at 0.85, and
+/// colorhash's coarse bins similarly over-fire.
+pub const HASH_GATE_ALGOS: &[&str] = &["phash", "dhash", "whash"];
 
 pub fn all_algorithms() -> Vec<&'static str> {
     let mut v = Vec::new();

@@ -1,0 +1,28 @@
+# MinIO 开发环境：对象存储管文件，SQLite 管元数据/特征。
+# 用法: docker compose up -d  →  ITRACE_STORAGE=s3 S3_ENDPOINT=http://localhost:9000 \
+#        S3_ACCESS_KEY=minioadmin S3_SECRET_KEY=minioadmin itrace-server
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+
+  init-bucket:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "sleep 3;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb -p local/itrace || true;
+      mc anonymous set download local/itrace || true"
+    restart: "no"
+
+volumes:
+  minio-data:

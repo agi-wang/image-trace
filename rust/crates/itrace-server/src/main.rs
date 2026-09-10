@@ -4,7 +4,6 @@ mod draw;
 mod service;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -28,6 +27,9 @@ use itrace_store::{ImageRecord, Store};
 struct AppState {
     store: Arc<Store>,
 }
+
+/// Storage backend name, set once at startup for /v1/system/info.
+static APP_STORAGE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
 type ApiResult<T> = Result<T, ApiError>;
 
@@ -202,7 +204,7 @@ fn validate_algorithm(a: &str) -> ApiResult<()> {
 }
 
 /// Spawn background feature precomputation for one image.
-fn enqueue_precompute(state: &AppState, image_id: i64, path: PathBuf) {
+fn enqueue_precompute(state: &AppState, image_id: i64, key: String) {
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
         if let Err(e) = store.set_feature_status(image_id, "computing") {
@@ -210,7 +212,7 @@ fn enqueue_precompute(state: &AppState, image_id: i64, path: PathBuf) {
             return;
         }
         let res = (|| -> anyhow::Result<()> {
-            let img = core::image_io::decode_file(&path)?;
+            let img = core::image_io::decode(&store.read_file(&key)?)?;
             let rows = core::features::compute_all_variants(&img);
             for (variant, name, bytes, dims) in rows {
                 store.put_feature(image_id, variant, &name, &bytes, dims)?;
@@ -242,9 +244,10 @@ fn sanitize_filename(name: &str) -> ApiResult<String> {
     Ok(file)
 }
 
-fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
-    let candidate = dir.join(name);
-    if !candidate.exists() {
+/// Unique blob key under a prefix ("uploads", "extracted", "thumbnails").
+fn unique_key(store: &Store, prefix: &str, name: &str) -> String {
+    let candidate = format!("{prefix}/{name}");
+    if !store.file_exists(&candidate) {
         return candidate;
     }
     let stem = std::path::Path::new(name)
@@ -258,18 +261,12 @@ fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
         .map(|s| format!(".{s}"))
         .unwrap_or_default();
     for i in 1.. {
-        let c = dir.join(format!("{stem}_{i}{ext}"));
-        if !c.exists() {
+        let c = format!("{prefix}/{stem}_{i}{ext}");
+        if !store.file_exists(&c) {
             return c;
         }
     }
     unreachable!()
-}
-
-fn rel_to_data(store: &Store, path: &std::path::Path) -> String {
-    path.strip_prefix(store.data_dir())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
 // ---------- handlers ----------
@@ -282,6 +279,7 @@ async fn system_info() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "engine": "rust-native",
+        "storage": *APP_STORAGE.get().unwrap_or(&"unknown"),
         "algorithms": core::all_algorithms(),
         "features": {
             "akaze": cfg!(feature = "akaze"),
@@ -328,8 +326,11 @@ async fn delete_project(
         }
     })?;
     for img in images {
-        if let Some(p) = s.store.resolve(&img.file_path) {
-            let _ = std::fs::remove_file(p);
+        let _ = s.store.delete_file(&img.file_path);
+        if let Ok(thumbs) = s.store.blobs().list(&format!("thumbnails/{}_", img.id)) {
+            for t in thumbs {
+                let _ = s.store.delete_file(&t);
+            }
         }
     }
     Ok(Json(serde_json::json!({"message": "项目已删除"})))
@@ -349,16 +350,10 @@ async fn delete_image(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let rec = s.store.delete_image(id).map_err(|_| ApiError::not_found("图像不存在"))?;
-    if let Some(p) = s.store.resolve(&rec.file_path) {
-        let _ = std::fs::remove_file(&p);
-    }
-    // thumbnails
-    let thumbs = s.store.data_dir().join("thumbnails");
-    if let Ok(rd) = std::fs::read_dir(&thumbs) {
-        for e in rd.flatten() {
-            if e.file_name().to_string_lossy().starts_with(&format!("{id}_")) {
-                let _ = std::fs::remove_file(e.path());
-            }
+    let _ = s.store.delete_file(&rec.file_path);
+    if let Ok(thumbs) = s.store.blobs().list(&format!("thumbnails/{id}_")) {
+        for t in thumbs {
+            let _ = s.store.delete_file(&t);
         }
     }
     Ok(Json(serde_json::json!({"message": "图像已删除"})))
@@ -371,26 +366,22 @@ async fn get_thumbnail(
 ) -> ApiResult<impl IntoResponse> {
     let size = q.size.clamp(16, 2048);
     let rec = s.store.get_image(id).map_err(|_| ApiError::not_found("图像不存在"))?;
-    let thumb_dir = s.store.data_dir().join("thumbnails");
-    let thumb_path = thumb_dir.join(format!("{id}_{size}.jpg"));
-    if !thumb_path.exists() {
-        let src = s
-            .store
-            .resolve(&rec.file_path)
-            .filter(|p| p.exists())
-            .ok_or_else(|| ApiError::not_found("图像文件不存在"))?;
-        let path = thumb_path.clone();
+    let thumb_key = format!("thumbnails/{id}_{size}.jpg");
+    if !s.store.file_exists(&thumb_key) {
+        let store = s.store.clone();
+        let key = rec.file_path.clone();
+        let tkey = thumb_key.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let img = core::image_io::decode_file(&src)?;
+            let img = core::image_io::decode(&store.read_file(&key)?)?;
             let th = core::image_io::resize_max_side(&img, size);
             let rgb = core::image_io::to_rgb(&th);
-            core::image_io::save_jpeg(&rgb, &path, 85)
+            store.write_file(&tkey, &core::image_io::encode_jpeg(&rgb, 85)?)
         })
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .map_err(ApiError::from)?;
     }
-    let bytes = std::fs::read(&thumb_path)?;
+    let bytes = s.store.read_file(&thumb_key).map_err(ApiError::from)?;
     Ok(([(axum::http::header::CONTENT_TYPE, "image/jpeg")], bytes))
 }
 
@@ -453,11 +444,9 @@ async fn recompute_features(
     let images = s.store.list_images(id, 0, i64::MAX)?;
     let mut triggered = 0;
     for img in images {
-        if img.feature_status != "ready" {
-            if let Some(p) = s.store.resolve(&img.file_path).filter(|p| p.exists()) {
-                enqueue_precompute(&s, img.id, p);
-                triggered += 1;
-            }
+        if img.feature_status != "ready" && s.store.file_exists(&img.file_path) {
+            enqueue_precompute(&s, img.id, img.file_path.clone());
+            triggered += 1;
         }
     }
     Ok(Json(serde_json::json!({
@@ -622,13 +611,11 @@ async fn download_file(
     Path(path): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let rel = path.strip_prefix("data/").unwrap_or(&path);
-    let full = s
+    let bytes = s
         .store
-        .resolve(rel)
-        .filter(|p| p.is_file())
-        .ok_or_else(|| ApiError::not_found("文件不存在"))?;
-    let bytes = tokio::fs::read(&full).await?;
-    let mime = match full.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        .read_file(rel)
+        .map_err(|_| ApiError::not_found("文件不存在"))?;
+    let mime = match rel.rsplit('.').next().unwrap_or("") {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "gif" => "image/gif",
@@ -651,6 +638,8 @@ async fn main() -> anyhow::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8000);
 
     let store = Store::open(std::path::Path::new(&data_dir))?;
+    let _ = APP_STORAGE.set(store.storage_kind());
+    tracing::info!("storage backend: {}", store.storage_kind());
     let state = AppState { store: Arc::new(store) };
 
     let app = Router::new()

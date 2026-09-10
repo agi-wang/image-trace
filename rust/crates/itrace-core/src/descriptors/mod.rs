@@ -143,7 +143,9 @@ pub fn match_knn_ratio(a: &DescriptorSet, b: &DescriptorSet, ratio: f64) -> Vec<
 
 /// Similarity score from cross-checked matches — mirrors the original
 /// `calculate_descriptor_similarity`: mean distance of top-k matches,
-/// normalized by descriptor bit width, mapped to [0,1].
+/// normalized by descriptor bit width — multiplied by a match-density
+/// factor so a handful of lucky near-identical descriptors between
+/// unrelated images cannot reach a high score.
 pub fn match_score(a: &DescriptorSet, b: &DescriptorSet, top_k: usize) -> f64 {
     let matches = match_cross_check(a, b);
     if matches.is_empty() {
@@ -152,5 +154,7 @@ pub fn match_score(a: &DescriptorSet, b: &DescriptorSet, top_k: usize) -> f64 {
     let top = &matches[..matches.len().min(top_k)];
     let avg = top.iter().map(|m| m.distance as f64).sum::<f64>() / top.len() as f64;
     let norm = (a.desc_len * 8) as f64;
-    (1.0 - avg.min(norm) / norm).clamp(0.0, 1.0)
+    let quality = (1.0 - avg.min(norm) / norm).clamp(0.0, 1.0);
+    let density = (matches.len() as f64 / top_k as f64).min(1.0);
+    quality * density
 }

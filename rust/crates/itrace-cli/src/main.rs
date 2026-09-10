@@ -98,10 +98,8 @@ fn main() -> anyhow::Result<()> {
                 if img.feature_status == "ready" {
                     return;
                 }
-                if let Some(p) = store.resolve(&img.file_path) {
-                    if let Err(e) = precompute(&store, img.id, &p) {
-                        eprintln!("image {} precompute failed: {e}", img.id);
-                    }
+                if let Err(e) = precompute(&store, img.id, &img.file_path) {
+                    eprintln!("image {} precompute failed: {e}", img.id);
                 }
             });
             println!("done");
@@ -112,8 +110,8 @@ fn main() -> anyhow::Result<()> {
             let prepared: Vec<Prepared> = images
                 .par_iter()
                 .filter_map(|img| {
-                    let p = store.resolve(&img.file_path)?;
-                    Prepared::load(&p, &desc_algos, rotation_invariant).ok()
+                    let bytes = store.read_file(&img.file_path).ok()?;
+                    Prepared::from_bytes(&bytes, &desc_algos, rotation_invariant).ok()
                 })
                 .collect();
             let (groups, ungrouped, _m) =
@@ -185,8 +183,8 @@ fn main() -> anyhow::Result<()> {
             let prepared: Vec<Prepared> = images
                 .par_iter()
                 .filter_map(|img| {
-                    let p = store.resolve(&img.file_path)?;
-                    Prepared::load(&p, &desc_algos, false).ok()
+                    let bytes = store.read_file(&img.file_path).ok()?;
+                    Prepared::from_bytes(&bytes, &desc_algos, false).ok()
                 })
                 .collect();
             let m = compare::pairwise_matrix(&prepared, &algorithm, false);
@@ -200,10 +198,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Slice { image_a, image_b, rows, cols } => {
             let ia = store.get_image(image_a)?;
             let ib = store.get_image(image_b)?;
-            let pa = store.resolve(&ia.file_path).context("file missing")?;
-            let pb = store.resolve(&ib.file_path).context("file missing")?;
-            let ga = image_io::to_gray(&image_io::decode_file(&pa)?);
-            let gb = image_io::to_gray(&image_io::decode_file(&pb)?);
+            let ga = image_io::to_gray(&image_io::decode(&store.read_file(&ia.file_path)?)?);
+            let gb = image_io::to_gray(&image_io::decode(&store.read_file(&ib.file_path)?)?);
             let res = itrace_core::slice::slice_match(&ga, &gb, rows, cols, 0.7);
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
@@ -214,14 +210,14 @@ fn main() -> anyhow::Result<()> {
 fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     if image_io::is_supported_image(name) {
-        let dest = unique_in(&store.upload_dir(), name);
-        std::fs::copy(path, &dest)?;
-        let feats = hashes::compute_image_features(&dest)?;
-        let rel = rel(store, &dest);
+        let data = std::fs::read(path)?;
+        let rel = unique_key(store, "uploads", name);
+        store.write_file(&rel, &data)?;
+        let feats = hashes::compute_image_features_bytes(&data)?;
         let rec = store.insert_image(&NewImage {
             project_id,
             filename: name.to_string(),
-            file_path: rel,
+            file_path: rel.clone(),
             file_hash: feats.file_hash,
             phash: Some(hashes::to_hex(feats.hashes.phash)),
             dhash: Some(hashes::to_hex(feats.hashes.dhash)),
@@ -233,23 +229,23 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
             width: Some(feats.width as i64),
             height: Some(feats.height as i64),
         })?;
-        precompute(store, rec.id, &dest)?;
+        precompute(store, rec.id, &rel)?;
         println!("+ {} -> image id {}", name, rec.id);
         return Ok(());
     }
     if image_io::is_supported_document(name) {
-        let dest = unique_in(&store.upload_dir(), name);
-        std::fs::copy(path, &dest)?;
-        let rel_doc = rel(store, &dest);
-        let extracted = documents::extract(&dest)?;
+        let data = std::fs::read(path)?;
+        let rel_doc = unique_key(store, "uploads", name);
+        store.write_file(&rel_doc, &data)?;
+        let extracted = documents::extract_named(name, &data)?;
         for img in extracted {
-            let out = unique_in(&store.extract_dir(), &img.filename);
-            std::fs::write(&out, &img.data)?;
-            let feats = hashes::compute_image_features(&out)?;
+            let key = unique_key(store, "extracted", &img.filename);
+            store.write_file(&key, &img.data)?;
+            let feats = hashes::compute_image_features_bytes(&img.data)?;
             let rec = store.insert_image(&NewImage {
                 project_id,
                 filename: img.filename.clone(),
-                file_path: rel(store, &out),
+                file_path: key.clone(),
                 file_hash: feats.file_hash,
                 phash: Some(hashes::to_hex(feats.hashes.phash)),
                 dhash: Some(hashes::to_hex(feats.hashes.dhash)),
@@ -261,7 +257,7 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
                 width: Some(feats.width as i64),
                 height: Some(feats.height as i64),
             })?;
-            precompute(store, rec.id, &out)?;
+            precompute(store, rec.id, &key)?;
             println!("+ {} -> image id {}", img.filename, rec.id);
         }
         return Ok(());
@@ -269,10 +265,10 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
     bail!("不支持的文件格式: {name}")
 }
 
-fn precompute(store: &Store, image_id: i64, path: &std::path::Path) -> anyhow::Result<()> {
+fn precompute(store: &Store, image_id: i64, key: &str) -> anyhow::Result<()> {
     store.set_feature_status(image_id, "computing")?;
     let res = (|| -> anyhow::Result<()> {
-        let img = image_io::decode_file(path)?;
+        let img = image_io::decode(&store.read_file(key)?)?;
         for (variant, name, bytes, dims) in features::compute_all_variants(&img) {
             store.put_feature(image_id, variant, &name, &bytes, dims)?;
         }
@@ -287,22 +283,18 @@ fn precompute(store: &Store, image_id: i64, path: &std::path::Path) -> anyhow::R
     }
 }
 
-fn unique_in(dir: &std::path::Path, name: &str) -> PathBuf {
-    let c = dir.join(name);
-    if !c.exists() {
+fn unique_key(store: &Store, prefix: &str, name: &str) -> String {
+    let c = format!("{prefix}/{name}");
+    if !store.file_exists(&c) {
         return c;
     }
     let stem = std::path::Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("f").to_string();
     let ext = std::path::Path::new(name).extension().and_then(|s| s.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
     for i in 1.. {
-        let c = dir.join(format!("{stem}_{i}{ext}"));
-        if !c.exists() {
+        let c = format!("{prefix}/{stem}_{i}{ext}");
+        if !store.file_exists(&c) {
             return c;
         }
     }
     unreachable!()
-}
-
-fn rel(store: &Store, p: &std::path::Path) -> String {
-    p.strip_prefix(store.data_dir()).map(|r| r.to_string_lossy().to_string()).unwrap_or_else(|_| p.to_string_lossy().to_string())
 }
