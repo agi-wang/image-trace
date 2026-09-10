@@ -295,6 +295,61 @@ paths:
               schema:
                 $ref: '#/components/schemas/SmartCompareResult'
 
+  /v1/projects/{projectId}/dedup:
+    post:
+      tags: [analysis]
+      summary: 索引查重（大规模，10^8 量级）
+      description: |
+        不做 N×N 全比对：把每张图 8 个方向变体的门控哈希（phash/dhash/whash）
+        键放进多索引哈希（MIH，64bit → 8×8bit 子串倒排），流式召回
+        `min_votes` 个算法在 `radius` 汉明距内命中的候选对，
+        再对候选做交叉变体精确验证并并查集分组。
+        复杂度近似 O(N)，单索引约 40B/图/算法。
+      operationId: dedupScan
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                radius:
+                  type: integer
+                  default: 10
+                  description: 召回汉明半径（64bit 哈希）
+                threshold:
+                  type: number
+                  default: 0.85
+                  description: 验证阶段的相似度阈值
+                min_votes:
+                  type: integer
+                  default: 2
+                  description: 候选对至少需几个门控算法命中
+      responses:
+        '200':
+          description: 索引查重结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_images: { type: integer }
+                  indexed_images: { type: integer }
+                  candidate_pairs:
+                    type: integer
+                    description: 召回的候选对数
+                  naive_pairs:
+                    type: integer
+                    description: 等效全比对对数 n(n-1)/2
+                  found_duplicates: { type: boolean }
+                  duplicate_groups:
+                    type: array
+                    items: { $ref: '#/components/schemas/DuplicateGroup' }
+                  unique_count: { type: integer }
+                  scan_seconds: { type: number }
+                  summary: { type: string }
+
   /v1/projects/{projectId}/matrix:
     get:
       tags: [analysis]

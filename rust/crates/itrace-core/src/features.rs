@@ -300,12 +300,19 @@ pub fn generic_similarity_matrix(
     let results: Vec<(usize, usize, f64)> = pairs
         .par_iter()
         .map(|&(i, j)| {
+            // cross-variant max: a rotated image's variant list is a
+            // permutation of the original's, so the max must range over
+            // all (v, w) pairs, not just same-index ones
             let mut mx = 0.0f64;
-            for &v in &variants {
-                let a = vectors.get(&ids[i]).and_then(|m| m.get(&v));
-                let b = vectors.get(&ids[j]).and_then(|m| m.get(&v));
-                if let (Some(a), Some(b)) = (a, b) {
-                    mx = mx.max(sim(a, b));
+            let ma = vectors.get(&ids[i]);
+            let mb = vectors.get(&ids[j]);
+            if let (Some(ma), Some(mb)) = (ma, mb) {
+                for &v in &variants {
+                    for &w in &variants {
+                        if let (Some(a), Some(b)) = (ma.get(&v), mb.get(&w)) {
+                            mx = mx.max(sim(a, b));
+                        }
+                    }
                 }
             }
             (i, j, mx)

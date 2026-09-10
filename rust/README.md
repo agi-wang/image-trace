@@ -64,6 +64,7 @@ itrace slice 1 4 --rows 2 --cols 2
 | GET | /v1/projects/{id}/feature-status | 特征就绪状态 |
 | POST | /v1/projects/{id}/compare | 单算法比对（rotation_invariant 可选） |
 | POST | /v1/projects/{id}/smart-compare | 多算法投票智能查重 |
+| POST | /v1/projects/{id}/dedup | 索引查重（MIH 召回，亿级规模） |
 | GET | /v1/projects/{id}/matrix | 相似度矩阵 |
 | GET | /v1/projects/{id}/report | 查重报告 |
 | POST | /v1/match/pairs | 两图关键点匹配明细 |

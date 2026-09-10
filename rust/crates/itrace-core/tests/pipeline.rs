@@ -195,3 +195,66 @@ fn orientation_variants_count() {
     let g2 = image_io::to_gray(&vars[2]);
     assert_ne!(g0.data, g2.data);
 }
+
+// ---------- index (billion-scale recall) ----------
+
+#[test]
+fn canonical_rot64_dihedral_invariant() {
+    use itrace_core::index::canonical_rot64;
+    let h = 0xDEADBEEF12345678u64;
+    assert_eq!(canonical_rot64(h), canonical_rot64(h));
+    // bit-matrix rotate must canon to the same value as the original
+    let rot90 = |v: u64| -> u64 {
+        let mut out = 0u64;
+        for i in 0..8usize {
+            for j in 0..8usize {
+                if (v >> (i * 8 + j)) & 1 == 1 {
+                    out |= 1u64 << (j * 8 + (7 - i));
+                }
+            }
+        }
+        out
+    };
+    let mut r = h;
+    for _ in 0..4 {
+        assert_eq!(canonical_rot64(r), canonical_rot64(h));
+        r = rot90(r);
+    }
+}
+
+#[test]
+fn canonical_ahash_matches_rotated_image() {
+    use itrace_core::index::canonical_rot64;
+    let a = to_dyn(make_photo(64, 48, 3));
+    let b = a.rotate90();
+    let ga = image_io::to_gray(&a);
+    let gb = image_io::to_gray(&b);
+    // ahash is dihedral-equivariant: its 8×8 bit grid rotates with the image
+    let ha = canonical_rot64(hashes::ahash(&ga));
+    let hb = canonical_rot64(hashes::ahash(&gb));
+    assert_eq!(ha, hb);
+}
+
+#[test]
+fn mih_finds_near_duplicate_keys() {
+    use itrace_core::index::{dedup_candidates, DedupKeys, MihIndex};
+    let mut idx = MihIndex::new();
+    let base = 0x0123456789ABCDEFu64;
+    idx.insert(base, 0);
+    // flip 6 low bits → hamming 6, inside radius
+    let near = base ^ 0b111111;
+    idx.insert(!base, 1); // far key
+    let hits = idx.query(near, 10);
+    assert_eq!(hits, vec![0]); // only base is near
+    assert!(idx.query(near, 5).is_empty()); // outside radius
+
+    // dedup_candidates: per-algo variant keys; pair flagged by ≥2 gate hashes
+    let keys = |v: u64| vec![v; 8]; // an image's 8 variants of one hash
+    let entries = vec![
+        DedupKeys { image_id: 1, variant_keys: vec![keys(base), keys(0xAAAA), keys(0xBBBB)] },
+        DedupKeys { image_id: 2, variant_keys: vec![keys(base), keys(0xAAAA), keys(0xFFFF)] }, // 2/3 match
+        DedupKeys { image_id: 3, variant_keys: vec![keys(!base), keys(!0xAAAAu64), keys(!0xBBBBu64)] },
+    ];
+    let pairs = dedup_candidates(&entries, 8, 2);
+    assert_eq!(pairs, vec![(0, 1)]);
+}

@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use itrace_core::compare::{self, Prepared};
 use itrace_core::descriptors;
 use itrace_core::features;
-use itrace_core::{documents, hashes, image_io, slice};
+use itrace_core::{documents, hashes, image_io, index, slice};
 use itrace_core::{HASH_GATE_ALGOS, SMART_ALGOS};
 use itrace_store::{ImageRecord, NewImage, NewRun, Project, Store};
 
@@ -297,6 +297,141 @@ pub fn run_smart_compare(
         } else {
             format!("在 {n} 张图片中使用 {} 种特征比对，未发现相似图片", SMART_ALGOS.len())
         }
+    }))
+}
+
+// ---------- indexed dedup (10^8-scale scan) ----------
+
+/// Near-duplicate scan without an N×N matrix: MIH candidate recall over
+/// canonical rotation-invariant hash keys, then variant-max verification.
+/// Gate hashes (phash/dhash/whash) act as independent recall voters.
+pub fn run_dedup_scan(
+    state: &AppState,
+    images: &[ImageRecord],
+    radius: u32,
+    threshold: f64,
+    min_votes: u32,
+) -> anyhow::Result<Value> {
+    let store = &state.store;
+    let n = images.len();
+    if n < 2 {
+        return Ok(json!({
+            "total_images": n, "found_duplicates": false, "duplicate_groups": [],
+            "unique_count": n, "candidate_pairs": 0, "naive_pairs": 0,
+            "scan_seconds": 0.0, "summary": "项目图片不足，无法查重"
+        }));
+    }
+
+    // candidate recall: MIH over all 8-variant keys of each gate hash —
+    // equivalent coverage to variant-max comparison, sub-linear per image
+    let ready: Vec<&ImageRecord> = images
+        .iter()
+        .filter(|i| i.feature_status == "ready")
+        .collect();
+    let ids: Vec<i64> = ready.iter().map(|i| i.id).collect();
+    let variants: Vec<u8> = (0..features::NUM_VARIANTS).collect();
+    let gate_features: Vec<&str> =
+        HASH_GATE_ALGOS.iter().filter_map(|a| features::algo_to_feature(a)).collect();
+    let maps: Vec<features::FeatureMap> = gate_features
+        .iter()
+        .map(|f| store.load_feature_map(&ids, f, &variants))
+        .collect::<anyhow::Result<_>>()?;
+    let exts: Vec<&dyn features::FeatureExtractor> = HASH_GATE_ALGOS
+        .iter()
+        .filter_map(|a| features::extractor_for_algo(a))
+        .collect();
+
+    let mut entries: Vec<index::DedupKeys> = Vec::with_capacity(ready.len());
+    for img in &ready {
+        let variant_keys: Vec<Vec<u64>> = maps
+            .iter()
+            .map(|m| {
+                variants
+                    .iter()
+                    .filter_map(|v| m.get(&img.id).and_then(|vm| vm.get(v)))
+                    .map(|b| features::unpack_bits(b))
+                    .collect()
+            })
+            .collect();
+        if variant_keys.iter().all(|k| k.len() == variants.len()) {
+            entries.push(index::DedupKeys { image_id: img.id, variant_keys });
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    let pairs = index::dedup_candidates(&entries, radius, min_votes);
+    let naive = (n as u64) * (n as u64 - 1) / 2;
+
+    // cross-variant max: a rotated file's variant set is a permutation of
+    // the original's, so (v, w) — not (v, v) — carries the true maximum
+    let score_pair = |ia: i64, ib: i64| -> f64 {
+        let mut best = 0.0f64;
+        for (map, ext) in maps.iter().zip(&exts) {
+            let (Some(ma), Some(mb)) = (map.get(&ia), map.get(&ib)) else { continue };
+            for &v in &variants {
+                for &w in &variants {
+                    if let (Some(a), Some(b)) = (ma.get(&v), mb.get(&w)) {
+                        best = best.max(ext.similarity(a, b));
+                    }
+                }
+            }
+        }
+        best
+    };
+
+    // position of each image_id inside `ready`
+    let pos: HashMap<i64, usize> =
+        ready.iter().enumerate().map(|(p, i)| (i.id, p)).collect();
+    let confirmed: Vec<(usize, usize)> = pairs
+        .iter()
+        .filter(|&&(i, j)| {
+            score_pair(entries[i as usize].image_id, entries[j as usize].image_id) >= threshold
+        })
+        .filter_map(|&(i, j)| {
+            Some((*pos.get(&entries[i as usize].image_id)?, *pos.get(&entries[j as usize].image_id)?))
+        })
+        .collect();
+
+    let groups_idx = compare::components_from_pairs(ready.len(), &confirmed);
+    let mut dup_groups = Vec::new();
+    let mut grouped = std::collections::HashSet::new();
+    for members in groups_idx {
+        if members.len() < 2 {
+            continue;
+        }
+        grouped.extend(members.iter().copied());
+        let mut best = 0.0f64;
+        for i in 0..members.len() {
+            for j in (i + 1)..members.len() {
+                best = best.max(score_pair(ready[members[i]].id, ready[members[j]].id));
+            }
+        }
+        dup_groups.push(json!({
+            "images": members.iter().map(|&m| json!({
+                "id": ready[m].id, "filename": ready[m].filename,
+                "file_path": ready[m].file_path
+            })).collect::<Vec<_>>(),
+            "confidence": (best * 10000.0).round() / 10000.0,
+        }));
+    }
+    dup_groups.sort_by(|a, b| {
+        b["confidence"].as_f64().unwrap_or(0.0).total_cmp(&a["confidence"].as_f64().unwrap_or(0.0))
+    });
+
+    let t = t0.elapsed().as_secs_f64();
+    let dup_n = grouped.len();
+    Ok(json!({
+        "total_images": n,
+        "indexed_images": entries.len(),
+        "candidate_pairs": pairs.len(),
+        "naive_pairs": naive,
+        "found_duplicates": !dup_groups.is_empty(),
+        "duplicate_groups": dup_groups,
+        "unique_count": n - dup_n,
+        "scan_seconds": (t * 1000.0).round() / 1000.0,
+        "summary": format!(
+            "索引扫描 {} 张图片：召回候选 {} 对（全量需 {} 对），确认 {} 组共 {} 张",
+            entries.len(), pairs.len(), naive, dup_groups.len(), dup_n)
     }))
 }
 

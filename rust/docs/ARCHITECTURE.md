@@ -94,3 +94,21 @@ analysis_runs(id, project_id, algorithm, threshold, total_images,
 ```
 
 `file_hash` 改用 BLAKE3（替代 MD5）：更快、无碰撞顾虑。
+
+## 亿级规模（10^8+）
+
+N×N 矩阵比对只适用于中小项目；亿级走 `/v1/projects/{id}/dedup` 索引扫描：
+
+**召回 — 多索引哈希 MIH**（`itrace-core/src/index.rs`）
+- 64bit 哈希拆 8×8bit 子串建倒排表；汉明距 ≤7 的键必然共享一个完整子串（鸽巢保证召回），radius≤15 经验召回仍高。
+- 每张图的全部 8 方向变体键都入索引 → 召回语义与"变体-max"比对完全等价（旋转文件的变体键集合是原图的置换）。
+- 3 个门控哈希各建一索引，候选对需 `min_votes` 个算法命中（默认 2/3）。
+- 复杂度 ≈ O(N·log bucket)；内存 ≈ 40B/图/算法索引（1 亿图 × 3 算法 ≈ 12GB，可按 key 前缀或项目分片）。
+
+**验证** — 候选对拉取 `feature_store` 已存向量做交叉变体精确打分（(v,w) 全对取 max），阈值后并查集分组。实测 39 图：45 候选对 vs 全量 741 对，2ms。
+
+**容量与吞吐配套**
+- 元数据：SQLite 亿级行可行（索引扫描），超大可换 `PostgreSQL`/`TiKV` 槽位——`Store` trait 已隔离 SQL。
+- 文件负载：S3/MinIO 分桶水平扩展；`BlobStore` 接口天然分布式。
+- 更深的近似检索（float 特征 → HNSW/IVF-PQ，描述子 → FAISS/ScaNN）预留为 `FeatureExtractor` 插件 + 外部索引服务插槽。
+- 写入吞吐：预计算是 CPU 密集 —— 水平扩 server 副本 + 任务队列即可线性扩展；SQLite 单写 WAL 模式下元数据写入足够，热点可切 Postgres。

@@ -11,6 +11,7 @@ pub mod features;
 pub mod group;
 pub mod hashes;
 pub mod image_io;
+pub mod index;
 pub mod metrics;
 pub mod slice;
 

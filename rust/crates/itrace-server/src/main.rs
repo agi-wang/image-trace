@@ -128,6 +128,24 @@ fn default_min_agree() -> usize {
 }
 
 #[derive(Deserialize)]
+struct DedupRequest {
+    /// Hamming radius for index recall (64-bit hashes).
+    #[serde(default = "default_dedup_radius")]
+    radius: u32,
+    #[serde(default = "default_threshold")]
+    threshold: f64,
+    /// Gate hashes that must flag a pair for it to be verified.
+    #[serde(default = "default_dedup_votes")]
+    min_votes: u32,
+}
+fn default_dedup_radius() -> u32 {
+    10
+}
+fn default_dedup_votes() -> u32 {
+    2
+}
+
+#[derive(Deserialize)]
 struct MatchRequest {
     image_a_id: i64,
     image_b_id: i64,
@@ -498,6 +516,27 @@ async fn smart_compare(
     Ok(Json(result))
 }
 
+async fn dedup(
+    State(s): State<AppState>,
+    Path(id): Path<i64>,
+    body: Option<Json<DedupRequest>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let body = body.map(|b| b.0).unwrap_or(DedupRequest {
+        radius: default_dedup_radius(),
+        threshold: default_threshold(),
+        min_votes: default_dedup_votes(),
+    });
+    s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+    let images = s.store.list_images(id, 0, i64::MAX)?;
+    let state = s.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        service::run_dedup_scan(&state, &images, body.radius, body.threshold, body.min_votes)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(Json(result))
+}
+
 async fn matrix(
     State(s): State<AppState>,
     Path(id): Path<i64>,
@@ -655,6 +694,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/projects/{id}/features/recompute", post(recompute_features))
         .route("/v1/projects/{id}/compare", post(compare))
         .route("/v1/projects/{id}/smart-compare", post(smart_compare))
+        .route("/v1/projects/{id}/dedup", post(dedup))
         .route("/v1/projects/{id}/matrix", get(matrix))
         .route("/v1/projects/{id}/report", get(report))
         .route("/v1/analysis-runs", get(list_runs))
