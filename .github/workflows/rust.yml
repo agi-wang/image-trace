@@ -1,0 +1,54 @@
+name: rust
+
+on:
+  push:
+    paths: ["rust/**", ".github/workflows/rust.yml"]
+  pull_request:
+    paths: ["rust/**"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo build --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install pillow
+      - name: build server + cli
+        run: cargo build --release -p itrace-server -p itrace-cli
+        working-directory: rust
+      - name: run server
+        run: |
+          DATA_DIR=/tmp/e2e-data PORT=8902 ./target/release/itrace-server &
+          for i in $(seq 1 30); do
+            curl -sf localhost:8902/v1/health && break || sleep 1
+          done
+        working-directory: rust
+      - name: e2e smoke (upload → precompute → rot-inv compare → slice)
+        run: bash scripts/e2e.sh
+        working-directory: rust
