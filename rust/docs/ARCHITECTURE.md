@@ -1,0 +1,77 @@
+# Image Trace RS — Rust 重写版架构
+
+> 基于原仓库 `agi-wang/image-trace`（FastAPI + SQLModel + OpenCV + PyMuPDF）从底层重新设计。
+> 目标：单二进制、无 Python/OpenCV 运行时依赖、旋转/裁剪/切片鲁棒的多算法图像查重引擎。
+
+## 与原版的差异
+
+| 维度 | 原版（Python） | 新版（Rust） |
+|---|---|---|
+| 运行时 | Python + FastAPI + Uvicorn | 单静态二进制（axum） |
+| 图像解码 | Pillow + 各插件 | `image` crate（jpg/png/gif/bmp/tiff/webp/ico/qoi…） |
+| 描述子 | OpenCV（ORB/BRISK/SIFT/AKAZE/KAZE） | 纯 Rust ORB + AKAZE；SIFT 预留 trait 插槽 |
+| 矩阵引擎 | numpy BLAS | rayon 并行 + 位运算 XOR/popcount |
+| 文档解析 | PyMuPDF + zipfile | lopdf（PDF 内嵌图）+ zip（OOXML media） |
+| 存储 | SQLModel/SQLite，feature 向量 base64 TEXT | rusqlite，feature 向量 BLOB（二进制，免编解码） |
+| 缓存 | 进程内 LRU + SQLite 双写 | 统一走 `feature_store` + `pair_cache` 表 |
+| 部署 | PyInstaller/Nuitka 打包 | `cargo build --release` 一个文件 |
+
+## 分层
+
+```
+crates/
+  itrace-core    纯计算库：解码、哈希、像素指标、ORB/AKAZE、变体、分组、切片匹配
+  itrace-store   rusqlite 持久化：projects/images/features/pair_cache/analysis_runs
+  itrace-server  axum HTTP API（docs/openapi.yaml 的实现）
+  itrace-cli     clap 命令行：init/add/compare/smart/report/serve
+```
+
+数据目录布局与原版一致：`data/uploads` `data/extracted` `data/thumbnails` `data/visualizations`，数据库 `data/image-trace.db`。
+
+## 算法栈（识别能力设计）
+
+**Tier 1 — 感知哈希**（64 bit，XOR + popcount）
+- `phash`：32×32 灰度 → DCT-II → 取 8×8 低频 → 中位数阈值
+- `dhash`：9×8 灰度相邻差分
+- `ahash`：8×8 灰度均值阈值
+- `whash`：32×32 灰度 → Haar 小波 → LL 子带中位数阈值
+- `colorhash`：HSV 量化直方图签名（色相 16 bin × 饱和度 4 bin）
+
+**Tier 2 — 像素/结构**
+- `ssim`：结构相似度（均值/方差/协方差滑窗），灰度 ≤512 边长
+- `histogram`：HSV H+S 二维直方图相关性（50×60 bin）
+- `template`：归一化互相关 NCC
+
+**Tier 3 — 局部特征描述子**
+- `orb`：纯 Rust 实现 — FAST-9 角点 + Harris 响应筛选 + 强度质心方向 + 旋转补偿 BRIEF-256 + 交叉验证匹配
+- `akaze`：`akaze` crate（可选 feature）
+- `sift`：预留 `DescriptorExtractor` trait；可接 `opencv` feature 或 ONNX 模型
+
+**Tier 4 — 变换鲁棒层（新设计，原版没有）**
+- 方向变体：8 个方向（4 旋转 × 翻转态）对哈希/描述子取 max —— 识别旋转/翻转
+- 切片检测 `slice_match`：B 切 R×C 网格 → 每片在 A 上滑窗 NCC + 灰度哈希 → 覆盖率判断 B 是否为 A 的切片重组或局部放大 —— 识别切片/裁剪/拼接
+- 多尺度：比对时对灰度金字塔下采样重试 —— 识别缩放 + 局部截取的混合变换
+
+**智能查重 `smart-compare`**
+- 每对图片跑全部可用算法 → 超阈值记一票 → `min_agree` 票 + 至少一票来自哈希门控 → 并查集连通分组 → confidence = 该组最大得分
+
+## 特征预计算管线
+
+上传即入库（`feature_status=pending`）→ 后台 tokio 任务：解码一次 → 生成 8 方向变体（内存中，不落盘）→ 每变体计算全部特征 → 向量以 `BLOB` 写入 `feature_store`（image_id × variant_idx × algorithm 唯一）→ `ready`。
+比对阶段直接 `SELECT` 拉取向量做批量矩阵运算，不再碰原图文件。
+
+## 存储 schema（SQLite）
+
+```
+projects(id, name, description, created_at)
+images(id, project_id→projects, filename, file_path, file_hash,
+       phash, dhash, ahash, whash, colorhash,
+       extracted_from, file_size, width, height, feature_status, created_at)
+feature_store(id, image_id→images, variant_idx, algorithm, vector BLOB,
+              dimensions, created_at, UNIQUE(image_id, variant_idx, algorithm))
+pair_cache(id, hash_a, hash_b, algorithm, rotation_invariant, score, created_at)
+analysis_runs(id, project_id, algorithm, threshold, total_images,
+              groups_count, unique_count, summary JSON, created_at)
+```
+
+`file_hash` 改用 BLAKE3（替代 MD5）：更快、无碰撞顾虑。
