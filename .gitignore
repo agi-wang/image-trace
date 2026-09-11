@@ -1,10 +1,5 @@
-/target
+target/
 data/
 *.db
 *.db-shm
 *.db-wal
-
-# Generated dataset artifacts — rebuild via scripts/build_dataset.py
-datasets/built/
-# Public sample seeds — fetch instructions in datasets/manifests/SOURCES.md
-datasets/raw/
