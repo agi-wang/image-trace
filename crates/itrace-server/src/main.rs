@@ -26,6 +26,10 @@ use itrace_store::{ImageRecord, Store};
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
+    /// Small decoded-gray cache (≤64 entries, keyed by image id) shared by
+    /// the match/slice endpoints — they re-decode the same blobs per call.
+    gray_cache:
+        Arc<std::sync::Mutex<std::collections::HashMap<i64, Arc<core::GrayImage>>>>,
 }
 
 /// Storage backend name, set once at startup for /v1/system/info.
@@ -80,6 +84,18 @@ impl From<std::io::Error> for ApiError {
     fn from(e: std::io::Error) -> Self {
         Self::internal(e.to_string())
     }
+}
+
+/// Run synchronous store/IO work on tokio's blocking pool so it never
+/// stalls an async worker thread.
+async fn blocking<T, F>(f: F) -> ApiResult<T>
+where
+    F: FnOnce() -> ApiResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
 }
 
 // ---------- request/response DTOs ----------
@@ -253,10 +269,12 @@ fn run_precompute(
     let res = (|| -> anyhow::Result<()> {
         let img = get_img()?;
         let rows = core::features::compute_all_variants(&img);
-        for (variant, name, bytes, dims) in rows {
-            store.put_feature(image_id, variant, &name, &bytes, dims)?;
-        }
-        Ok(())
+        // one batched write instead of ~112 individual upserts
+        let refs: Vec<(u8, &str, &[u8], usize)> = rows
+            .iter()
+            .map(|(v, n, b, d)| (*v, n.as_str(), b.as_slice(), *d))
+            .collect();
+        store.put_features(image_id, &refs)
     })();
     match res {
         Ok(()) => {
@@ -334,44 +352,53 @@ async fn create_project(
     if body.name.trim().is_empty() {
         return Err(ApiError::bad("项目名称不能为空"));
     }
-    let p = s.store.create_project(&body.name, body.description.as_deref())?;
-    Ok((StatusCode::CREATED, Json(p)))
+    blocking(move || {
+        let p = s.store.create_project(&body.name, body.description.as_deref())?;
+        Ok((StatusCode::CREATED, Json(p)))
+    })
+    .await
 }
 
 async fn list_projects(
     State(s): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<itrace_store::Project>>> {
-    Ok(Json(s.store.list_projects(q.skip, q.limit.min(500))?))
+    blocking(move || Ok(Json(s.store.list_projects(q.skip, q.limit.min(500))?))).await
 }
 
 async fn get_project(
     State(s): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<itrace_store::Project>> {
-    s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在")).map(Json)
+    blocking(move || {
+        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在")).map(Json)
+    })
+    .await
 }
 
 async fn delete_project(
     State(s): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let images = s.store.delete_project(id).map_err(|e| {
-        if e.to_string().contains("不存在") {
-            ApiError::not_found("项目不存在")
-        } else {
-            ApiError::from(e)
-        }
-    })?;
-    for img in images {
-        let _ = s.store.delete_file(&img.file_path);
-        if let Ok(thumbs) = s.store.blobs().list(&format!("thumbnails/{}_", img.id)) {
-            for t in thumbs {
-                let _ = s.store.delete_file(&t);
+    blocking(move || {
+        let images = s.store.delete_project(id).map_err(|e| {
+            if e.to_string().contains("不存在") {
+                ApiError::not_found("项目不存在")
+            } else {
+                ApiError::from(e)
+            }
+        })?;
+        for img in images {
+            let _ = s.store.delete_file(&img.file_path);
+            if let Ok(thumbs) = s.store.blobs().list(&format!("thumbnails/{}_", img.id)) {
+                for t in thumbs {
+                    let _ = s.store.delete_file(&t);
+                }
             }
         }
-    }
-    Ok(Json(serde_json::json!({"message": "项目已删除"})))
+        Ok(Json(serde_json::json!({"message": "项目已删除"})))
+    })
+    .await
 }
 
 async fn list_images(
@@ -379,22 +406,29 @@ async fn list_images(
     Path(id): Path<i64>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<ImageRecord>>> {
-    s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-    Ok(Json(s.store.list_images(id, q.skip, q.limit.min(500))?))
+    let (skip, limit) = (q.skip, q.limit.min(500));
+    blocking(move || {
+        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        Ok(Json(s.store.list_images(id, skip, limit)?))
+    })
+    .await
 }
 
 async fn delete_image(
     State(s): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let rec = s.store.delete_image(id).map_err(|_| ApiError::not_found("图像不存在"))?;
-    let _ = s.store.delete_file(&rec.file_path);
-    if let Ok(thumbs) = s.store.blobs().list(&format!("thumbnails/{id}_")) {
-        for t in thumbs {
-            let _ = s.store.delete_file(&t);
+    blocking(move || {
+        let rec = s.store.delete_image(id).map_err(|_| ApiError::not_found("图像不存在"))?;
+        let _ = s.store.delete_file(&rec.file_path);
+        if let Ok(thumbs) = s.store.blobs().list(&format!("thumbnails/{id}_")) {
+            for t in thumbs {
+                let _ = s.store.delete_file(&t);
+            }
         }
-    }
-    Ok(Json(serde_json::json!({"message": "图像已删除"})))
+        Ok(Json(serde_json::json!({"message": "图像已删除"})))
+    })
+    .await
 }
 
 async fn get_thumbnail(
@@ -403,23 +437,18 @@ async fn get_thumbnail(
     Query(q): Query<ThumbQuery>,
 ) -> ApiResult<impl IntoResponse> {
     let size = q.size.clamp(16, 2048);
-    let rec = s.store.get_image(id).map_err(|_| ApiError::not_found("图像不存在"))?;
-    let thumb_key = format!("thumbnails/{id}_{size}.jpg");
-    if !s.store.file_exists(&thumb_key) {
-        let store = s.store.clone();
-        let key = rec.file_path.clone();
-        let tkey = thumb_key.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let img = core::image_io::decode(&store.read_file(&key)?)?;
+    let bytes = blocking(move || {
+        let rec = s.store.get_image(id).map_err(|_| ApiError::not_found("图像不存在"))?;
+        let thumb_key = format!("thumbnails/{id}_{size}.jpg");
+        if !s.store.file_exists(&thumb_key) {
+            let img = core::image_io::decode(&s.store.read_file(&rec.file_path)?)?;
             let th = core::image_io::resize_max_side(&img, size);
             let rgb = core::image_io::to_rgb(&th);
-            store.write_file(&tkey, &core::image_io::encode_jpeg(&rgb, 85)?)
-        })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map_err(ApiError::from)?;
-    }
-    let bytes = s.store.read_file(&thumb_key).map_err(ApiError::from)?;
+            s.store.write_file(&thumb_key, &core::image_io::encode_jpeg(&rgb, 85)?)?;
+        }
+        Ok(s.store.read_file(&thumb_key)?)
+    })
+    .await?;
     Ok(([(axum::http::header::CONTENT_TYPE, "image/jpeg")], bytes))
 }
 
@@ -446,46 +475,53 @@ async fn upload(
     let filename = sanitize_filename(&filename.ok_or_else(|| ApiError::bad("文件名为空"))?)?;
     let data = data.ok_or_else(|| ApiError::bad("缺少文件内容"))?;
 
-    s.store.get_project(project_id).map_err(|_| ApiError::not_found("项目不存在"))?;
-
-    let state = s.clone();
-    tokio::task::spawn_blocking(move || {
-        service::handle_upload(&state, project_id, &filename, data)
+    blocking(move || {
+        s.store.get_project(project_id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        service::handle_upload(&s, project_id, &filename, data)
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .map(Json)
+    .map(Json) // handle_upload already returns ApiResult
 }
 
 async fn feature_status(
     State(s): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-    let images = s.store.list_images(id, 0, i64::MAX)?;
-    let items: Vec<serde_json::Value> = images
-        .iter()
-        .map(|i| serde_json::json!({"id": i.id, "filename": i.filename, "status": i.feature_status}))
-        .collect();
-    let ready = items.iter().filter(|i| i["status"] == "ready").count();
-    Ok(Json(serde_json::json!({
-        "project_id": id, "total": items.len(), "ready": ready,
-        "all_ready": ready == items.len() && !items.is_empty(), "images": items
-    })))
+    blocking(move || {
+        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_images(id, 0, i64::MAX)?;
+        let items: Vec<serde_json::Value> = images
+            .iter()
+            .map(|i| {
+                serde_json::json!({"id": i.id, "filename": i.filename, "status": i.feature_status})
+            })
+            .collect();
+        let ready = items.iter().filter(|i| i["status"] == "ready").count();
+        Ok(Json(serde_json::json!({
+            "project_id": id, "total": items.len(), "ready": ready,
+            "all_ready": ready == items.len() && !items.is_empty(), "images": items
+        })))
+    })
+    .await
 }
 
 async fn recompute_features(
     State(s): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-    let images = s.store.list_images(id, 0, i64::MAX)?;
-    let mut triggered = 0;
-    for img in images {
-        if img.feature_status != "ready" && s.store.file_exists(&img.file_path) {
-            enqueue_precompute(&s, img.id, img.file_path.clone());
-            triggered += 1;
-        }
+    let st = s.clone();
+    let pending = blocking(move || {
+        st.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = st.store.list_images(id, 0, i64::MAX)?;
+        Ok(images
+            .into_iter()
+            .filter(|i| i.feature_status != "ready" && st.store.file_exists(&i.file_path))
+            .collect::<Vec<_>>())
+    })
+    .await?;
+    let triggered = pending.len();
+    for img in pending {
+        enqueue_precompute(&s, img.id, img.file_path);
     }
     Ok(Json(serde_json::json!({
         "triggered": triggered,
@@ -503,17 +539,13 @@ async fn compare(
     if !(0.0..=1.0).contains(&body.threshold) {
         return Err(ApiError::bad("阈值必须在0-1之间"));
     }
-    s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-    let images = s.store.list_images(id, 0, i64::MAX)?;
-    let state = s.clone();
-    let threshold = body.threshold;
-    let rot = body.rotation_invariant;
-    let result = tokio::task::spawn_blocking(move || {
-        service::run_compare(&state, &images, &algo, threshold, rot)
+    let (threshold, rot) = (body.threshold, body.rotation_invariant);
+    blocking(move || {
+        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_images(id, 0, i64::MAX)?;
+        Ok(Json(service::run_compare(&s, &images, &algo, threshold, rot)?))
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(result))
 }
 
 async fn smart_compare(
@@ -525,15 +557,13 @@ async fn smart_compare(
         threshold: default_smart_threshold(),
         min_agree: default_min_agree(),
     });
-    s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-    let images = s.store.list_images(id, 0, i64::MAX)?;
-    let state = s.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        service::run_smart_compare(&state, &images, body.threshold, body.min_agree)
+    let (threshold, min_agree) = (body.threshold, body.min_agree);
+    blocking(move || {
+        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_images(id, 0, i64::MAX)?;
+        Ok(Json(service::run_smart_compare(&s, &images, threshold, min_agree)?))
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(result))
 }
 
 async fn dedup(
@@ -546,15 +576,13 @@ async fn dedup(
         threshold: default_threshold(),
         min_votes: default_dedup_votes(),
     });
-    s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-    let images = s.store.list_images(id, 0, i64::MAX)?;
-    let state = s.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        service::run_dedup_scan(&state, &images, body.radius, body.threshold, body.min_votes)
+    let (radius, threshold, min_votes) = (body.radius, body.threshold, body.min_votes);
+    blocking(move || {
+        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_images(id, 0, i64::MAX)?;
+        Ok(Json(service::run_dedup_scan(&s, &images, radius, threshold, min_votes)?))
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(result))
 }
 
 async fn matrix(
@@ -563,17 +591,13 @@ async fn matrix(
     Query(q): Query<MatrixQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_algorithm(&q.algorithm)?;
-    s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-    let images = s.store.list_images(id, 0, i64::MAX)?;
-    let state = s.clone();
-    let algo = q.algorithm.clone();
-    let rot = q.rotation_invariant;
-    let result = tokio::task::spawn_blocking(move || {
-        service::pairwise_matrix(&state, &images, &algo, rot)
+    let (algo, rot) = (q.algorithm, q.rotation_invariant);
+    blocking(move || {
+        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_images(id, 0, i64::MAX)?;
+        Ok(Json(service::pairwise_matrix(&s, &images, &algo, rot)?))
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(result))
 }
 
 async fn report(
@@ -582,36 +606,37 @@ async fn report(
     Query(q): Query<ReportQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_algorithm(&q.algorithm)?;
-    let project = s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-    let images = s.store.list_images(id, 0, i64::MAX)?;
-    let state = s.clone();
-    let algo = q.algorithm.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        service::build_report(&state, &project, &images, &algo, q.threshold, q.rotation_invariant)
+    let (algo, threshold, rot) = (q.algorithm, q.threshold, q.rotation_invariant);
+    blocking(move || {
+        let project = s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_images(id, 0, i64::MAX)?;
+        Ok(Json(service::build_report(&s, &project, &images, &algo, threshold, rot)?))
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(result))
 }
 
 async fn list_runs(
     State(s): State<AppState>,
     Query(q): Query<RunsQuery>,
 ) -> ApiResult<Json<Vec<itrace_store::AnalysisRunRecord>>> {
-    s.store.get_project(q.project_id).map_err(|_| ApiError::not_found("项目不存在"))?;
-    Ok(Json(s.store.list_runs(q.project_id, q.skip, q.limit.min(500))?))
+    blocking(move || {
+        s.store.get_project(q.project_id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        Ok(Json(s.store.list_runs(q.project_id, q.skip, q.limit.min(500))?))
+    })
+    .await
 }
 
 async fn get_run(
     State(s): State<AppState>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let run = s.store.get_run(id).map_err(|_| ApiError::not_found("分析记录不存在"))?;
-    let parsed: Option<serde_json::Value> = run
-        .summary
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok());
-    Ok(Json(serde_json::json!({"run": run, "result": parsed})))
+    blocking(move || {
+        let run = s.store.get_run(id).map_err(|_| ApiError::not_found("分析记录不存在"))?;
+        let parsed: Option<serde_json::Value> =
+            run.summary.as_deref().and_then(|s| serde_json::from_str(s).ok());
+        Ok(Json(serde_json::json!({"run": run, "result": parsed})))
+    })
+    .await
 }
 
 async fn match_pairs(
@@ -622,13 +647,14 @@ async fn match_pairs(
     if !DESCRIPTOR_ALGOS.contains(&algo.as_str()) {
         return Err(ApiError::bad(format!("仅支持描述子算法: {}", DESCRIPTOR_ALGOS.join(","))));
     }
-    let ia = s.store.get_image(body.image_a_id).map_err(|_| ApiError::not_found("图像不存在"))?;
-    let ib = s.store.get_image(body.image_b_id).map_err(|_| ApiError::not_found("图像不存在"))?;
-    let state = s.clone();
-    tokio::task::spawn_blocking(move || service::match_data(&state, &ia, &ib, &algo))
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map(Json)
+    let (a, b) = (body.image_a_id, body.image_b_id);
+    blocking(move || {
+        let ia = s.store.get_image(a).map_err(|_| ApiError::not_found("图像不存在"))?;
+        let ib = s.store.get_image(b).map_err(|_| ApiError::not_found("图像不存在"))?;
+        service::match_data(&s, &ia, &ib, &algo)
+    })
+    .await
+    .map(Json)
 }
 
 async fn visualize_match(
@@ -639,30 +665,29 @@ async fn visualize_match(
     if !DESCRIPTOR_ALGOS.contains(&algo.as_str()) {
         return Err(ApiError::bad(format!("仅支持描述子算法: {}", DESCRIPTOR_ALGOS.join(","))));
     }
-    let ia = s.store.get_image(body.image_a_id).map_err(|_| ApiError::not_found("图像不存在"))?;
-    let ib = s.store.get_image(body.image_b_id).map_err(|_| ApiError::not_found("图像不存在"))?;
-    let state = s.clone();
-    tokio::task::spawn_blocking(move || service::visualize(&state, &ia, &ib, &algo))
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .map(Json)
+    let (a, b) = (body.image_a_id, body.image_b_id);
+    blocking(move || {
+        let ia = s.store.get_image(a).map_err(|_| ApiError::not_found("图像不存在"))?;
+        let ib = s.store.get_image(b).map_err(|_| ApiError::not_found("图像不存在"))?;
+        service::visualize(&s, &ia, &ib, &algo)
+    })
+    .await
+    .map(Json)
 }
 
 async fn slice_match(
     State(s): State<AppState>,
     Json(body): Json<SliceRequest>,
 ) -> ApiResult<Json<core::slice::SliceMatchResult>> {
-    let ia = s.store.get_image(body.image_a_id).map_err(|_| ApiError::not_found("图像不存在"))?;
-    let ib = s.store.get_image(body.image_b_id).map_err(|_| ApiError::not_found("图像不存在"))?;
+    let (a, b) = (body.image_a_id, body.image_b_id);
     let rows = body.rows.clamp(1, 8);
     let cols = body.cols.clamp(1, 8);
-    let state = s.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        service::slice_match(&state, &ia, &ib, rows, cols)
+    blocking(move || {
+        let ia = s.store.get_image(a).map_err(|_| ApiError::not_found("图像不存在"))?;
+        let ib = s.store.get_image(b).map_err(|_| ApiError::not_found("图像不存在"))?;
+        Ok(Json(service::slice_match(&s, &ia, &ib, rows, cols)?))
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))??;
-    Ok(Json(result))
 }
 
 /// Blob prefixes a client may download — anything else (e.g. the SQLite DB
@@ -673,14 +698,10 @@ async fn download_file(
     State(s): State<AppState>,
     Path(path): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let rel = path.strip_prefix("data/").unwrap_or(&path);
+    let rel = path.strip_prefix("data/").unwrap_or(&path).to_string();
     if !DOWNLOAD_PREFIXES.iter().any(|p| rel.starts_with(p)) {
         return Err(ApiError::not_found("文件不存在"));
     }
-    let bytes = s
-        .store
-        .read_file(rel)
-        .map_err(|_| ApiError::not_found("文件不存在"))?;
     let mime = match rel.rsplit('.').next().unwrap_or("") {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
@@ -689,6 +710,9 @@ async fn download_file(
         "pdf" => "application/pdf",
         _ => "application/octet-stream",
     };
+    let bytes =
+        blocking(move || s.store.read_file(&rel).map_err(|_| ApiError::not_found("文件不存在")))
+            .await?;
     Ok(([(axum::http::header::CONTENT_TYPE, mime)], bytes))
 }
 
@@ -706,7 +730,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::open(std::path::Path::new(&data_dir))?;
     let _ = APP_STORAGE.set(store.storage_kind());
     tracing::info!("storage backend: {}", store.storage_kind());
-    let state = AppState { store: Arc::new(store) };
+    let state = AppState { store: Arc::new(store), gray_cache: Default::default() };
 
     let app = Router::new()
         .route("/v1/health", get(health))

@@ -21,8 +21,9 @@ const LEVEL_MAX_FEATURES: usize = 256;
 const PYRAMID_SIGMA: f32 = 1.0;
 
 fn gaussian_blur(gray: &GrayImage, sigma: f32) -> GrayImage {
-    let buf: ImageBuffer<Luma<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(gray.width, gray.height, gray.data.clone())
+    // Borrowed view over `gray.data` — blur only reads its source.
+    let buf: ImageBuffer<Luma<u8>, &[u8]> =
+        ImageBuffer::from_raw(gray.width, gray.height, gray.data.as_slice())
             .expect("gray buffer size matches");
     GrayImage::new(
         gray.width,
@@ -31,32 +32,17 @@ fn gaussian_blur(gray: &GrayImage, sigma: f32) -> GrayImage {
     )
 }
 
-/// Levels of the Gaussian pyramid, base level first. Level *i*+1 is a
-/// blurred 2× downsample of level *i* (classic Burt–Adelson reduce).
-fn gaussian_pyramid(gray: &GrayImage) -> Vec<GrayImage> {
-    let mut levels = Vec::with_capacity(NUM_LEVELS as usize);
-    let mut cur = gray.clone();
-    for i in 0..NUM_LEVELS {
-        if i > 0 {
-            let blurred = gaussian_blur(&cur, PYRAMID_SIGMA);
-            cur = image_io::resize_gray_exact(
-                &blurred,
-                (cur.width / 2).max(1),
-                (cur.height / 2).max(1),
-            );
-        }
-        levels.push(cur.clone());
-    }
-    levels
-}
-
 /// ORB descriptors pooled across the pyramid: one merged descriptor set
 /// with keypoint coordinates rescaled to the base-level frame and
-/// `level` re-tagged to the outer pyramid level.
+/// `level` re-tagged to the outer pyramid level. The pyramid is computed
+/// lazily level-by-level — no full-image clones: level *i*+1 is a blurred
+/// 2× downsample of level *i* (classic Burt–Adelson reduce).
 fn detect_multiscale(gray: &GrayImage) -> DescriptorSet {
     let mut merged =
         DescriptorSet { keypoints: Vec::new(), desc_len: 32, data: Vec::new() };
-    for (i, level) in gaussian_pyramid(gray).iter().enumerate() {
+    let mut owned: Option<GrayImage> = None;
+    for i in 0..NUM_LEVELS {
+        let level: &GrayImage = owned.as_ref().unwrap_or(gray);
         let ds = orb::detect_orb(level, LEVEL_MAX_FEATURES);
         let s = (1u32 << i) as f32;
         merged.keypoints.extend(ds.keypoints.iter().map(|k| {
@@ -67,6 +53,13 @@ fn detect_multiscale(gray: &GrayImage) -> DescriptorSet {
             k
         }));
         merged.data.extend_from_slice(&ds.data);
+        if i + 1 < NUM_LEVELS {
+            owned = Some(image_io::resize_gray_exact(
+                &gaussian_blur(level, PYRAMID_SIGMA),
+                (level.width / 2).max(1),
+                (level.height / 2).max(1),
+            ));
+        }
     }
     merged
 }
@@ -91,15 +84,35 @@ impl FeatureExtractor for OrbScaleExtractor {
         data.len() / 4
     }
     fn similarity(&self, a: &[u8], b: &[u8]) -> f64 {
-        centered_cosine(&unpack_f32(a), &unpack_f32(b))
+        // pooled payloads are 32 dims — stack-decode instead of Vec allocs
+        let mut fa = [0f32; POOLED_DIMS];
+        let mut fb = [0f32; POOLED_DIMS];
+        if a.len() == POOLED_DIMS * 4 && b.len() == POOLED_DIMS * 4 {
+            for (v, c) in fa.iter_mut().zip(a.as_chunks::<4>().0) {
+                *v = f32::from_le_bytes(*c);
+            }
+            for (v, c) in fb.iter_mut().zip(b.as_chunks::<4>().0) {
+                *v = f32::from_le_bytes(*c);
+            }
+            centered_cosine(&fa, &fb)
+        } else {
+            centered_cosine(&unpack_f32(a), &unpack_f32(b))
+        }
+    }
+    fn matrix_kernel(&self) -> Option<super::MatrixKernel> {
+        Some(super::MatrixKernel::CenteredCosine)
     }
 }
+
+/// Pooled-vector dimensionality (ORB descriptors are 32 bytes).
+const POOLED_DIMS: usize = 32;
 
 /// Cosine over mean-centered pooled vectors. Raw pooled byte-means are
 /// all-positive and share ORB's bit-distribution bias, so plain cosine
 /// reports ~0.95+ even for unrelated images; removing each vector's own
-/// mean makes the score track distribution *shape* instead.
-fn centered_cosine(a: &[f32], b: &[f32]) -> f64 {
+/// mean makes the score track distribution *shape* instead. `pub(crate)`:
+/// also the decode-once matrix kernel's scorer.
+pub(crate) fn centered_cosine(a: &[f32], b: &[f32]) -> f64 {
     let n = a.len().min(b.len());
     if n == 0 {
         return 0.0;

@@ -2,6 +2,7 @@
 
 pub mod orb;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// A detected keypoint.
@@ -72,39 +73,89 @@ pub struct Match {
     pub distance: u32,
 }
 
-/// Hamming distance between two binary descriptors.
+/// Hamming distance between two binary descriptors — processed a
+/// `u64` word at a time (a 32-byte descriptor is 4 XOR+popcount ops).
 #[inline]
 pub fn desc_hamming(a: &[u8], b: &[u8]) -> u32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x ^ y).count_ones()).sum()
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut d = 0u32;
+    let mut ac = a.chunks_exact(8);
+    let mut bc = b.chunks_exact(8);
+    for (x, y) in (&mut ac).zip(&mut bc) {
+        let xa = u64::from_ne_bytes(x.try_into().unwrap());
+        let xb = u64::from_ne_bytes(y.try_into().unwrap());
+        d += (xa ^ xb).count_ones();
+    }
+    for (x, y) in ac.remainder().iter().zip(bc.remainder()) {
+        d += (x ^ y).count_ones();
+    }
+    d
+}
+
+/// Hamming distance with early exit: `Some(d)` iff `d < cap`.
+/// Callers pass a running bound (current best / second-best) so
+/// rows that can't matter bail after the first chunks.
+#[inline]
+fn hamming_capped(a: &[u8], b: &[u8], cap: u32) -> Option<u32> {
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut d = 0u32;
+    let mut ac = a.chunks_exact(8);
+    let mut bc = b.chunks_exact(8);
+    for (x, y) in (&mut ac).zip(&mut bc) {
+        let xa = u64::from_ne_bytes(x.try_into().unwrap());
+        let xb = u64::from_ne_bytes(y.try_into().unwrap());
+        d += (xa ^ xb).count_ones();
+        if d >= cap {
+            return None;
+        }
+    }
+    for (x, y) in ac.remainder().iter().zip(bc.remainder()) {
+        d += (x ^ y).count_ones();
+    }
+    (d < cap).then_some(d)
 }
 
 /// Cross-checked nearest-neighbour matching (BFMatcher crossCheck equivalent).
+///
+/// The a×b distance matrix is computed exactly once (parallel rows);
+/// the forward argmin, the column-wise backward argmin and the reported
+/// distance all read from it, so each pair distance is computed once.
 pub fn match_cross_check(a: &DescriptorSet, b: &DescriptorSet) -> Vec<Match> {
     if a.desc_len != b.desc_len || a.is_empty() || b.is_empty() {
         return Vec::new();
     }
-    let best_in_b: Vec<usize> = (0..a.len())
+    let (an, bn) = (a.len(), b.len());
+    // matrix rows + per-row forward argmin (first minimum wins)
+    let rows: Vec<(Vec<u32>, usize)> = (0..an)
+        .into_par_iter()
         .map(|i| {
             let ra = a.row(i);
-            (0..b.len())
-                .map(|j| (desc_hamming(ra, b.row(j)), j))
-                .min_by_key(|(d, _)| *d)
-                .map(|(_, j)| j)
-                .unwrap_or(0)
+            let row: Vec<u32> = (0..bn).map(|j| desc_hamming(ra, b.row(j))).collect();
+            let mut best = 0usize;
+            for (j, &d) in row.iter().enumerate().skip(1) {
+                if d < row[best] {
+                    best = j;
+                }
+            }
+            (row, best)
         })
         .collect();
+    // backward argmin per column in one sequential pass over the rows
+    // (scan order = row index → strict < keeps the first minimum's index)
+    let mut col_best: Vec<(u32, usize)> = vec![(u32::MAX, usize::MAX); bn];
+    for (k, (row, _)) in rows.iter().enumerate() {
+        for (j, &d) in row.iter().enumerate() {
+            if d < col_best[j].0 {
+                col_best[j] = (d, k);
+            }
+        }
+    }
     let mut out = Vec::new();
-    for (i, &j) in best_in_b.iter().enumerate() {
-        let ra = a.row(i);
-        let rb = b.row(j);
-        // best match of rb back into a
-        let back = (0..a.len())
-            .map(|k| (desc_hamming(rb, a.row(k)), k))
-            .min_by_key(|(d, _)| *d)
-            .map(|(_, k)| k)
-            .unwrap_or(usize::MAX);
-        if back == i {
-            out.push(Match { a_idx: i, b_idx: j, distance: desc_hamming(ra, rb) });
+    for (i, (row, j)) in rows.iter().enumerate() {
+        if col_best[*j].1 == i {
+            out.push(Match { a_idx: i, b_idx: *j, distance: row[*j] });
         }
     }
     out.sort_by_key(|m| m.distance);
@@ -117,26 +168,33 @@ pub fn match_knn_ratio(a: &DescriptorSet, b: &DescriptorSet, ratio: f64) -> Vec<
     if a.desc_len != b.desc_len || a.is_empty() || b.is_empty() {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    for i in 0..a.len() {
-        let ra = a.row(i);
-        let mut best = u32::MAX;
-        let mut second = u32::MAX;
-        let mut best_j = 0usize;
-        for j in 0..b.len() {
-            let d = desc_hamming(ra, b.row(j));
-            if d < best {
-                second = best;
-                best = d;
-                best_j = j;
-            } else if d < second {
-                second = d;
+    let bn = b.len();
+    let mut out: Vec<Match> = (0..a.len())
+        .into_par_iter()
+        .filter_map(|i| {
+            let ra = a.row(i);
+            let mut best = u32::MAX;
+            let mut second = u32::MAX;
+            let mut best_j = 0usize;
+            for j in 0..bn {
+                // only a distance under the running second-best can
+                // still change the outcome — early-exit otherwise
+                let Some(d) = hamming_capped(ra, b.row(j), second) else { continue };
+                if d < best {
+                    second = best;
+                    best = d;
+                    best_j = j;
+                } else {
+                    second = d;
+                }
             }
-        }
-        if second < u32::MAX && (best as f64) < ratio * (second as f64) {
-            out.push(Match { a_idx: i, b_idx: best_j, distance: best });
-        }
-    }
+            if second < u32::MAX && (best as f64) < ratio * (second as f64) {
+                Some(Match { a_idx: i, b_idx: best_j, distance: best })
+            } else {
+                None
+            }
+        })
+        .collect();
     out.sort_by_key(|m| m.distance);
     out
 }
@@ -146,6 +204,9 @@ pub fn match_knn_ratio(a: &DescriptorSet, b: &DescriptorSet, ratio: f64) -> Vec<
 /// normalized by descriptor bit width — multiplied by a match-density
 /// factor so a handful of lucky near-identical descriptors between
 /// unrelated images cannot reach a high score.
+///
+/// `match_cross_check` already returns matches sorted by distance, so
+/// the top-k slice needs no further sorting or selection.
 pub fn match_score(a: &DescriptorSet, b: &DescriptorSet, top_k: usize) -> f64 {
     let matches = match_cross_check(a, b);
     if matches.is_empty() {

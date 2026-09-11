@@ -58,9 +58,17 @@ impl FeatureExtractor for BlockhashExtractor {
                 means[ty * GRID + tx] = sum as f64 / (tp * tp) as f64;
             }
         }
+        // select_nth_unstable for the upper middle, then take the max of the
+        // low partition — the same two order statistics the full sort averaged.
         let mut sorted = means;
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = (sorted[BITS / 2 - 1] + sorted[BITS / 2]) / 2.0;
+        sorted.select_nth_unstable_by(BITS / 2, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let lo = sorted[..BITS / 2]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let median = (lo + sorted[BITS / 2]) / 2.0;
         let mut out = vec![0u8; BITS / 8];
         for (i, &m) in means.iter().enumerate() {
             if m > median {
@@ -73,20 +81,24 @@ impl FeatureExtractor for BlockhashExtractor {
         BITS
     }
     fn similarity(&self, a: &[u8], b: &[u8]) -> f64 {
-        let ga = unpack_grid(a);
-        let gb = unpack_grid(b);
+        let ga = payload_rows(a);
+        let gb = payload_rows(b);
         // Both directions: either image may be the cropped one.
         best_overlap(&ga, &gb).max(best_overlap(&gb, &ga))
     }
 }
 
-/// Unpack an LSB-first bit payload into a row-major GRID×GRID 0/1 tile map.
-fn unpack_grid(data: &[u8]) -> [u8; BITS] {
-    let mut g = [0u8; BITS];
-    for (i, v) in g.iter_mut().enumerate() {
-        *v = (data[i / 8] >> (i % 8)) & 1;
+/// Pack an LSB-first bit payload into GRID row masks (bit x of row y =
+/// tile y*GRID+x — the same mapping `unpack_grid` produced, kept in u64s so
+/// overlap windows compare with XOR + popcount). Reads `BITS/8` bytes like
+/// the old unpacking (extra bytes ignored, short payloads panic).
+fn payload_rows(data: &[u8]) -> [u64; GRID] {
+    let mut r = [0u64; GRID];
+    for i in 0..BITS / 8 {
+        // 8 consecutive tile bits per byte; all land in row i/4 at (i%4)*8
+        r[i / 4] |= (data[i] as u64) << ((i % 4) * 8);
     }
-    g
+    r
 }
 
 /// Source tile index for output tile (x, y) under dihedral orientation `k`,
@@ -115,78 +127,95 @@ fn oriented_src(k: u8, x: usize, y: usize) -> usize {
 ///   windows of `a` — the tile region a same-fraction crop would occupy.
 ///
 /// Returns the best hits/overlap ratio found.
-fn best_overlap(a: &[u8; BITS], b: &[u8; BITS]) -> f64 {
+///
+/// Tile rows are u64 bitmasks: an overlap region is a rectangle, so each of
+/// its rows scores with one XOR + popcount (hits = total − mismatches), and
+/// a shift is abandoned as soon as its remaining rows cannot raise `best` —
+/// identical scores to the per-tile comparison this replaces.
+fn best_overlap(a: &[u64; GRID], b: &[u64; GRID]) -> f64 {
     let mut best = 0.0f64;
     for k in 0..8u8 {
-        let mut bg = [0u8; BITS];
-        for y in 0..GRID {
+        // `b` under dihedral orientation k, packed: row y bit x = b[src(x,y)]
+        let mut rb = [0u64; GRID];
+        for (y, row) in rb.iter_mut().enumerate() {
+            let mut bits = 0u64;
             for x in 0..GRID {
-                bg[y * GRID + x] = b[oriented_src(k, x, y)];
+                let src = oriented_src(k, x, y);
+                bits |= ((b[src / GRID] >> (src % GRID)) & 1) << x;
             }
+            *row = bits;
         }
         for oy in -MAX_SHIFT..=MAX_SHIFT {
+            // compared b-rows: by ∈ [by0, by1) with ay = by + oy
+            let (by0, by1) = ((-oy).max(0) as usize, (GRID as i32 - oy).min(GRID as i32) as usize);
+            let nrows = by1 - by0;
             for ox in -MAX_SHIFT..=MAX_SHIFT {
-                let mut hits = 0usize;
-                let mut total = 0usize;
-                for by in 0..GRID {
-                    let ay = by as i32 + oy;
-                    if ay < 0 || ay >= GRID as i32 {
-                        continue;
-                    }
-                    for bx in 0..GRID {
-                        let ax = bx as i32 + ox;
-                        if ax < 0 || ax >= GRID as i32 {
-                            continue;
-                        }
-                        total += 1;
-                        if a[ay as usize * GRID + ax as usize] == bg[by * GRID + bx] {
-                            hits += 1;
-                        }
+                let bx0 = (-ox).max(0) as usize;
+                let ax0 = ox.max(0) as usize;
+                let width = GRID - ox.unsigned_abs() as usize;
+                let mask = (1u64 << width) - 1;
+                let total = nrows * width;
+                let mut mism = 0usize;
+                for (i, &rbrow) in rb[by0..by1].iter().enumerate() {
+                    let ay = (by0 + i) as i32 + oy;
+                    mism += (((a[ay as usize] >> ax0) ^ (rbrow >> bx0)) & mask).count_ones() as usize;
+                    // score bound: even all-matching remaining rows can't
+                    // beat `best` — stop (the max update below is then ≤ best
+                    // and a no-op, so no completion flag is needed)
+                    if (total - mism) as f64 <= best * total as f64 {
+                        break;
                     }
                 }
                 if total >= MIN_OVERLAP {
-                    best = best.max(hits as f64 / total as f64);
+                    best = best.max((total - mism) as f64 / total as f64);
                 }
             }
         }
         for &s in ZOOMS {
             let w = (GRID as f64 * s).round() as usize;
-            // Majority-downsample `bg` to w×w: window tile t takes the strict
-            // majority of the bg tiles mapping into it (½ on a tie).
-            let mut wt = [0f64; BITS];
-            for wy in 0..w {
-                for wx in 0..w {
-                    let (mut ones, mut n) = (0usize, 0usize);
-                    for by in 0..GRID {
-                        for bx in 0..GRID {
-                            if ((bx as f64 + 0.5) * s).floor() as usize == wx
-                                && ((by as f64 + 0.5) * s).floor() as usize == wy
-                            {
-                                ones += bg[by * GRID + bx] as usize;
-                                n += 1;
-                            }
-                        }
-                    }
-                    wt[wy * GRID + wx] = ones as f64 / n as f64;
+            // Majority-downsample `rb` to w×w: each source tile maps into
+            // exactly one window cell — one pass accumulates ones/n per cell.
+            let mut ones = [0u32; BITS];
+            let mut cnt = [0u32; BITS];
+            for (by, &rbrow) in rb.iter().enumerate() {
+                let wy = ((by as f64 + 0.5) * s).floor() as usize;
+                for bx in 0..GRID {
+                    let wx = ((bx as f64 + 0.5) * s).floor() as usize;
+                    cnt[wy * GRID + wx] += 1;
+                    ones[wy * GRID + wx] += ((rbrow >> bx) & 1) as u32;
                 }
             }
+            // window tile = strict majority of its source tiles (½ on a tie);
+            // rows packed as bit masks: set bits + half-credit tie cells
+            let mut wbits = [0u64; GRID];
+            let mut wtie = [0u64; GRID];
+            for wy in 0..w {
+                for wx in 0..w {
+                    let wt = ones[wy * GRID + wx] as f64 / cnt[wy * GRID + wx] as f64;
+                    if (wt - 0.5).abs() < 1e-9 {
+                        wtie[wy] |= 1 << wx;
+                    } else if wt > 0.5 {
+                        wbits[wy] |= 1 << wx;
+                    }
+                }
+            }
+            let ntie: usize = wtie[..w].iter().map(|r| r.count_ones() as usize).sum();
+            let (w2, half_tie) = ((w * w) as f64, ntie as f64 * 0.5);
+            let mask = (1u64 << w) - 1;
             for oy in 0..=(GRID - w) {
                 for ox in 0..=(GRID - w) {
-                    let mut score = 0f64;
+                    let mut mism = 0usize;
                     for wy in 0..w {
-                        for wx in 0..w {
-                            let abit = a[(wy + oy) * GRID + wx + ox] as f64;
-                            let bbit = wt[wy * GRID + wx];
-                            score += if (bbit - 0.5).abs() < 1e-9 {
-                                0.5
-                            } else if (bbit > 0.5) == (abit > 0.5) {
-                                1.0
-                            } else {
-                                0.0
-                            };
+                        mism += ((((a[wy + oy] >> ox) ^ wbits[wy]) & mask) & !wtie[wy])
+                            .count_ones() as usize;
+                        if w2 - mism as f64 - half_tie <= best * w2 {
+                            break; // bound can't beat best — same no-op update
                         }
                     }
-                    best = best.max(score / (w * w) as f64);
+                    // score = (non-tie matches + ½·ties) / w²
+                    //       = (w² − mism − ntie/2) / w² — the exact dyadic
+                    //       sum the per-cell accumulation produced
+                    best = best.max((w2 - mism as f64 - half_tie) / w2);
                 }
             }
         }

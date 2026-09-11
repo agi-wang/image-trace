@@ -72,10 +72,14 @@ pub fn edgehash(gray: &GrayImage) -> u64 {
                 - small.data[i - w - 1] as i32
                 - 2 * small.data[i - w] as i32
                 - small.data[i - w + 1] as i32;
-            let mag = ((gx * gx + gy * gy) as f64).sqrt();
-            if mag < MAG_FLOOR {
+            // compare squared magnitude to squared floor — sqrt is monotonic,
+            // so the filter decision is identical and the sqrt runs only on
+            // pixels that pass
+            let mag2 = (gx * gx + gy * gy) as f64;
+            if mag2 < MAG_FLOOR * MAG_FLOOR {
                 continue;
             }
+            let mag = mag2.sqrt();
             // undirected orientation in [0, π) at 45° bin spacing, cyclic;
             // magnitude splits linearly between the two nearest bins
             let pos = (gy as f64)

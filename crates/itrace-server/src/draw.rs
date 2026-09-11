@@ -13,6 +13,18 @@ fn put_px(img: &mut RgbImage, x: i32, y: i32, c: (u8, u8, u8)) {
     }
 }
 
+/// Copy `src` into `canvas` at horizontal pixel offset `x_off`, one whole
+/// row slice at a time (3 bytes/px contiguous) instead of per-pixel.
+fn blit(canvas: &mut RgbImage, src: &RgbImage, x_off: u32) {
+    let cw = canvas.width as usize;
+    let sw = src.width as usize;
+    for y in 0..src.height as usize {
+        let dst = (y * cw + x_off as usize) * 3;
+        canvas.data[dst..dst + sw * 3]
+            .copy_from_slice(&src.data[y * sw * 3..(y + 1) * sw * 3]);
+    }
+}
+
 fn draw_circle(img: &mut RgbImage, cx: i32, cy: i32, r: i32, c: (u8, u8, u8)) {
     for deg in (0..360).step_by(4) {
         let rad = (deg as f32).to_radians();
@@ -67,18 +79,8 @@ pub fn draw_matches(
     let h = a.height.max(b.height);
     let mut canvas = RgbImage::new(w, h, vec![0u8; (w * h * 3) as usize]);
     // blit images
-    for y in 0..a.height {
-        for x in 0..a.width {
-            let (r, g, bl) = a.pixel(x, y);
-            put_px(&mut canvas, x as i32, y as i32, (r, g, bl));
-        }
-    }
-    for y in 0..b.height {
-        for x in 0..b.width {
-            let (r, g, bl) = b.pixel(x, y);
-            put_px(&mut canvas, (x + a.width) as i32, y as i32, (r, g, bl));
-        }
-    }
+    blit(&mut canvas, a, 0);
+    blit(&mut canvas, b, a.width);
     for (i, m) in matches.iter().enumerate() {
         let c = COLORS[i % COLORS.len()];
         let ka = da.keypoints[m.a_idx];

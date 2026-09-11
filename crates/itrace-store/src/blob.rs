@@ -2,6 +2,7 @@
 //! (MinIO). Keys are slash-separated paths like `uploads/photo.jpg`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -41,13 +42,28 @@ impl FsBlobStore {
     }
 }
 
+/// Temp-file sequence so concurrent `put` calls on the same key never
+/// share a scratch path.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl BlobStore for FsBlobStore {
     fn put(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
         let p = self.full(key)?;
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
         }
-        std::fs::write(p, data)?;
+        // Atomic publish: write a unique sibling temp file, then rename
+        // over the target — readers never see a partially-written blob.
+        let tmp = p.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&tmp, data)?;
+        if let Err(e) = std::fs::rename(&tmp, &p) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
     fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
@@ -115,11 +131,16 @@ impl S3BlobStore {
             .with_allow_http(true)
             .with_virtual_hosted_style_request(false)
             .build()?;
-        // multi_thread (1 worker): spawned tasks are driven autonomously by the
-        // runtime's own worker — a current_thread runtime would never poll
-        // them without someone calling block_on.
+        // multi_thread (≤4 workers): spawned tasks are driven autonomously
+        // by the runtime's own workers — a current_thread runtime would
+        // never poll them without someone calling block_on. More than one
+        // worker lets pipelined put/get calls overlap on the wire.
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .min(4);
         let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(workers)
             .enable_all()
             .build()?;
         Ok(Self { inner, rt })
@@ -199,5 +220,33 @@ pub fn blob_store_from_env(local_root: &std::path::Path) -> anyhow::Result<Arc<d
     match std::env::var("ITRACE_STORAGE").unwrap_or_else(|_| "fs".into()).as_str() {
         "s3" => Ok(Arc::new(S3BlobStore::from_env()?)),
         _ => Ok(Arc::new(FsBlobStore::new(local_root))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fs_put_is_atomic_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!(
+            "itrace-blob-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = FsBlobStore::new(&dir);
+        store.put("uploads/a.jpg", b"hello").unwrap();
+        assert!(store.exists("uploads/a.jpg"));
+        assert_eq!(store.get("uploads/a.jpg").unwrap(), b"hello");
+        // overwrite publishes via rename — no torn file, no stray tmp left
+        store.put("uploads/a.jpg", b"world").unwrap();
+        assert_eq!(store.get("uploads/a.jpg").unwrap(), b"world");
+        assert_eq!(store.list("uploads/a.jpg").unwrap(), ["uploads/a.jpg"]);
+        store.delete("uploads/a.jpg").unwrap();
+        assert!(!store.exists("uploads/a.jpg"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

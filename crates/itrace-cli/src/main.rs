@@ -94,14 +94,17 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Precompute { project_id } => {
             let images = store.list_images(project_id, 0, i64::MAX)?;
-            images.par_iter().for_each(|img| {
-                if img.feature_status == "ready" {
-                    return;
+            // decode + feature compute in parallel; DB writes stay sequential
+            let computed: Vec<_> = images
+                .par_iter()
+                .filter(|i| i.feature_status != "ready")
+                .map(|i| (i.id, compute_rows(&store, &i.file_path)))
+                .collect();
+            for (id, rows) in computed {
+                if let Err(e) = write_features(&store, id, rows) {
+                    eprintln!("image {id} precompute failed: {e}");
                 }
-                if let Err(e) = precompute(&store, img.id, &img.file_path) {
-                    eprintln!("image {} precompute failed: {e}", img.id);
-                }
-            });
+            }
             println!("done");
         }
         Cmd::Compare { project_id, algorithm, threshold, rotation_invariant } => {
@@ -140,13 +143,30 @@ fn main() -> anyhow::Result<()> {
             let variants: Vec<u8> = (0..features::NUM_VARIANTS).collect();
             let mut pair_hits: std::collections::HashMap<(usize, usize), Vec<String>> =
                 std::collections::HashMap::new();
-            for algo in itrace_core::SMART_ALGOS {
-                let Some(feat) = features::algo_to_feature(algo) else { continue };
-                let map = store.load_feature_map(&ids, feat, &variants)?;
+            // deduped feature list — one batched load covers every algo
+            let mut feat_names: Vec<&'static str> = Vec::new();
+            let algo_feat: Vec<Option<usize>> = itrace_core::SMART_ALGOS
+                .iter()
+                .map(|a| {
+                    features::algo_to_feature(a).map(|f| {
+                        match feat_names.iter().position(|&x| x == f) {
+                            Some(i) => i,
+                            None => {
+                                feat_names.push(f);
+                                feat_names.len() - 1
+                            }
+                        }
+                    })
+                })
+                .collect();
+            let maps = store.load_feature_maps(&ids, &feat_names, &variants)?;
+            for (algo, fi) in itrace_core::SMART_ALGOS.iter().zip(&algo_feat) {
+                let Some(fi) = *fi else { continue };
+                let map = &maps[fi];
                 if map.is_empty() {
                     continue;
                 }
-                let m = features::similarity_matrix(&map, &ids, algo, true);
+                let m = features::similarity_matrix(map, &ids, algo, true);
                 for (i, row) in m.iter().enumerate() {
                     for (j, &s) in row.iter().enumerate().skip(i + 1) {
                         if s >= threshold {
@@ -265,15 +285,26 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
     bail!("不支持的文件格式: {name}")
 }
 
-fn precompute(store: &Store, image_id: i64, key: &str) -> anyhow::Result<()> {
+/// Computed feature rows for one image: (variant_idx, name, bytes, dims).
+type FeatureRows = Vec<(u8, String, Vec<u8>, usize)>;
+
+/// Decode `key` and compute all feature rows (CPU-heavy; no DB access).
+fn compute_rows(store: &Store, key: &str) -> anyhow::Result<FeatureRows> {
+    Ok(features::compute_all_variants(&image_io::decode(&store.read_file(key)?)?))
+}
+
+/// Status protocol: computing → batched write → ready / pending.
+fn write_features(
+    store: &Store,
+    image_id: i64,
+    rows: anyhow::Result<FeatureRows>,
+) -> anyhow::Result<()> {
     store.set_feature_status(image_id, "computing")?;
-    let res = (|| -> anyhow::Result<()> {
-        let img = image_io::decode(&store.read_file(key)?)?;
-        for (variant, name, bytes, dims) in features::compute_all_variants(&img) {
-            store.put_feature(image_id, variant, &name, &bytes, dims)?;
-        }
-        Ok(())
-    })();
+    let res = rows.and_then(|rows| {
+        let refs: Vec<(u8, &str, &[u8], usize)> =
+            rows.iter().map(|(v, n, b, d)| (*v, n.as_str(), b.as_slice(), *d)).collect();
+        store.put_features(image_id, &refs)
+    });
     match res {
         Ok(()) => store.set_feature_status(image_id, "ready"),
         Err(e) => {
@@ -281,6 +312,10 @@ fn precompute(store: &Store, image_id: i64, key: &str) -> anyhow::Result<()> {
             Err(e)
         }
     }
+}
+
+fn precompute(store: &Store, image_id: i64, key: &str) -> anyhow::Result<()> {
+    write_features(store, image_id, compute_rows(store, key))
 }
 
 fn unique_key(store: &Store, prefix: &str, name: &str) -> String {

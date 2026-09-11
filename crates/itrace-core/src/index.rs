@@ -12,7 +12,8 @@
 //! (some substring must be identical); larger radii keep high empirical recall
 //! and are re-verified by exact cross-variant scoring downstream.
 //!
-//! Memory ≈ 44 B per indexed key (u64 key + u32 owner + 8×u32 table refs);
+//! Memory ≈ 44 B per indexed key (u64 key + u32 owner + 8×u32 table refs)
+//! plus a fixed ~48 KiB per index for the direct-mapped bucket arrays;
 //! 8 keys/image/algorithm ⇒ ~350 B/image per algorithm index, i.e. ~35 GB
 //! per 100M-image index — shard by project or key-prefix beyond that.
 //! `canonical_rot64` remains as a single-key fast path for exact
@@ -20,7 +21,10 @@
 
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 const SUBS: usize = 8; // 64 bits → 8 × 8-bit substrings
+const SUBKEYS: usize = 256; // distinct values of one 8-bit substring
 
 /// Apply a dihedral transform to an 8×8 bit matrix packed row-major in a u64.
 fn xform8x8(h: u64, f: fn(usize, usize) -> (usize, usize)) -> u64 {
@@ -59,11 +63,24 @@ pub fn canonical_rot64(h: u64) -> u64 {
 /// Multi-Index Hash index over u64 keys — near O(1) candidate lookup on
 /// Hamming space instead of O(N) scan. Each key carries an `owner` id
 /// (e.g. image index) so multiple keys can map to one entity.
-#[derive(Default)]
+///
+/// `tables[t]` is a direct-mapped array of 256 buckets indexed by the
+/// 8-bit substring value — no hashing or bucket lookup misses on the
+/// hot insert/query path.
 pub struct MihIndex {
     keys: Vec<u64>,
     owners: Vec<u32>,
-    tables: [HashMap<u8, Vec<u32>>; SUBS],
+    tables: [Vec<Vec<u32>>; SUBS],
+}
+
+impl Default for MihIndex {
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            owners: Vec::new(),
+            tables: std::array::from_fn(|_| vec![Vec::new(); SUBKEYS]),
+        }
+    }
 }
 
 impl MihIndex {
@@ -85,8 +102,8 @@ impl MihIndex {
         self.keys.push(key);
         self.owners.push(owner);
         for (t, table) in self.tables.iter_mut().enumerate() {
-            let sub = ((key >> (t * 8)) & 0xff) as u8;
-            table.entry(sub).or_default().push(pos);
+            let sub = ((key >> (t * 8)) & 0xff) as usize;
+            table[sub].push(pos);
         }
     }
 
@@ -94,18 +111,21 @@ impl MihIndex {
     pub fn query(&self, key: u64, radius: u32) -> Vec<u32> {
         let mut cand: Vec<u32> = Vec::new();
         for (t, table) in self.tables.iter().enumerate() {
-            let sub = ((key >> (t * 8)) & 0xff) as u8;
-            if let Some(ids) = table.get(&sub) {
-                cand.extend_from_slice(ids);
-            }
+            let sub = ((key >> (t * 8)) & 0xff) as usize;
+            // Popcount-filter while streaming buckets: the predicate is
+            // per-position, so filtering before the dedup sort yields the
+            // same set while sorting far fewer elements.
+            cand.extend(
+                table[sub]
+                    .iter()
+                    .copied()
+                    .filter(|&p| (self.keys[p as usize] ^ key).count_ones() <= radius),
+            );
         }
         cand.sort_unstable();
         cand.dedup();
-        let mut owners: Vec<u32> = cand
-            .into_iter()
-            .filter(|&p| (self.keys[p as usize] ^ key).count_ones() <= radius)
-            .map(|p| self.owners[p as usize])
-            .collect();
+        let mut owners: Vec<u32> =
+            cand.into_iter().map(|p| self.owners[p as usize]).collect();
         owners.sort_unstable();
         owners.dedup();
         owners
@@ -129,36 +149,60 @@ pub struct DedupKeys {
 
 /// Emit candidate image-index pairs flagged within `radius` bits by at
 /// least `min_votes` DISTINCT gate algorithms (one vote per algorithm,
-/// regardless of how many variant keys matched). Returns (i, j), i < j.
+/// regardless of how many variant keys matched). Returns (i, j), i < j,
+/// sorted and deduplicated.
+///
+/// One fully-populated MIH index is built per algorithm (in parallel),
+/// then every entry queries every index (in parallel). A pair within
+/// `radius` is found from both directions and normalized to (min, max),
+/// so the emitted set is identical to a sequential insert-then-query
+/// scan — a hit under algo a sets bit a of the pair's vote mask.
 pub fn dedup_candidates(entries: &[DedupKeys], radius: u32, min_votes: u32) -> Vec<(u32, u32)> {
     if entries.is_empty() || entries[0].variant_keys.is_empty() {
         return Vec::new();
     }
     let m = entries[0].variant_keys.len();
-    let mut indexes: Vec<MihIndex> = (0..m).map(|_| MihIndex::new()).collect();
-    let mut out: Vec<(u32, u32)> = Vec::new();
-    let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
-    for (i, e) in entries.iter().enumerate() {
-        // algo bitmask per other-image: a match under algo a sets bit a
-        let mut hit: HashMap<u32, u32> = HashMap::new();
-        for (a, idx) in indexes.iter_mut().enumerate() {
-            let mut uniq: Vec<u64> = e.variant_keys[a].clone();
-            uniq.sort_unstable();
-            uniq.dedup();
-            for key in uniq {
-                for j in idx.insert_query(key, i as u32, radius) {
-                    if j != i as u32 {
-                        *hit.entry(j).or_insert(0) |= 1 << a;
+    let indexes: Vec<MihIndex> = (0..m)
+        .into_par_iter()
+        .map(|a| {
+            let mut idx = MihIndex::new();
+            for (i, e) in entries.iter().enumerate() {
+                let mut uniq: Vec<u64> = e.variant_keys[a].clone();
+                uniq.sort_unstable();
+                uniq.dedup();
+                for key in uniq {
+                    idx.insert(key, i as u32);
+                }
+            }
+            idx
+        })
+        .collect();
+    let mut out: Vec<(u32, u32)> = entries
+        .par_iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            let i = i as u32;
+            // algo bitmask per other-image: a match under algo a sets bit a
+            let mut hit: HashMap<u32, u32> = HashMap::new();
+            for (a, idx) in indexes.iter().enumerate() {
+                let mut uniq: Vec<u64> = e.variant_keys[a].clone();
+                uniq.sort_unstable();
+                uniq.dedup();
+                for key in uniq {
+                    for j in idx.query(key, radius) {
+                        if j != i {
+                            *hit.entry(j).or_insert(0) |= 1 << a;
+                        }
                     }
                 }
             }
-        }
-        let i = i as u32;
-        for (j, mask) in hit {
-            if mask.count_ones() >= min_votes && seen.insert((j.min(i), j.max(i))) {
-                out.push((j.min(i), j.max(i)));
-            }
-        }
-    }
+            hit.into_iter()
+                .filter(|(_, mask)| mask.count_ones() >= min_votes)
+                .map(|(j, _)| (j.min(i), j.max(i)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
     out
 }

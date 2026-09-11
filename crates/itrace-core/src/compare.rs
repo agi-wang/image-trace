@@ -2,6 +2,7 @@
 //! /compare when image files are available. Matrix/vector mode lives in
 //! `features.rs` and is used by smart-compare.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -13,6 +14,19 @@ use crate::{hashes, image_io, metrics, GrayImage, HashSet, RgbImage};
 use crate::{DESCRIPTOR_ALGOS, HASH_ALGOS};
 
 const MAX_SIDE: u32 = 512;
+
+/// Hashes of one dihedral gray variant. Rotations/flips are exact pixel
+/// permutations, so colorhash (a function of the pixel multiset) equals the
+/// base image's — pass it in instead of recomputing HSV over an RGB copy.
+fn variant_hash(vg: &GrayImage, colorhash: u64) -> HashSet {
+    HashSet {
+        phash: hashes::phash(vg),
+        dhash: hashes::dhash(vg),
+        ahash: hashes::ahash(vg),
+        whash: hashes::whash(vg),
+        colorhash,
+    }
+}
 
 /// An image decoded once and prepared for pairwise scoring.
 /// Descriptor sets are computed lazily by the caller-side cache because ORB
@@ -59,17 +73,16 @@ impl Prepared {
         let mut variant_hashes = Vec::new();
         let mut variant_grays = Vec::new();
         if rot_inv {
+            // Gray variants of `gray` (already ≤ MAX_SIDE — no resize needed).
+            // They are pixel-identical to `to_gray(orientation_variants(&small)[i])`
+            // because to_luma8 commutes with exact permutations, so hashing them
+            // directly reproduces the old RGB-transform pipeline bit-for-bit.
             let vgs = image_io::gray_orientation_variants(&gray);
-            for vg in &vgs {
-                let vg_small = image_io::resize_gray_max(vg, MAX_SIDE);
-                variant_grays.push(vg_small);
-            }
-            let variants = image_io::orientation_variants(&small);
-            for v in &variants {
-                let g = image_io::to_gray(v);
-                let r = image_io::to_rgb(v);
-                variant_hashes.push(hashes::compute_all(&g, &r));
-            }
+            variant_hashes = vgs
+                .par_iter()
+                .map(|vg| variant_hash(vg, hashes.colorhash))
+                .collect();
+            variant_grays = vgs;
         }
 
         let mut prepared = Prepared {
@@ -86,20 +99,50 @@ impl Prepared {
         Ok(prepared)
     }
 
+    /// Run descriptor extraction. All detects — base image plus every dihedral
+    /// variant — are flattened into a single rayon job set so a lone algo still
+    /// gets its base and variant extracts running concurrently.
     pub fn prepare_descriptors(&mut self, desc_algos: &[String], rot_inv: bool) {
-        for algo in desc_algos {
-            let Some(ext) = descriptors::extractor_for(algo) else {
-                continue;
-            };
-            self.descs
-                .insert(algo.clone(), ext.detect(&self.gray, 512));
-            if rot_inv && !self.variant_grays.is_empty() {
-                let per_variant: Vec<DescriptorSet> = self
-                    .variant_grays
-                    .par_iter()
-                    .map(|g| ext.detect(g, 512))
+        let exts: Vec<_> = desc_algos
+            .iter()
+            .filter_map(|a| descriptors::extractor_for(a).map(|e| (a.clone(), e)))
+            .collect();
+        let nv = if rot_inv { self.variant_grays.len() } else { 0 };
+        // Job list: (algo_idx, None) = base image, (algo_idx, Some(v)) = variant v.
+        let mut jobs = Vec::with_capacity(exts.len() * (nv + 1));
+        for ai in 0..exts.len() {
+            jobs.push((ai, None));
+            jobs.extend((0..nv).map(|vi| (ai, Some(vi))));
+        }
+        let results: Vec<(usize, Option<usize>, DescriptorSet)> = {
+            let (gray, vgs) = (&self.gray, &self.variant_grays);
+            jobs.par_iter()
+                .map(|&(ai, vi)| {
+                    let g = match vi {
+                        None => gray,
+                        Some(vi) => &vgs[vi],
+                    };
+                    (ai, vi, exts[ai].1.detect(g, 512))
+                })
+                .collect()
+        };
+        let mut slots: Vec<Vec<Option<DescriptorSet>>> =
+            exts.iter().map(|_| vec![None; nv]).collect();
+        for (ai, vi, d) in results {
+            match vi {
+                None => {
+                    self.descs.insert(exts[ai].0.clone(), d);
+                }
+                Some(vi) => slots[ai][vi] = Some(d),
+            }
+        }
+        if nv > 0 {
+            for (ai, algo_slots) in slots.into_iter().enumerate() {
+                let sets = algo_slots
+                    .into_iter()
+                    .map(|s| s.expect("every variant job ran"))
                     .collect();
-                self.variant_descs.insert(algo.clone(), per_variant);
+                self.variant_descs.insert(exts[ai].0.clone(), sets);
             }
         }
     }
@@ -127,34 +170,59 @@ fn base_score(algo: &str, a: &Prepared, b: &Prepared) -> f64 {
     }
 }
 
+/// Borrow `g` when it already is `w`×`h`; owned exact resize otherwise.
+/// (`resize_gray_exact` clones the buffer even on a no-op.)
+fn fit_exact(g: &GrayImage, w: u32, h: u32) -> Cow<'_, GrayImage> {
+    if g.width == w && g.height == h {
+        Cow::Borrowed(g)
+    } else {
+        Cow::Owned(image_io::resize_gray_exact(g, w, h))
+    }
+}
+
+/// Borrow `g` when already ≤ `max_side`; owned downscale otherwise.
+fn fit_max(g: &GrayImage, max_side: u32) -> Cow<'_, GrayImage> {
+    if g.width.max(g.height) <= max_side {
+        Cow::Borrowed(g)
+    } else {
+        Cow::Owned(image_io::resize_gray_max(g, max_side))
+    }
+}
+
 fn ssim_common(a: &GrayImage, b: &GrayImage) -> f64 {
     let h = a.height.min(b.height);
     let w = a.width.min(b.width);
-    let ra = image_io::resize_gray_exact(a, w, h);
-    let rb = image_io::resize_gray_exact(b, w, h);
-    metrics::ssim(&ra, &rb)
+    metrics::ssim(&fit_exact(a, w, h), &fit_exact(b, w, h))
 }
 
 fn template_common(a: &GrayImage, b: &GrayImage) -> f64 {
-    let ra = image_io::resize_gray_max(a, 256);
-    let rb = image_io::resize_gray_max(b, 256);
+    let ra = fit_max(a, 256);
+    let rb = fit_max(b, 256);
     let h = ra.height.min(rb.height);
     let w = ra.width.min(rb.width);
-    let ra = image_io::resize_gray_exact(&ra, w, h);
-    let rb = image_io::resize_gray_exact(&rb, w, h);
-    metrics::ncc(&ra, &rb)
+    metrics::ncc(&fit_exact(&ra, w, h), &fit_exact(&rb, w, h))
 }
 
-fn hybrid_score(a: &Prepared, b: &Prepared) -> f64 {
+/// 0.3·phash + 0.3·ssim + 0.4·orb fusion over borrowed parts — shared by
+/// `hybrid_score` and the rot-inv per-variant loop so variants can be scored
+/// without cloning images/histograms into a throwaway `Prepared`.
+fn hybrid_parts(
+    a_gray: &GrayImage,
+    a_phash: u64,
+    a_orb: Option<&DescriptorSet>,
+    b_gray: &GrayImage,
+    b_phash: u64,
+    b_orb: Option<&DescriptorSet>,
+) -> f64 {
     let weights: [(f64, &str); 3] = [(0.3, "phash"), (0.3, "ssim"), (0.4, "orb")];
     let mut tw = 0.0;
     let mut ts = 0.0;
     for (w, algo) in weights {
         let s = match algo {
-            "phash" => hashes::hash_similarity(a.hashes.phash, b.hashes.phash),
-            "ssim" => ssim_common(&a.gray, &b.gray),
+            "phash" => hashes::hash_similarity(a_phash, b_phash),
+            "ssim" => ssim_common(a_gray, b_gray),
             "orb" => {
-                let (Some(da), Some(db)) = (a.descs.get("orb"), b.descs.get("orb")) else {
+                let (Some(da), Some(db)) = (a_orb, b_orb) else {
                     continue;
                 };
                 descriptors::match_score(da, db, 64)
@@ -165,6 +233,17 @@ fn hybrid_score(a: &Prepared, b: &Prepared) -> f64 {
         tw += w;
     }
     if tw > 0.0 { ts / tw } else { 0.0 }
+}
+
+fn hybrid_score(a: &Prepared, b: &Prepared) -> f64 {
+    hybrid_parts(
+        &a.gray,
+        a.hashes.phash,
+        a.descs.get("orb"),
+        &b.gray,
+        b.hashes.phash,
+        b.descs.get("orb"),
+    )
 }
 
 /// Rotation/flip-invariant score: max over B's 8 dihedral variants.
@@ -214,23 +293,19 @@ fn rotated_score(algo: &str, a: &Prepared, b: &Prepared) -> f64 {
             best
         }
         "auto" => {
+            let a_orb = a.descs.get("orb");
+            let b_orb = b.variant_descs.get("orb");
             for (i, vb) in b.variant_hashes.iter().enumerate() {
-                let mut vb_p = Prepared {
-                    gray: b.variant_grays.get(i).cloned().unwrap_or_else(|| b.gray.clone()),
-                    rgb: b.rgb.clone(),
-                    hashes: vb.clone(),
-                    variant_hashes: Vec::new(),
-                    variant_grays: Vec::new(),
-                    histogram: b.histogram.clone(),
-                    descs: HashMap::new(),
-                    variant_descs: HashMap::new(),
-                };
-                if let Some(dv) = b.variant_descs.get("orb") {
-                    if let Some(d) = dv.get(i) {
-                        vb_p.descs.insert("orb".to_string(), d.clone());
-                    }
-                }
-                best = best.max(hybrid_score(a, &vb_p));
+                let vg = b.variant_grays.get(i).unwrap_or(&b.gray);
+                let vo = b_orb.and_then(|dv| dv.get(i));
+                best = best.max(hybrid_parts(
+                    &a.gray,
+                    a.hashes.phash,
+                    a_orb,
+                    vg,
+                    vb.phash,
+                    vo,
+                ));
                 if best >= 0.95 {
                     break;
                 }
@@ -267,11 +342,10 @@ pub fn pairwise_matrix(
     for (i, row) in m.iter_mut().enumerate() {
         row[i] = 1.0;
     }
-    let pairs: Vec<(usize, usize)> =
-        (0..n).flat_map(|i| (i + 1..n).map(move |j| (i, j))).collect();
-    let results: Vec<(usize, usize, f64)> = pairs
-        .par_iter()
-        .map(|&(i, j)| (i, j, pair_score(algorithm, &prepared[i], &prepared[j], rot_inv)))
+    let results: Vec<(usize, usize, f64)> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| (i + 1..n).map(move |j| (i, j)))
+        .map(|(i, j)| (i, j, pair_score(algorithm, &prepared[i], &prepared[j], rot_inv)))
         .collect();
     for (i, j, s) in results {
         m[i][j] = s;

@@ -47,11 +47,13 @@ pub fn from_hex(s: &str) -> u64 {
 
 /// Compute all five hashes for a decoded image.
 pub fn compute_all(gray: &GrayImage, rgb: &RgbImage) -> HashSet {
+    // phash and whash share one 32×32 downscale.
+    let small32 = image_io::resize_gray_exact(gray, 32, 32);
     HashSet {
-        phash: phash(gray),
+        phash: phash_small(&small32),
         dhash: dhash(gray),
         ahash: ahash(gray),
-        whash: whash(gray),
+        whash: whash_small(&small32),
         colorhash: colorhash(rgb),
     }
 }
@@ -77,9 +79,10 @@ pub fn ahash(gray: &GrayImage) -> u64 {
 pub fn dhash(gray: &GrayImage) -> u64 {
     let small = image_io::resize_gray_exact(gray, 9, 8);
     let mut bits = 0u64;
-    for y in 0..8u32 {
-        for x in 0..8u32 {
-            if small.get(x, y) > small.get(x + 1, y) {
+    for y in 0..8usize {
+        let row = &small.data[y * 9..y * 9 + 9];
+        for x in 0..8usize {
+            if row[x] > row[x + 1] {
                 bits |= 1 << (y * 8 + x);
             }
         }
@@ -90,15 +93,24 @@ pub fn dhash(gray: &GrayImage) -> u64 {
 // ---------- phash ----------
 
 fn median_f64(values: &mut [f64]) -> f64 {
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = values.len();
     if n == 0 {
         return 0.0;
     }
+    let mid = n / 2;
+    values.select_nth_unstable_by(mid, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
     if n % 2 == 1 {
-        values[n / 2]
+        values[mid]
     } else {
-        (values[n / 2 - 1] + values[n / 2]) / 2.0
+        // After selecting the upper middle, the lower middle is the max of the
+        // low partition — same two values the full sort averaged.
+        let lo = values[..mid]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        (lo + values[mid]) / 2.0
     }
 }
 
@@ -106,15 +118,24 @@ fn median_f64(values: &mut [f64]) -> f64 {
 fn dct_2d(input: &[f64], n: usize) -> Vec<f64> {
     let mut out = vec![0.0f64; n * n];
     let pi_n = std::f64::consts::PI / n as f64;
+    // cos((x + 0.5) * k * pi/n) table, shared by the row and column passes.
+    let mut cos_t = vec![0.0f64; n * n];
+    for k in 0..n {
+        for x in 0..n {
+            cos_t[k * n + x] = ((x as f64 + 0.5) * k as f64 * pi_n).cos();
+        }
+    }
+    let s0 = (1.0 / n as f64).sqrt();
+    let sk = (2.0 / n as f64).sqrt();
     // rows
     let mut tmp = vec![0.0f64; n * n];
     for y in 0..n {
         for u in 0..n {
             let mut s = 0.0;
             for x in 0..n {
-                s += input[y * n + x] * ((x as f64 + 0.5) * u as f64 * pi_n).cos();
+                s += input[y * n + x] * cos_t[u * n + x];
             }
-            tmp[y * n + u] = s * if u == 0 { (1.0 / n as f64).sqrt() } else { (2.0 / n as f64).sqrt() };
+            tmp[y * n + u] = s * if u == 0 { s0 } else { sk };
         }
     }
     // cols
@@ -122,9 +143,9 @@ fn dct_2d(input: &[f64], n: usize) -> Vec<f64> {
         for u in 0..n {
             let mut s = 0.0;
             for y in 0..n {
-                s += tmp[y * n + u] * ((y as f64 + 0.5) * v as f64 * pi_n).cos();
+                s += tmp[y * n + u] * cos_t[v * n + y];
             }
-            out[v * n + u] = s * if v == 0 { (1.0 / n as f64).sqrt() } else { (2.0 / n as f64).sqrt() };
+            out[v * n + u] = s * if v == 0 { s0 } else { sk };
         }
     }
     out
@@ -132,17 +153,21 @@ fn dct_2d(input: &[f64], n: usize) -> Vec<f64> {
 
 /// Perceptual hash: 32×32 → DCT-II → top-left 8×8 → median threshold.
 pub fn phash(gray: &GrayImage) -> u64 {
-    let small = image_io::resize_gray_exact(gray, 32, 32);
+    phash_small(&image_io::resize_gray_exact(gray, 32, 32))
+}
+
+/// phash on an already-32×32 grayscale image.
+fn phash_small(small: &GrayImage) -> u64 {
     let f: Vec<f64> = small.data.iter().map(|&v| v as f64).collect();
     let dct = dct_2d(&f, 32);
     // low-frequency 8×8
-    let mut low = Vec::with_capacity(64);
+    let mut low = [0.0f64; 64];
     for v in 0..8 {
         for u in 0..8 {
-            low.push(dct[v * 32 + u]);
+            low[v * 8 + u] = dct[v * 32 + u];
         }
     }
-    let mut med_src = low.clone();
+    let mut med_src = low;
     let med = median_f64(&mut med_src);
     let mut bits = 0u64;
     for (i, &v) in low.iter().enumerate() {
@@ -155,10 +180,10 @@ pub fn phash(gray: &GrayImage) -> u64 {
 
 // ---------- whash ----------
 
-/// In-place 1D Haar transform step on a row slice.
-fn haar_row(data: &mut [f64], stride: usize, len: usize, base: usize) {
+/// In-place 1D Haar transform step on a row slice; `tmp` is caller scratch
+/// of at least `len` elements (avoids a per-row allocation per level).
+fn haar_row(data: &mut [f64], stride: usize, len: usize, base: usize, tmp: &mut [f64]) {
     let half = len / 2;
-    let mut tmp = vec![0.0f64; len];
     for i in 0..half {
         let a = data[base + (2 * i) * stride];
         let b = data[base + (2 * i + 1) * stride];
@@ -172,15 +197,16 @@ fn haar_row(data: &mut [f64], stride: usize, len: usize, base: usize) {
 
 /// Full 2D Haar wavelet decomposition of a size×size block (size = power of 2).
 fn haar_2d(data: &mut [f64], size: usize) {
+    let mut tmp = vec![0.0f64; size];
     let mut len = size;
     while len > 1 {
         // rows
         for y in 0..len {
-            haar_row(data, 1, len, y * size);
+            haar_row(data, 1, len, y * size, &mut tmp);
         }
         // cols
         for x in 0..len {
-            haar_row(data, size, len, x);
+            haar_row(data, size, len, x, &mut tmp);
         }
         len /= 2;
     }
@@ -188,18 +214,22 @@ fn haar_2d(data: &mut [f64], size: usize) {
 
 /// Wavelet hash: 32×32 → 2D Haar → zero out DC → low 8×8 of transform → median.
 pub fn whash(gray: &GrayImage) -> u64 {
-    let small = image_io::resize_gray_exact(gray, 32, 32);
+    whash_small(&image_io::resize_gray_exact(gray, 32, 32))
+}
+
+/// whash on an already-32×32 grayscale image.
+fn whash_small(small: &GrayImage) -> u64 {
     let mut f: Vec<f64> = small.data.iter().map(|&v| v as f64).collect();
     haar_2d(&mut f, 32);
     // remove DC (top-left) for brightness invariance
     f[0] = 0.0;
-    let mut low = Vec::with_capacity(64);
+    let mut low = [0.0f64; 64];
     for v in 0..8 {
         for u in 0..8 {
-            low.push(f[v * 32 + u]);
+            low[v * 8 + u] = f[v * 32 + u];
         }
     }
-    let mut med_src = low.clone();
+    let mut med_src = low;
     let med = median_f64(&mut med_src);
     let mut bits = 0u64;
     for (i, &v) in low.iter().enumerate() {
@@ -220,10 +250,10 @@ pub fn colorhash(rgb: &RgbImage) -> u64 {
     if npix == 0 {
         return 0;
     }
-    for i in 0..npix {
-        let r = rgb.data[i * 3] as f64 / 255.0;
-        let g = rgb.data[i * 3 + 1] as f64 / 255.0;
-        let b = rgb.data[i * 3 + 2] as f64 / 255.0;
+    for px in rgb.data.chunks_exact(3) {
+        let r = px[0] as f64 / 255.0;
+        let g = px[1] as f64 / 255.0;
+        let b = px[2] as f64 / 255.0;
         let (h, s, v) = rgb_to_hsv(r, g, b);
         // weight by saturation*value so near-gray pixels barely count
         let w = s * v;
@@ -238,7 +268,7 @@ pub fn colorhash(rgb: &RgbImage) -> u64 {
     for b in bins.iter_mut() {
         *b /= total;
     }
-    let mut med_src: Vec<f64> = bins.to_vec();
+    let mut med_src = bins;
     let med = median_f64(&mut med_src);
     let mut bits = 0u64;
     for (i, &v) in bins.iter().enumerate() {

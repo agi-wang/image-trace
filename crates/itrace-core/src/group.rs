@@ -39,7 +39,7 @@ impl UnionFind {
     pub fn groups(&mut self) -> Vec<Vec<usize>> {
         use std::collections::HashMap;
         let n = self.parent.len();
-        let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut map: HashMap<usize, Vec<usize>> = HashMap::with_capacity(n);
         for i in 0..n {
             let r = self.find(i);
             map.entry(r).or_default().push(i);

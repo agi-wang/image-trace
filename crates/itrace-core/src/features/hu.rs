@@ -36,21 +36,32 @@ impl FeatureExtractor for HuExtractor {
         data.len() / 4
     }
     fn similarity(&self, a: &[u8], b: &[u8]) -> f64 {
-        // Plain cosine on log-Hu vectors saturates (~0.99 for unrelated
-        // shapes: all components land in the same positive range). Compare in
-        // log-moment space instead: exp(-||Δt||₂) — 1.0 for identical shapes,
-        // decaying smoothly as moment profiles diverge.
-        let (ta, tb) = (unpack_f32(a), unpack_f32(b));
-        let n = ta.len().min(tb.len());
-        if n == 0 {
-            return 0.0;
-        }
-        let d = (0..n)
-            .map(|i| (ta[i] as f64 - tb[i] as f64).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        (-d).exp()
+        log_moment_similarity(&unpack_f32(a), &unpack_f32(b))
     }
+    fn rotation_invariant(&self) -> bool {
+        // η_pq normalization makes the invariants orientation-independent by
+        // construction; every variant produces the same stored vector.
+        true
+    }
+    fn matrix_kernel(&self) -> Option<super::MatrixKernel> {
+        Some(super::MatrixKernel::ExpDist)
+    }
+}
+
+/// `exp(-||Δt||₂)` over decoded log-moment vectors — the similarity metric
+/// (plain cosine saturates: log-Hu components all land in the same positive
+/// range, scoring ~0.99 for unrelated shapes). Shared by `similarity` and
+/// the decode-once matrix kernel; identical values.
+pub(crate) fn log_moment_similarity(ta: &[f32], tb: &[f32]) -> f64 {
+    let n = ta.len().min(tb.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let d = (0..n)
+        .map(|i| (ta[i] as f64 - tb[i] as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    (-d).exp()
 }
 
 /// Otsu between-class-variance threshold over a 256-bin histogram.
@@ -110,14 +121,25 @@ fn hu_log_moments(gray: &GrayImage) -> [f64; 7] {
     }
     let is_ink = |v: u8| (v > t) == ink_above;
 
+    // Binary ink mask, built once: bit i = pixel i in row-major order. The
+    // moment passes iterate set bits in index order — the same accumulation
+    // order as the row-major pixel loops they replace.
+    let mut mask = vec![0u64; g.data.len().div_ceil(64)];
+    for (i, &v) in g.data.iter().enumerate() {
+        if is_ink(v) {
+            mask[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+
     let mut cx = 0.0f64;
     let mut cy = 0.0f64;
-    for y in 0..h {
-        for x in 0..w {
-            if is_ink(g.get(x, y)) {
-                cx += x as f64;
-                cy += y as f64;
-            }
+    for (wi, &word) in mask.iter().enumerate() {
+        let mut m = word;
+        while m != 0 {
+            let i = wi * 64 + m.trailing_zeros() as usize;
+            m &= m - 1;
+            cx += (i as u32 % w) as f64;
+            cy += (i as u32 / w) as f64;
         }
     }
     cx /= m00;
@@ -125,21 +147,20 @@ fn hu_log_moments(gray: &GrayImage) -> [f64; 7] {
 
     let (mut mu20, mut mu02, mut mu11) = (0.0f64, 0.0f64, 0.0f64);
     let (mut mu30, mut mu03, mut mu21, mut mu12) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    for y in 0..h {
-        let dy = y as f64 - cy;
-        let dy2 = dy * dy;
-        let dy3 = dy2 * dy;
-        for x in 0..w {
-            if !is_ink(g.get(x, y)) {
-                continue;
-            }
-            let dx = x as f64 - cx;
+    for (wi, &word) in mask.iter().enumerate() {
+        let mut m = word;
+        while m != 0 {
+            let i = wi * 64 + m.trailing_zeros() as usize;
+            m &= m - 1;
+            let dx = (i as u32 % w) as f64 - cx;
+            let dy = (i as u32 / w) as f64 - cy;
             let dx2 = dx * dx;
+            let dy2 = dy * dy;
             mu20 += dx2;
             mu02 += dy2;
             mu11 += dx * dy;
             mu30 += dx2 * dx;
-            mu03 += dy3;
+            mu03 += dy2 * dy;
             mu21 += dx2 * dy;
             mu12 += dx * dy2;
         }

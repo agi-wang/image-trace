@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use itrace_core::features::FeatureMap;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub use blob::BlobStore;
@@ -16,6 +16,13 @@ pub use blob::BlobStore;
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+-- Readers wait up to 10s on a writer instead of erroring; WAL makes
+-- synchronous=NORMAL crash-safe; larger page cache + mmap cut syscall
+-- and page-cache traffic on scan-heavy queries.
+PRAGMA busy_timeout = 10000;
+PRAGMA synchronous = NORMAL;
+PRAGMA cache_size = -262144;
+PRAGMA mmap_size = 268435456;
 
 CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,6 +45,7 @@ CREATE TABLE IF NOT EXISTS images (
 );
 CREATE INDEX IF NOT EXISTS idx_images_project ON images(project_id);
 CREATE INDEX IF NOT EXISTS idx_images_hash ON images(file_hash);
+CREATE INDEX IF NOT EXISTS idx_images_project_status ON images(project_id, feature_status);
 
 CREATE TABLE IF NOT EXISTS feature_store (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +59,9 @@ CREATE TABLE IF NOT EXISTS feature_store (
 );
 CREATE INDEX IF NOT EXISTS idx_fs_image ON feature_store(image_id);
 CREATE INDEX IF NOT EXISTS idx_fs_algo ON feature_store(algorithm);
+-- Covers load_feature_map: WHERE algorithm = ? AND image_id IN (…)
+-- AND variant_idx IN (…).
+CREATE INDEX IF NOT EXISTS idx_fs_cover ON feature_store(algorithm, image_id, variant_idx);
 
 CREATE TABLE IF NOT EXISTS pair_cache (
     hash_a TEXT NOT NULL,
@@ -61,6 +72,8 @@ CREATE TABLE IF NOT EXISTS pair_cache (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (hash_a, hash_b, algorithm, rotation_invariant)
 );
+-- delete_image prunes by hash_b as well; the PK only covers hash_a.
+CREATE INDEX IF NOT EXISTS idx_pair_cache_b ON pair_cache(hash_b);
 
 CREATE TABLE IF NOT EXISTS analysis_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,10 +198,8 @@ impl Store {
 
     pub fn create_project(&self, name: &str, description: Option<&str>) -> anyhow::Result<Project> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO projects(name, description) VALUES(?1, ?2)",
-            params![name, description],
-        )?;
+        conn.prepare_cached("INSERT INTO projects(name, description) VALUES(?1, ?2)")?
+            .execute(params![name, description])?;
         let id = conn.last_insert_rowid();
         drop(conn);
         self.get_project(id)
@@ -196,12 +207,14 @@ impl Store {
 
     pub fn get_project(&self, id: i64) -> anyhow::Result<Project> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT p.id, p.name, p.description, p.created_at,
-                    (SELECT COUNT(*) FROM images i WHERE i.project_id = p.id)
-             FROM projects p WHERE p.id = ?1",
-            params![id],
-            |r| {
+        let found = conn
+            .prepare_cached(
+                "SELECT p.id, p.name, p.description, p.created_at, COUNT(i.id)
+                 FROM projects p LEFT JOIN images i ON i.project_id = p.id
+                 WHERE p.id = ?1
+                 GROUP BY p.id",
+            )?
+            .query_row(params![id], |r| {
                 Ok(Project {
                     id: r.get(0)?,
                     name: r.get(1)?,
@@ -209,18 +222,17 @@ impl Store {
                     created_at: r.get(3)?,
                     image_count: r.get(4)?,
                 })
-            },
-        )
-        .optional()?
-        .with_context(|| format!("项目不存在: {id}"))
+            })
+            .optional()?;
+        found.with_context(|| format!("项目不存在: {id}"))
     }
 
     pub fn list_projects(&self, skip: i64, limit: i64) -> anyhow::Result<Vec<Project>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT p.id, p.name, p.description, p.created_at,
-                    (SELECT COUNT(*) FROM images i WHERE i.project_id = p.id)
-             FROM projects p ORDER BY p.id LIMIT ?1 OFFSET ?2",
+        let mut stmt = conn.prepare_cached(
+            "SELECT p.id, p.name, p.description, p.created_at, COUNT(i.id)
+             FROM projects p LEFT JOIN images i ON i.project_id = p.id
+             GROUP BY p.id ORDER BY p.id LIMIT ?1 OFFSET ?2",
         )?;
         let rows = stmt
             .query_map(params![limit, skip], |r| {
@@ -241,7 +253,9 @@ impl Store {
     pub fn delete_project(&self, id: i64) -> anyhow::Result<Vec<ImageRecord>> {
         let images = self.list_images(id, 0, i64::MAX)?;
         let conn = self.conn.lock().unwrap();
-        let n = conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        let n = conn
+            .prepare_cached("DELETE FROM projects WHERE id = ?1")?
+            .execute(params![id])?;
         if n == 0 {
             anyhow::bail!("项目不存在: {id}");
         }
@@ -252,17 +266,17 @@ impl Store {
 
     pub fn insert_image(&self, rec: &NewImage) -> anyhow::Result<ImageRecord> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO images(project_id, filename, file_path, file_hash,
                 phash, dhash, ahash, whash, colorhash, extracted_from,
                 file_size, width, height, feature_status)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending')",
-            params![
-                rec.project_id, rec.filename, rec.file_path, rec.file_hash,
-                rec.phash, rec.dhash, rec.ahash, rec.whash, rec.colorhash,
-                rec.extracted_from, rec.file_size, rec.width, rec.height,
-            ],
-        )?;
+        )?
+        .execute(params![
+            rec.project_id, rec.filename, rec.file_path, rec.file_hash,
+            rec.phash, rec.dhash, rec.ahash, rec.whash, rec.colorhash,
+            rec.extracted_from, rec.file_size, rec.width, rec.height,
+        ])?;
         let id = conn.last_insert_rowid();
         drop(conn);
         self.get_image(id)
@@ -297,7 +311,9 @@ impl Store {
                     i.feature_status, i.created_at
              FROM images i {tail}"
         );
-        let mut stmt = conn.prepare(&sql)?;
+        // `tail` has only a handful of distinct shapes, so the cached
+        // statements still hit on repeat calls.
+        let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt
             .query_map(p, |r| {
                 Ok(ImageRecord {
@@ -326,11 +342,10 @@ impl Store {
     pub fn delete_image(&self, id: i64) -> anyhow::Result<ImageRecord> {
         let rec = self.get_image(id)?;
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM pair_cache WHERE hash_a = ?1 OR hash_b = ?1",
-            params![rec.file_hash],
-        )?;
-        conn.execute("DELETE FROM images WHERE id = ?1", params![id])?;
+        conn.prepare_cached("DELETE FROM pair_cache WHERE hash_a = ?1 OR hash_b = ?1")?
+            .execute(params![rec.file_hash])?;
+        conn.prepare_cached("DELETE FROM images WHERE id = ?1")?
+            .execute(params![id])?;
         Ok(rec)
     }
 
@@ -338,10 +353,8 @@ impl Store {
 
     pub fn set_feature_status(&self, image_id: i64, status: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE images SET feature_status = ?1 WHERE id = ?2",
-            params![status, image_id],
-        )?;
+        conn.prepare_cached("UPDATE images SET feature_status = ?1 WHERE id = ?2")?
+            .execute(params![status, image_id])?;
         Ok(())
     }
 
@@ -354,13 +367,49 @@ impl Store {
         dims: usize,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO feature_store(image_id, variant_idx, algorithm, vector, dims)
              VALUES(?1,?2,?3,?4,?5)
              ON CONFLICT(image_id, variant_idx, algorithm) DO UPDATE SET
                vector = excluded.vector, dims = excluded.dims",
-            params![image_id, variant_idx as i64, algorithm, vector, dims as i64],
-        )?;
+        )?
+        .execute(params![image_id, variant_idx as i64, algorithm, vector, dims as i64])?;
+        Ok(())
+    }
+
+    /// Batch-upsert all feature rows for one image in ONE transaction.
+    ///
+    /// `rows`: `(variant_idx, algorithm, vector, dims)` — one prepared
+    /// upsert is reused for the whole batch, so a variant×algorithm
+    /// matrix lands in a single commit instead of one commit per row.
+    pub fn put_features(
+        &self,
+        image_id: i64,
+        rows: &[(u8, &str, &[u8], usize)],
+    ) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO feature_store(image_id, variant_idx, algorithm, vector, dims)
+                 VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(image_id, variant_idx, algorithm) DO UPDATE SET
+                   vector = excluded.vector, dims = excluded.dims",
+            )?;
+            for &(variant_idx, algorithm, vector, dims) in rows {
+                stmt.execute(params![
+                    image_id,
+                    variant_idx as i64,
+                    algorithm,
+                    vector,
+                    dims as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -372,37 +421,80 @@ impl Store {
         variants: &[u8],
     ) -> anyhow::Result<FeatureMap> {
         let conn = self.conn.lock().unwrap();
-        let id_list = image_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-        let v_list = variants.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT image_id, variant_idx, vector FROM feature_store
-             WHERE algorithm = ?1 AND image_id IN ({id_list}) AND variant_idx IN ({v_list})"
-        );
-        let mut stmt = conn.prepare(&sql)?;
+        Self::load_feature_map_conn(&conn, image_ids, feature, variants)
+    }
+
+    /// Like `load_feature_map` but for several algorithms in one lock
+    /// acquisition. Returns one FeatureMap per requested feature name,
+    /// in the same order as `features`.
+    pub fn load_feature_maps(
+        &self,
+        image_ids: &[i64],
+        features: &[&str],
+        variants: &[u8],
+    ) -> anyhow::Result<Vec<FeatureMap>> {
+        let conn = self.conn.lock().unwrap();
+        features
+            .iter()
+            .map(|f| Self::load_feature_map_conn(&conn, image_ids, f, variants))
+            .collect()
+    }
+
+    /// Shared body for the feature-map loaders. `IN` lists are bound
+    /// `?N` placeholders (values as params, not interpolated text) and
+    /// id lists are chunked so total bound variables stay under
+    /// SQLite's classic 999 ceiling.
+    fn load_feature_map_conn(
+        conn: &Connection,
+        image_ids: &[i64],
+        feature: &str,
+        variants: &[u8],
+    ) -> anyhow::Result<FeatureMap> {
         let mut map: FeatureMap = FeatureMap::new();
-        let rows = stmt.query_map(params![feature], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u8, r.get::<_, Vec<u8>>(2)?))
-        })?;
-        for row in rows {
-            let (id, v, vec) = row?;
-            map.entry(id).or_default().insert(v, vec);
+        if image_ids.is_empty() || variants.is_empty() {
+            return Ok(map);
+        }
+        // ?1 = algorithm; ids start at ?2, variants follow.
+        let chunk_len = (900usize.saturating_sub(variants.len() + 1)).max(1);
+        for ids in image_ids.chunks(chunk_len) {
+            let id_ph = placeholders(2, ids.len());
+            let v_ph = placeholders(2 + ids.len(), variants.len());
+            let sql = format!(
+                "SELECT image_id, variant_idx, vector FROM feature_store
+                 WHERE algorithm = ?1 AND image_id IN ({id_ph}) AND variant_idx IN ({v_ph})"
+            );
+            let mut bind: Vec<rusqlite::types::Value> =
+                Vec::with_capacity(1 + ids.len() + variants.len());
+            bind.push(feature.to_string().into());
+            bind.extend(ids.iter().map(|&id| id.into()));
+            bind.extend(variants.iter().map(|&v| v.into()));
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(params_from_iter(bind), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u8, r.get::<_, Vec<u8>>(2)?))
+            })?;
+            for row in rows {
+                let (id, v, vec) = row?;
+                map.entry(id).or_default().insert(v, vec);
+            }
         }
         Ok(map)
     }
 
     /// Count images in `ids` whose feature_status = 'ready'.
     pub fn features_ready(&self, ids: &[i64]) -> anyhow::Result<bool> {
-        if ids.is_empty() {
-            return Ok(true);
-        }
         let conn = self.conn.lock().unwrap();
-        let id_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-        let n: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM images WHERE id IN ({id_list}) AND feature_status = 'ready'"),
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(n as usize == ids.len())
+        for chunk in ids.chunks(900) {
+            let ph = placeholders(1, chunk.len());
+            let n: i64 = conn
+                .prepare_cached(&format!(
+                    "SELECT COUNT(*) FROM images WHERE id IN ({ph}) AND feature_status = 'ready'"
+                ))?
+                .query_row(params_from_iter(chunk.iter()), |r| r.get(0))?;
+            if n as usize != chunk.len() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     // ---------- pair cache ----------
@@ -416,14 +508,14 @@ impl Store {
     ) -> anyhow::Result<Option<f64>> {
         let (a, b) = ordered_pair(hash_a, hash_b);
         let conn = self.conn.lock().unwrap();
-        Ok(conn
-            .query_row(
+        let score = conn
+            .prepare_cached(
                 "SELECT score FROM pair_cache
                  WHERE hash_a=?1 AND hash_b=?2 AND algorithm=?3 AND rotation_invariant=?4",
-                params![a, b, algo, rot_inv as i64],
-                |r| r.get(0),
-            )
-            .optional()?)
+            )?
+            .query_row(params![a, b, algo, rot_inv as i64], |r| r.get(0))
+            .optional()?;
+        Ok(score)
     }
 
     pub fn put_pair_score(
@@ -436,11 +528,11 @@ impl Store {
     ) -> anyhow::Result<()> {
         let (a, b) = ordered_pair(hash_a, hash_b);
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        conn.prepare_cached(
             "INSERT OR REPLACE INTO pair_cache(hash_a,hash_b,algorithm,rotation_invariant,score)
              VALUES(?1,?2,?3,?4,?5)",
-            params![a, b, algo, rot_inv as i64, score],
-        )?;
+        )?
+        .execute(params![a, b, algo, rot_inv as i64, score])?;
         Ok(())
     }
 
@@ -448,21 +540,21 @@ impl Store {
 
     pub fn insert_run(&self, run: &NewRun) -> anyhow::Result<i64> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO analysis_runs(project_id, algorithm, threshold,
                 total_images, groups_count, unique_count, summary)
              VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![
-                run.project_id, run.algorithm, run.threshold, run.total_images,
-                run.groups_count, run.unique_count, run.summary
-            ],
-        )?;
+        )?
+        .execute(params![
+            run.project_id, run.algorithm, run.threshold, run.total_images,
+            run.groups_count, run.unique_count, run.summary
+        ])?;
         Ok(conn.last_insert_rowid())
     }
 
     pub fn list_runs(&self, project_id: i64, skip: i64, limit: i64) -> anyhow::Result<Vec<AnalysisRunRecord>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, project_id, algorithm, threshold, total_images,
                     groups_count, unique_count, summary, created_at
              FROM analysis_runs WHERE project_id=?1 ORDER BY id DESC LIMIT ?2 OFFSET ?3",
@@ -487,12 +579,13 @@ impl Store {
 
     pub fn get_run(&self, run_id: i64) -> anyhow::Result<AnalysisRunRecord> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT id, project_id, algorithm, threshold, total_images,
-                    groups_count, unique_count, summary, created_at
-             FROM analysis_runs WHERE id=?1",
-            params![run_id],
-            |r| {
+        let found = conn
+            .prepare_cached(
+                "SELECT id, project_id, algorithm, threshold, total_images,
+                        groups_count, unique_count, summary, created_at
+                 FROM analysis_runs WHERE id=?1",
+            )?
+            .query_row(params![run_id], |r| {
                 Ok(AnalysisRunRecord {
                     id: r.get(0)?,
                     project_id: r.get(1)?,
@@ -504,10 +597,9 @@ impl Store {
                     summary: r.get(7)?,
                     created_at: r.get(8)?,
                 })
-            },
-        )
-        .optional()?
-        .with_context(|| format!("分析记录不存在: {run_id}"))
+            })
+            .optional()?;
+        found.with_context(|| format!("分析记录不存在: {run_id}"))
     }
 
     pub fn latest_run(
@@ -517,30 +609,38 @@ impl Store {
         threshold: f64,
     ) -> anyhow::Result<Option<AnalysisRunRecord>> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn
-            .query_row(
+        let run = conn
+            .prepare_cached(
                 "SELECT id, project_id, algorithm, threshold, total_images,
                         groups_count, unique_count, summary, created_at
                  FROM analysis_runs
                  WHERE project_id=?1 AND algorithm=?2 AND threshold=?3
                  ORDER BY id DESC LIMIT 1",
-                params![project_id, algorithm, threshold],
-                |r| {
-                    Ok(AnalysisRunRecord {
-                        id: r.get(0)?,
-                        project_id: r.get(1)?,
-                        algorithm: r.get(2)?,
-                        threshold: r.get(3)?,
-                        total_images: r.get(4)?,
-                        groups_count: r.get(5)?,
-                        unique_count: r.get(6)?,
-                        summary: r.get(7)?,
-                        created_at: r.get(8)?,
-                    })
-                },
-            )
-            .optional()?)
+            )?
+            .query_row(params![project_id, algorithm, threshold], |r| {
+                Ok(AnalysisRunRecord {
+                    id: r.get(0)?,
+                    project_id: r.get(1)?,
+                    algorithm: r.get(2)?,
+                    threshold: r.get(3)?,
+                    total_images: r.get(4)?,
+                    groups_count: r.get(5)?,
+                    unique_count: r.get(6)?,
+                    summary: r.get(7)?,
+                    created_at: r.get(8)?,
+                })
+            })
+            .optional()?;
+        Ok(run)
     }
+}
+
+/// `?start,?start+1,…` — explicit numbered placeholders for a bound `IN` list.
+fn placeholders(start: usize, n: usize) -> String {
+    (start..start + n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn ordered_pair(a: &str, b: &str) -> (String, String) {
@@ -576,4 +676,87 @@ pub struct NewRun {
     pub groups_count: i64,
     pub unique_count: i64,
     pub summary: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "itrace-store-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn img(project_id: i64, name: &str) -> NewImage {
+        NewImage {
+            project_id,
+            filename: name.into(),
+            file_path: format!("u/{name}"),
+            file_hash: format!("h{name}"),
+            phash: None,
+            dhash: None,
+            ahash: None,
+            whash: None,
+            colorhash: None,
+            extracted_from: None,
+            file_size: None,
+            width: None,
+            height: None,
+        }
+    }
+
+    #[test]
+    fn put_features_batch_and_load_maps() {
+        let dir = tmp_dir("feat");
+        let s = Store::open(&dir).unwrap();
+        let p = s.create_project("t", None).unwrap();
+        let a = s.insert_image(&img(p.id, "a.jpg")).unwrap();
+        let b = s.insert_image(&img(p.id, "b.jpg")).unwrap();
+
+        // 2 algorithms × 2 variants in one transaction, then a re-upsert
+        // exercises the ON CONFLICT path.
+        s.put_features(
+            a.id,
+            &[
+                (0, "phash", &[1u8; 8][..], 64),
+                (1, "phash", &[2u8; 8][..], 64),
+                (0, "dhash", &[3u8; 8][..], 64),
+                (1, "dhash", &[4u8; 8][..], 64),
+            ],
+        )
+        .unwrap();
+        s.put_features(a.id, &[(0, "phash", &[9u8; 8][..], 64)]).unwrap();
+
+        let ids = vec![a.id, b.id];
+        let variants = vec![0u8, 1u8];
+        let maps = s
+            .load_feature_maps(&ids, &["phash", "dhash"], &variants)
+            .unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0][&a.id][&0], vec![9u8; 8]);
+        assert_eq!(maps[0][&a.id][&1], vec![2u8; 8]);
+        assert_eq!(maps[1][&a.id][&0], vec![3u8; 8]);
+        assert!(!maps[0].contains_key(&b.id));
+        // empty id/variant lists return an empty map, not an error
+        assert!(s.load_feature_map(&[], "phash", &variants).unwrap().is_empty());
+        assert!(s.load_feature_map(&ids, "phash", &[]).unwrap().is_empty());
+
+        assert!(!s.features_ready(&ids).unwrap()); // 'pending' by default
+        s.set_feature_status(a.id, "ready").unwrap();
+        s.set_feature_status(b.id, "ready").unwrap();
+        assert!(s.features_ready(&ids).unwrap());
+        assert!(s.features_ready(&[]).unwrap());
+
+        // image_count comes through the LEFT JOIN + GROUP BY path
+        assert_eq!(s.get_project(p.id).unwrap().image_count, 2);
+        assert_eq!(s.list_projects(0, 10).unwrap()[0].image_count, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

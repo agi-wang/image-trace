@@ -33,40 +33,62 @@ struct Profile {
     col_grad: [f64; BINS],
 }
 
-/// Resample a dense signal to `n` bins (linear interpolation).
-fn resample(vals: &[f64], n: usize) -> Vec<f64> {
+/// Resample a dense signal to `n` bins (linear interpolation), writing
+/// `out[..n]` — a stack buffer instead of a Vec per window.
+fn resample(vals: &[f64], out: &mut [f64], n: usize) {
     let m = vals.len();
     if m == 0 {
-        return vec![0.0; n];
+        out[..n].fill(0.0);
+        return;
     }
     if m == n {
-        return vals.to_vec();
+        out[..n].copy_from_slice(vals);
+        return;
     }
-    (0..n)
-        .map(|i| {
-            let pos = (i as f64 + 0.5) * m as f64 / n as f64 - 0.5;
-            if pos <= 0.0 {
-                vals[0]
-            } else if pos >= (m - 1) as f64 {
-                vals[m - 1]
-            } else {
-                let lo = pos.floor() as usize;
-                let t = pos - lo as f64;
-                vals[lo] * (1.0 - t) + vals[lo + 1] * t
-            }
-        })
-        .collect()
+    for (i, o) in out.iter_mut().enumerate().take(n) {
+        let pos = (i as f64 + 0.5) * m as f64 / n as f64 - 0.5;
+        *o = if pos <= 0.0 {
+            vals[0]
+        } else if pos >= (m - 1) as f64 {
+            vals[m - 1]
+        } else {
+            let lo = pos.floor() as usize;
+            let t = pos - lo as f64;
+            vals[lo] * (1.0 - t) + vals[lo + 1] * t
+        };
+    }
 }
 
-/// Pearson correlation between two signals, in [0,1].
+/// Signal mean — the same forward-order sum `pcc` computes, hoisted so each
+/// signal is summed once per transform instead of once per call site.
+fn mean(s: &[f64]) -> f64 {
+    s.iter().sum::<f64>() / s.len() as f64
+}
+
+/// The four signal means of a profile, for `pcc_with_means`.
+struct Means {
+    row_mean: f64,
+    row_grad: f64,
+    col_mean: f64,
+    col_grad: f64,
+}
+
+fn profile_means(p: &Profile) -> Means {
+    Means {
+        row_mean: mean(&p.row_mean),
+        row_grad: mean(&p.row_grad),
+        col_mean: mean(&p.col_mean),
+        col_grad: mean(&p.col_grad),
+    }
+}
+
+/// Pearson correlation between two signals with precomputed means, in [0,1].
 /// Centering removes DC so the score tracks profile *shape*.
-fn pcc(a: &[f64], b: &[f64]) -> f64 {
+fn pcc_with_means(a: &[f64], ma: f64, b: &[f64], mb: f64) -> f64 {
     let n = a.len().min(b.len());
     if n == 0 {
         return 0.0;
     }
-    let ma = a[..n].iter().sum::<f64>() / n as f64;
-    let mb = b[..n].iter().sum::<f64>() / n as f64;
     let (mut dot, mut na, mut nb) = (0.0, 0.0, 0.0);
     for i in 0..n {
         let da = a[i] - ma;
@@ -108,11 +130,11 @@ fn transform(p: &Profile, swap: bool, rev_r: bool, rev_c: bool) -> Profile {
 }
 
 /// Equal-weight correlation over the four signal pairs.
-fn profile_cosine(a: &Profile, b: &Profile) -> f64 {
-    (pcc(&a.row_mean, &b.row_mean)
-        + pcc(&a.row_grad, &b.row_grad)
-        + pcc(&a.col_mean, &b.col_mean)
-        + pcc(&a.col_grad, &b.col_grad))
+fn profile_cosine(a: &Profile, am: &Means, b: &Profile, bm: &Means) -> f64 {
+    (pcc_with_means(&a.row_mean, am.row_mean, &b.row_mean, bm.row_mean)
+        + pcc_with_means(&a.row_grad, am.row_grad, &b.row_grad, bm.row_grad)
+        + pcc_with_means(&a.col_mean, am.col_mean, &b.col_mean, bm.col_mean)
+        + pcc_with_means(&a.col_grad, am.col_grad, &b.col_grad, bm.col_grad))
         / 4.0
 }
 
@@ -120,12 +142,33 @@ fn profile_cosine(a: &Profile, b: &Profile) -> f64 {
 /// — the cross-correlation that detects a slice. Both sides are compared
 /// at the window's native resolution (child downsampled to `len` bins), so
 /// thin slices aren't penalized for keeping finer detail than the parent.
+/// The child's mean/norm are hoisted per `len` — identical `pcc` values.
 fn band_match(child: &[f64; BINS], parent: &[f64; BINS]) -> f64 {
     let mut best = 0.0f64;
+    let mut cds = [0.0f64; BINS];
     for len in 4..=BINS {
-        let cds = resample(child, len);
+        resample(child, &mut cds, len);
+        let ca = &cds[..len];
+        let ma = mean(ca);
+        let na: f64 = ca.iter().map(|v| (v - ma) * (v - ma)).sum();
         for start in 0..=(BINS - len) {
-            best = best.max(pcc(&cds, &parent[start..start + len]));
+            let wb = &parent[start..start + len];
+            let mb = mean(wb);
+            let (mut dot, mut nb) = (0.0, 0.0);
+            for i in 0..len {
+                let db = wb[i] - mb;
+                dot += (ca[i] - ma) * db;
+                nb += db * db;
+            }
+            let s = if na <= EPS || nb <= EPS {
+                if na <= EPS && nb <= EPS { 1.0 } else { 0.0 }
+            } else {
+                (dot / (na * nb).sqrt()).clamp(0.0, 1.0)
+            };
+            best = best.max(s);
+            if best >= 1.0 {
+                return 1.0; // max possible — later windows can't change it
+            }
         }
     }
     best
@@ -133,16 +176,16 @@ fn band_match(child: &[f64; BINS], parent: &[f64; BINS]) -> f64 {
 
 /// Score "child is a contiguous band of parent": band correlation on one
 /// axis corroborated by direct correlation on the other axis.
-fn slice_score(child: &Profile, parent: &Profile) -> f64 {
+fn slice_score(child: &Profile, cm: &Means, parent: &Profile, pm: &Means) -> f64 {
     let horizontal = (band_match(&child.row_mean, &parent.row_mean)
         + band_match(&child.row_grad, &parent.row_grad)
-        + pcc(&child.col_mean, &parent.col_mean)
-        + pcc(&child.col_grad, &parent.col_grad))
+        + pcc_with_means(&child.col_mean, cm.col_mean, &parent.col_mean, pm.col_mean)
+        + pcc_with_means(&child.col_grad, cm.col_grad, &parent.col_grad, pm.col_grad))
         / 4.0;
     let vertical = (band_match(&child.col_mean, &parent.col_mean)
         + band_match(&child.col_grad, &parent.col_grad)
-        + pcc(&child.row_mean, &parent.row_mean)
-        + pcc(&child.row_grad, &parent.row_grad))
+        + pcc_with_means(&child.row_mean, cm.row_mean, &parent.row_mean, pm.row_mean)
+        + pcc_with_means(&child.row_grad, cm.row_grad, &parent.row_grad, pm.row_grad))
         / 4.0;
     horizontal.max(vertical)
 }
@@ -233,8 +276,10 @@ impl FeatureExtractor for SliceProfileExtractor {
         }
 
         let mut out = Vec::with_capacity(4 * BINS);
-        let push = |vals: &[f64], scale: f64, out: &mut Vec<u8>| {
-            for v in resample(vals, BINS) {
+        let mut buf = [0.0f64; BINS];
+        let mut push = |vals: &[f64], scale: f64, out: &mut Vec<u8>| {
+            resample(vals, &mut buf, BINS);
+            for v in buf {
                 out.push((v * scale).round().clamp(0.0, 255.0) as u8);
             }
         };
@@ -258,18 +303,24 @@ impl FeatureExtractor for SliceProfileExtractor {
                 return super::cosine(&fa, &fb);
             }
         };
+        let ma = profile_means(&pa);
         let mut best = 0.0f64;
         for swap in [false, true] {
             for rev_r in [false, true] {
                 for rev_c in [false, true] {
                     let tb = transform(&pb, swap, rev_r, rev_c);
-                    best = best.max(profile_cosine(&pa, &tb));
+                    let mb = profile_means(&tb);
+                    best = best.max(profile_cosine(&pa, &ma, &tb, &mb));
                     if !swap {
                         // Axis swap is already covered by slice_score's
                         // horizontal/vertical symmetry — only scan the
                         // four reversal transforms.
-                        best = best.max(slice_score(&pa, &tb));
-                        best = best.max(slice_score(&tb, &pa));
+                        best = best.max(slice_score(&pa, &ma, &tb, &mb));
+                        best = best.max(slice_score(&tb, &mb, &pa, &ma));
+                    }
+                    if best >= 1.0 {
+                        // every term is clamped ≤ 1 — the max can't move
+                        return 1.0;
                     }
                 }
             }

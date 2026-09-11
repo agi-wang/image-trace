@@ -1,6 +1,7 @@
 //! Business logic invoked by HTTP handlers (runs on blocking pool).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Context;
 use rayon::prelude::*;
@@ -10,10 +11,30 @@ use itrace_core::compare::{self, Prepared};
 use itrace_core::descriptors;
 use itrace_core::features;
 use itrace_core::{documents, hashes, image_io, index, slice};
-use itrace_core::{HASH_GATE_ALGOS, SMART_ALGOS};
+use itrace_core::{GrayImage, RgbImage, HASH_GATE_ALGOS, SMART_ALGOS};
 use itrace_store::{ImageRecord, NewImage, NewRun, Project, Store};
 
 use crate::{enqueue_precompute_decoded, unique_key, ApiError, ApiResult, AppState};
+
+/// Resolve each algo to its stored-feature index, deduplicating feature
+/// names (several algos may share one stored feature, e.g. ssim/template
+/// both use `gray_flat`). `feat_names` is filled in first-seen order so one
+/// `load_feature_maps` batch covers every algorithm.
+fn feature_index(algos: &[&str], feat_names: &mut Vec<&'static str>) -> Vec<Option<usize>> {
+    algos.iter()
+        .map(|a| {
+            features::algo_to_feature(a).map(|f| {
+                match feat_names.iter().position(|&x| x == f) {
+                    Some(i) => i,
+                    None => {
+                        feat_names.push(f);
+                        feat_names.len() - 1
+                    }
+                }
+            })
+        })
+        .collect()
+}
 
 // ---------- upload ----------
 
@@ -292,13 +313,19 @@ pub fn run_smart_compare(
     let variants: Vec<u8> = (0..features::NUM_VARIANTS).collect();
     let mut pair_hits: HashMap<(usize, usize), Vec<(String, f64)>> = HashMap::new();
 
-    for algo in SMART_ALGOS {
-        let Some(feat) = features::algo_to_feature(algo) else { continue };
-        let map = store.load_feature_map(&ids, feat, &variants)?;
+    // One batched load for every needed feature (algos sharing a stored
+    // feature reuse the same map — index aligns with `feat_names`).
+    let mut feat_names: Vec<&'static str> = Vec::new();
+    let algo_feat = feature_index(SMART_ALGOS, &mut feat_names);
+    let maps = store.load_feature_maps(&ids, &feat_names, &variants)?;
+
+    for (algo, fi) in SMART_ALGOS.iter().zip(&algo_feat) {
+        let Some(fi) = *fi else { continue };
+        let map = &maps[fi];
         if map.is_empty() {
             continue;
         }
-        let m = features::similarity_matrix(&map, &ids, algo, true);
+        let m = features::similarity_matrix(map, &ids, algo, true);
         for (i, row) in m.iter().enumerate() {
             for (j, &s) in row.iter().enumerate().skip(i + 1) {
                 if s >= threshold {
@@ -410,25 +437,22 @@ pub fn run_dedup_scan(
         .collect();
     let ids: Vec<i64> = ready.iter().map(|i| i.id).collect();
     let variants: Vec<u8> = (0..features::NUM_VARIANTS).collect();
-    let gate_features: Vec<&str> =
-        HASH_GATE_ALGOS.iter().filter_map(|a| features::algo_to_feature(a)).collect();
-    let maps: Vec<features::FeatureMap> = gate_features
-        .iter()
-        .map(|f| store.load_feature_map(&ids, f, &variants))
-        .collect::<anyhow::Result<_>>()?;
-    let exts: Vec<&dyn features::FeatureExtractor> = HASH_GATE_ALGOS
-        .iter()
-        .filter_map(|a| features::extractor_for_algo(a))
-        .collect();
+    // One batched load for the gate features (deduped, first-seen order);
+    // `gate_feats` holds the map index per resolved gate algo — unmapped
+    // algos are dropped, same as the old per-feature filter_map.
+    let mut feat_names: Vec<&'static str> = Vec::new();
+    let gate_feat = feature_index(HASH_GATE_ALGOS, &mut feat_names);
+    let gate_feats: Vec<usize> = gate_feat.iter().flatten().copied().collect();
+    let maps = store.load_feature_maps(&ids, &feat_names, &variants)?;
 
     let mut entries: Vec<index::DedupKeys> = Vec::with_capacity(ready.len());
     for img in &ready {
-        let variant_keys: Vec<Vec<u64>> = maps
+        let variant_keys: Vec<Vec<u64>> = gate_feats
             .iter()
-            .map(|m| {
+            .map(|&fi| {
                 variants
                     .iter()
-                    .filter_map(|v| m.get(&img.id).and_then(|vm| vm.get(v)))
+                    .filter_map(|v| maps[fi].get(&img.id).and_then(|vm| vm.get(v)))
                     .map(|b| features::unpack_bits(b))
                     .collect()
             })
@@ -442,20 +466,30 @@ pub fn run_dedup_scan(
     let pairs = index::dedup_candidates(&entries, radius, min_votes);
     let naive = (n as u64) * (n as u64 - 1) / 2;
 
-    // cross-variant max: a rotated file's variant set is a permutation of
-    // the original's, so (v, w) — not (v, v) — carries the true maximum
-    let score_pair = |ia: i64, ib: i64| -> f64 {
+    // Cross-variant max scored directly on the u64 keys unpacked into
+    // `entries` above — the gate features are all Bits-kind, so
+    // hash_similarity(a, b) is exactly ext.similarity(blob_a, blob_b)
+    // without re-touching the blobs. Verified scores are cached: the group
+    // pass below re-scores pairs already confirmed here.
+    let entry_pos: HashMap<i64, usize> =
+        entries.iter().enumerate().map(|(p, e)| (e.image_id, p)).collect();
+    let mut score_cache: HashMap<(i64, i64), f64> = HashMap::new();
+    let mut score_pair = |ia: i64, ib: i64| -> f64 {
+        let key = (ia.min(ib), ia.max(ib));
+        if let Some(&s) = score_cache.get(&key) {
+            return s;
+        }
         let mut best = 0.0f64;
-        for (map, ext) in maps.iter().zip(&exts) {
-            let (Some(ma), Some(mb)) = (map.get(&ia), map.get(&ib)) else { continue };
-            for &v in &variants {
-                for &w in &variants {
-                    if let (Some(a), Some(b)) = (ma.get(&v), mb.get(&w)) {
-                        best = best.max(ext.similarity(a, b));
+        if let (Some(&ea), Some(&eb)) = (entry_pos.get(&ia), entry_pos.get(&ib)) {
+            for (ka, kb) in entries[ea].variant_keys.iter().zip(&entries[eb].variant_keys) {
+                for &a in ka {
+                    for &b in kb {
+                        best = best.max(hashes::hash_similarity(a, b));
                     }
                 }
             }
         }
+        score_cache.insert(key, best);
         best
     };
 
@@ -517,15 +551,24 @@ pub fn run_dedup_scan(
 
 // ---------- pairwise matrix ----------
 
-pub fn pairwise_matrix(
+/// Typed matrix result — `build_report` consumes `matrix` directly instead
+/// of round-tripping the N×N values through `serde_json::Value`.
+struct MatrixResult {
+    names: Vec<String>,
+    image_ids: Vec<i64>,
+    matrix: Vec<Vec<f64>>,
+    engine: &'static str,
+}
+
+fn compute_matrix(
     state: &AppState,
     images: &[ImageRecord],
     algo: &str,
     rot_inv: bool,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<MatrixResult> {
     let store = &state.store;
     let ids: Vec<i64> = images.iter().map(|i| i.id).collect();
-    let names: Vec<&str> = images.iter().map(|i| i.filename.as_str()).collect();
+    let names: Vec<String> = images.iter().map(|i| i.filename.clone()).collect();
 
     // fast path: stored features
     if let Some(feat) = features::algo_to_feature(algo) {
@@ -534,10 +577,7 @@ pub fn pairwise_matrix(
         let map = store.load_feature_map(&ids, feat, &variants)?;
         if !map.is_empty() {
             let m = features::similarity_matrix(&map, &ids, algo, rot_inv);
-            return Ok(json!({
-                "names": names, "image_ids": ids, "matrix": m,
-                "algorithm": algo, "engine": "rust-matrix"
-            }));
+            return Ok(MatrixResult { names, image_ids: ids, matrix: m, engine: "rust-matrix" });
         }
     }
 
@@ -545,11 +585,21 @@ pub fn pairwise_matrix(
     // back to `images` (undecodable files are dropped)
     let (kept, prepared) = load_prepared(store, images, algo, rot_inv);
     let m = compare::pairwise_matrix(&prepared, algo, rot_inv);
-    let kept_names: Vec<&str> = kept.iter().map(|&k| images[k].filename.as_str()).collect();
-    let kept_ids: Vec<i64> = kept.iter().map(|&k| images[k].id).collect();
+    let names = kept.iter().map(|&k| images[k].filename.clone()).collect();
+    let image_ids = kept.iter().map(|&k| images[k].id).collect();
+    Ok(MatrixResult { names, image_ids, matrix: m, engine: "precise" })
+}
+
+pub fn pairwise_matrix(
+    state: &AppState,
+    images: &[ImageRecord],
+    algo: &str,
+    rot_inv: bool,
+) -> anyhow::Result<Value> {
+    let r = compute_matrix(state, images, algo, rot_inv)?;
     Ok(json!({
-        "names": kept_names, "image_ids": kept_ids, "matrix": m,
-        "algorithm": algo, "engine": "precise"
+        "names": r.names, "image_ids": r.image_ids, "matrix": r.matrix,
+        "algorithm": algo, "engine": r.engine
     }))
 }
 
@@ -563,9 +613,9 @@ pub fn build_report(
     threshold: f64,
     rot_inv: bool,
 ) -> anyhow::Result<Value> {
-    let matrix_payload = pairwise_matrix(state, images, algo, rot_inv)?;
-    let m: Vec<Vec<f64>> = serde_json::from_value(matrix_payload["matrix"].clone())?;
-    let (groups, ungrouped) = itrace_core::group::cluster(&m, threshold);
+    let r = compute_matrix(state, images, algo, rot_inv)?;
+    let m = &r.matrix;
+    let (groups, ungrouped) = itrace_core::group::cluster(m, threshold);
 
     let mut group_json = Vec::new();
     for members in &groups {
@@ -602,8 +652,8 @@ pub fn build_report(
             "height": i.height, "file_size": i.file_size
         })).collect::<Vec<_>>(),
         "matrix": {
-            "names": matrix_payload["names"], "image_ids": matrix_payload["image_ids"],
-            "values": m, "engine": matrix_payload["engine"]
+            "names": r.names, "image_ids": r.image_ids,
+            "values": r.matrix, "engine": r.engine
         },
         "groups": group_json,
         "summary": {
@@ -639,11 +689,28 @@ fn chrono_now() -> String {
 
 // ---------- match data / visualize / slices ----------
 
-fn load_gray(store: &Store, img: &ImageRecord) -> anyhow::Result<itrace_core::GrayImage> {
+fn load_gray(store: &Store, img: &ImageRecord) -> anyhow::Result<GrayImage> {
     let bytes = store.read_file(&img.file_path).context("图像文件不存在")?;
     let decoded = image_io::decode(&bytes)?;
     let small = image_io::resize_max_side(&decoded, 1024);
     Ok(image_io::to_gray(&small))
+}
+
+/// `load_gray` behind the small shared cache — the match/slice endpoints
+/// re-decode the same few blobs on every call.
+fn load_gray_cached(state: &AppState, img: &ImageRecord) -> anyhow::Result<Arc<GrayImage>> {
+    if let Some(g) = state.gray_cache.lock().unwrap().get(&img.id) {
+        return Ok(Arc::clone(g));
+    }
+    let g = Arc::new(load_gray(&state.store, img)?);
+    let mut cache = state.gray_cache.lock().unwrap();
+    if cache.len() >= 64 {
+        if let Some(&k) = cache.keys().next() {
+            cache.remove(&k);
+        }
+    }
+    cache.insert(img.id, Arc::clone(&g));
+    Ok(g)
 }
 
 pub fn match_data(
@@ -652,11 +719,11 @@ pub fn match_data(
     ib: &ImageRecord,
     algo: &str,
 ) -> ApiResult<Value> {
-    let store = &state.store;
     let ext = descriptors::extractor_for(algo)
         .ok_or_else(|| ApiError::bad(format!("算法 {algo} 在此构建中不可用")))?;
-    let ga = load_gray(store, ia).map_err(|e| ApiError::not_found(e.to_string()))?;
-    let gb = load_gray(store, ib).map_err(|e| ApiError::not_found(e.to_string()))?;
+    let (ga, gb) = rayon::join(|| load_gray_cached(state, ia), || load_gray_cached(state, ib));
+    let ga = ga.map_err(|e| ApiError::not_found(e.to_string()))?;
+    let gb = gb.map_err(|e| ApiError::not_found(e.to_string()))?;
     let da = ext.detect(&ga, 500);
     let db = ext.detect(&gb, 500);
     let matches = descriptors::match_knn_ratio(&da, &db, 0.75);
@@ -700,6 +767,18 @@ pub fn match_data(
     }))
 }
 
+/// Read + decode + resize one image, returning its gray and rgb buffers.
+fn decode_side(
+    store: &Store,
+    img: &ImageRecord,
+    max_side: u32,
+) -> ApiResult<(GrayImage, RgbImage)> {
+    let bytes =
+        store.read_file(&img.file_path).map_err(|_| ApiError::not_found("图像文件不存在"))?;
+    let im = image_io::resize_max_side(&image_io::decode(&bytes)?, max_side);
+    Ok((image_io::to_gray(&im), image_io::to_rgb(&im)))
+}
+
 pub fn visualize(
     state: &AppState,
     ia: &ImageRecord,
@@ -709,19 +788,14 @@ pub fn visualize(
     let store = &state.store;
     let ext = descriptors::extractor_for(algo)
         .ok_or_else(|| ApiError::bad(format!("算法 {algo} 在此构建中不可用")))?;
-    let imga = image_io::decode(&store.read_file(&ia.file_path).map_err(|_| ApiError::not_found("图像文件不存在"))?)?;
-    let imgb = image_io::decode(&store.read_file(&ib.file_path).map_err(|_| ApiError::not_found("图像文件不存在"))?)?;
-    let imga = image_io::resize_max_side(&imga, 640);
-    let imgb = image_io::resize_max_side(&imgb, 640);
-    let ga = image_io::to_gray(&imga);
-    let gb = image_io::to_gray(&imgb);
+    let (a, b) = rayon::join(|| decode_side(store, ia, 640), || decode_side(store, ib, 640));
+    let (ga, ra) = a?;
+    let (gb, rb) = b?;
     let da = ext.detect(&ga, 500);
     let db = ext.detect(&gb, 500);
     let matches = descriptors::match_cross_check(&da, &db);
     let matches: Vec<descriptors::Match> = matches.into_iter().take(40).collect();
 
-    let ra = image_io::to_rgb(&imga);
-    let rb = image_io::to_rgb(&imgb);
     let vis = crate::draw::draw_matches(&ra, &rb, &da, &db, &matches);
 
     let fname = format!("match_{}_{}.jpg", algo, uuid_short());
@@ -745,9 +819,8 @@ pub fn slice_match(
     rows: u32,
     cols: u32,
 ) -> anyhow::Result<slice::SliceMatchResult> {
-    let store = &state.store;
-    let ga = load_gray(store, ia)?;
-    let gb = load_gray(store, ib)?;
+    let (ga, gb) = rayon::join(|| load_gray_cached(state, ia), || load_gray_cached(state, ib));
+    let (ga, gb) = (ga?, gb?);
     Ok(slice::slice_match(&ga, &gb, rows, cols, 0.7))
 }
 

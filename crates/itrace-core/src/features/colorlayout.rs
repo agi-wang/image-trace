@@ -24,15 +24,15 @@ const KEEP_C: usize = 6;
 const DIMS: usize = KEEP_Y + 2 * KEEP_C;
 
 /// Zigzag visit order for an 8×8 block (linear index = v*8 + u).
-fn zigzag_order() -> [usize; N * N] {
+const fn build_zigzag() -> [usize; N * N] {
     let mut order = [0usize; N * N];
     let mut i = 0;
     let mut diag = 0;
     while diag < 2 * N - 1 {
         // Even anti-diagonals run bottom-left → top-right, odd the reverse.
         let up = diag % 2 == 0;
-        let u_lo = diag.saturating_sub(N - 1);
-        let u_hi = diag.min(N - 1);
+        let u_lo = if diag >= N { diag - (N - 1) } else { 0 };
+        let u_hi = if diag < N { diag } else { N - 1 };
         let mut k = u_lo;
         while k <= u_hi {
             let (u, v) = if up { (k, diag - k) } else { (diag - k, k) };
@@ -45,27 +45,48 @@ fn zigzag_order() -> [usize; N * N] {
     order
 }
 
-/// Separable orthonormal 2D DCT-II on an N×N f64 block.
-fn dct_2d(input: &[f64], n: usize) -> Vec<f64> {
-    let mut out = vec![0.0f64; n * n];
-    let pi_n = std::f64::consts::PI / n as f64;
-    let mut tmp = vec![0.0f64; n * n];
-    for (y, row) in tmp.chunks_exact_mut(n).enumerate() {
-        for (u, o) in row.iter_mut().enumerate() {
-            let mut s = 0.0;
-            for x in 0..n {
-                s += input[y * n + x] * ((x as f64 + 0.5) * u as f64 * pi_n).cos();
+const ZIGZAG: [usize; N * N] = build_zigzag();
+
+/// cos((x + 0.5) * k * π/N) table shared by the row and column passes —
+/// the identical f64 values the inner loops computed, evaluated once.
+fn cos_table() -> &'static [f64; N * N] {
+    use std::sync::OnceLock;
+    static T: OnceLock<[f64; N * N]> = OnceLock::new();
+    T.get_or_init(|| {
+        let pi_n = std::f64::consts::PI / N as f64;
+        let mut t = [0.0f64; N * N];
+        for k in 0..N {
+            for x in 0..N {
+                t[k * N + x] = ((x as f64 + 0.5) * k as f64 * pi_n).cos();
             }
-            *o = s * if u == 0 { (1.0 / n as f64).sqrt() } else { (2.0 / n as f64).sqrt() };
+        }
+        t
+    })
+}
+
+/// Separable orthonormal 2D DCT-II on an N×N f64 block (stack-allocated).
+fn dct_2d(input: &[f64; N * N]) -> [f64; N * N] {
+    let t = cos_table();
+    let s0 = (1.0 / N as f64).sqrt();
+    let sk = (2.0 / N as f64).sqrt();
+    let mut tmp = [0.0f64; N * N];
+    for y in 0..N {
+        for u in 0..N {
+            let mut s = 0.0;
+            for x in 0..N {
+                s += input[y * N + x] * t[u * N + x];
+            }
+            tmp[y * N + u] = s * if u == 0 { s0 } else { sk };
         }
     }
-    for v in 0..n {
-        for u in 0..n {
+    let mut out = [0.0f64; N * N];
+    for v in 0..N {
+        for u in 0..N {
             let mut s = 0.0;
-            for y in 0..n {
-                s += tmp[y * n + u] * ((y as f64 + 0.5) * v as f64 * pi_n).cos();
+            for y in 0..N {
+                s += tmp[y * N + u] * t[v * N + y];
             }
-            out[v * n + u] = s * if v == 0 { (1.0 / n as f64).sqrt() } else { (2.0 / n as f64).sqrt() };
+            out[v * N + u] = s * if v == 0 { s0 } else { sk };
         }
     }
     out
@@ -123,10 +144,9 @@ fn to_ycbcr(planes: &[[f64; N * N]; 3]) -> [[f64; N * N]; 3] {
 /// `dc_center`); the rest are AC magnitudes — mirrors only flip DCT
 /// signs and a 90° rotation transposes the coefficient grid, so
 /// magnitudes keep the descriptor stable under orientation changes.
-fn take_low(dct: &[f64], keep: usize, dc_center: f64, out: &mut Vec<f32>) {
-    let order = zigzag_order();
+fn take_low(dct: &[f64; N * N], keep: usize, dc_center: f64, out: &mut Vec<f32>) {
     out.push((dct[0] / N as f64 - dc_center) as f32);
-    for &idx in order.iter().take(keep).skip(1) {
+    for &idx in ZIGZAG.iter().take(keep).skip(1) {
         out.push(dct[idx].abs() as f32);
     }
 }
@@ -147,9 +167,9 @@ impl FeatureExtractor for ColorLayoutExtractor {
     fn compute(&self, _gray: &GrayImage, rgb: &RgbImage) -> Vec<u8> {
         let ycc = to_ycbcr(&downsample(rgb));
         let mut v = Vec::with_capacity(DIMS);
-        take_low(&dct_2d(&ycc[0], N), KEEP_Y, 0.0, &mut v);
-        take_low(&dct_2d(&ycc[1], N), KEEP_C, 128.0, &mut v);
-        take_low(&dct_2d(&ycc[2], N), KEEP_C, 128.0, &mut v);
+        take_low(&dct_2d(&ycc[0]), KEEP_Y, 0.0, &mut v);
+        take_low(&dct_2d(&ycc[1]), KEEP_C, 128.0, &mut v);
+        take_low(&dct_2d(&ycc[2]), KEEP_C, 128.0, &mut v);
         pack_f32(&v)
     }
     fn dims(&self, data: &[u8]) -> usize {
@@ -157,6 +177,9 @@ impl FeatureExtractor for ColorLayoutExtractor {
     }
     fn similarity(&self, a: &[u8], b: &[u8]) -> f64 {
         cosine(&unpack_f32(a), &unpack_f32(b))
+    }
+    fn matrix_kernel(&self) -> Option<super::MatrixKernel> {
+        Some(super::MatrixKernel::Cosine)
     }
 }
 

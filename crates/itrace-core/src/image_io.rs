@@ -17,16 +17,14 @@ pub fn is_supported_image(filename: &str) -> bool {
     std::path::Path::new(filename)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| SUPPORTED_IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+        .is_some_and(|e| SUPPORTED_IMAGE_EXTENSIONS.iter().any(|s| e.eq_ignore_ascii_case(s)))
 }
 
 pub fn is_supported_document(filename: &str) -> bool {
     std::path::Path::new(filename)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| SUPPORTED_DOCUMENT_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
+        .is_some_and(|e| SUPPORTED_DOCUMENT_EXTENSIONS.iter().any(|s| e.eq_ignore_ascii_case(s)))
 }
 
 /// Decode a raster image from raw bytes.
@@ -72,8 +70,9 @@ pub fn resize_gray_exact(gray: &GrayImage, w: u32, h: u32) -> GrayImage {
     if gray.width == w && gray.height == h {
         return gray.clone();
     }
-    let buf: ImageBuffer<Luma<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(gray.width, gray.height, gray.data.clone())
+    // View over the borrowed data — resize only needs a pixel source.
+    let buf: ImageBuffer<Luma<u8>, &[u8]> =
+        ImageBuffer::from_raw(gray.width, gray.height, gray.data.as_slice())
             .expect("gray buffer size matches");
     let out = image::imageops::resize(&buf, w, h, image::imageops::FilterType::Triangle);
     GrayImage::new(w, h, out.into_raw())
@@ -112,37 +111,42 @@ pub fn orientation_variants(img: &DynamicImage) -> Vec<DynamicImage> {
 /// Variants for a grayscale buffer — cheaper than going through DynamicImage.
 pub fn gray_orientation_variants(gray: &GrayImage) -> Vec<GrayImage> {
     let (w, h) = (gray.width, gray.height);
-    let make = |f: &dyn Fn(u32, u32) -> u8, nw: u32, nh: u32| -> GrayImage {
-        let mut data = Vec::with_capacity((nw * nh) as usize);
+    // out(x,y) = gray[src(x,y)]; monomorphized per transform — no dispatch.
+    fn mapped(
+        gray: &GrayImage,
+        nw: u32,
+        nh: u32,
+        src: impl Fn(u32, u32) -> (u32, u32),
+    ) -> GrayImage {
+        let mut data = vec![0u8; (nw * nh) as usize];
         for y in 0..nh {
             for x in 0..nw {
-                data.push(f(x, y));
+                let (sx, sy) = src(x, y);
+                data[(y * nw + x) as usize] = gray.data[(sy * gray.width + sx) as usize];
             }
         }
         GrayImage::new(nw, nh, data)
-    };
-    let g = &gray.data;
-    let at = move |x: u32, y: u32| g[(y * w + x) as usize];
+    }
     vec![
         gray.clone(),
         // rot90 cw: new(x,y) = old(y, w-1-x) — checked below
-        make(&|x, y| at(y, h - 1 - x), h, w),
-        make(&|x, y| at(w - 1 - x, h - 1 - y), w, h),
-        make(&|x, y| at(w - 1 - y, x), h, w),
-        make(&|x, y| at(w - 1 - x, y), w, h),
+        mapped(gray, h, w, |x, y| (y, h - 1 - x)),
+        mapped(gray, w, h, |x, y| (w - 1 - x, h - 1 - y)),
+        mapped(gray, h, w, |x, y| (w - 1 - y, x)),
+        mapped(gray, w, h, |x, y| (w - 1 - x, y)),
         // flip + rot90: rotate90(flip(img)) → new(x,y) = flip(y, h-1-x) = old(w-1-y, h-1-x)
-        make(&|x, y| at(w - 1 - y, h - 1 - x), h, w),
+        mapped(gray, h, w, |x, y| (w - 1 - y, h - 1 - x)),
         // flip + rot180 = flip_vertical
-        make(&|x, y| at(x, h - 1 - y), w, h),
+        mapped(gray, w, h, |x, y| (x, h - 1 - y)),
         // flip + rot270: rotate270(flip) → new(x,y)=flip(w-1-y, x) = old(w-1-(w-1-y), x)=old(y,x)... transpose
-        make(&|x, y| at(y, x), h, w),
+        mapped(gray, h, w, |x, y| (y, x)),
     ]
 }
 
 /// Encode an RGB buffer as JPEG bytes.
 pub fn encode_jpeg(img: &RgbImage, quality: u8) -> anyhow::Result<Vec<u8>> {
-    let buf: ImageBuffer<image::Rgb<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(img.width, img.height, img.data.clone())
+    let buf: ImageBuffer<image::Rgb<u8>, &[u8]> =
+        ImageBuffer::from_raw(img.width, img.height, img.data.as_slice())
             .ok_or_else(|| anyhow::anyhow!("invalid rgb buffer"))?;
     let mut cur = std::io::Cursor::new(Vec::new());
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, quality);

@@ -3,12 +3,24 @@
 //! Handles the cases the original pipeline misses: an image that was cut into
 //! tiles and reassembled (sliced), embedded as a sub-image, or saved as a crop.
 
+use std::borrow::Cow;
+
 use rayon::prelude::*;
 
 use crate::metrics::template_match;
 use crate::{image_io, GrayImage};
 
 const MAX_SIDE: u32 = 384;
+
+/// Borrow `g` when already ≤ `max_side`; owned downscale otherwise.
+/// (`resize_gray_max` clones the buffer even on a no-op.)
+fn fit_max(g: &GrayImage, max_side: u32) -> Cow<'_, GrayImage> {
+    if g.width.max(g.height) <= max_side {
+        Cow::Borrowed(g)
+    } else {
+        Cow::Owned(image_io::resize_gray_max(g, max_side))
+    }
+}
 
 /// Result for one slice cell.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -39,7 +51,7 @@ pub struct SliceMatchResult {
 /// Cut `img` into rows×cols cells (edge cells absorb the remainder).
 fn grid_cells(img: &GrayImage, rows: u32, cols: u32) -> Vec<GrayImage> {
     let (w, h) = (img.width, img.height);
-    let mut cells = Vec::new();
+    let mut cells = Vec::with_capacity((rows * cols) as usize);
     for r in 0..rows {
         for c in 0..cols {
             let x0 = c * w / cols;
@@ -60,16 +72,35 @@ fn grid_cells(img: &GrayImage, rows: u32, cols: u32) -> Vec<GrayImage> {
     cells
 }
 
-/// 4 rotations of a cell (0°, 90°, 180°, 270°).
-fn rotations(cell: &GrayImage) -> Vec<GrayImage> {
-    let vars = image_io::gray_orientation_variants(cell);
-    vec![vars[0].clone(), vars[1].clone(), vars[2].clone(), vars[3].clone()]
+/// One rotation of a cell: `ri` quarter-turns clockwise (0°, 90°, 180°, 270°).
+/// Pixel-identical to `image_io::gray_orientation_variants` indices 0..=3 but
+/// builds only the requested rotation — the 4 flip variants are never used.
+fn rotate_cell(cell: &GrayImage, ri: u32) -> GrayImage {
+    let (w, h) = (cell.width, cell.height);
+    let at = |x: u32, y: u32| cell.data[(y * w + x) as usize];
+    let build = |nw: u32, nh: u32, f: &dyn Fn(u32, u32) -> u8| {
+        let mut data = Vec::with_capacity((nw * nh) as usize);
+        for y in 0..nh {
+            for x in 0..nw {
+                data.push(f(x, y));
+            }
+        }
+        GrayImage::new(nw, nh, data)
+    };
+    match ri {
+        0 => cell.clone(),
+        1 => build(h, w, &|x, y| at(y, h - 1 - x)), // rot90 cw
+        2 => build(w, h, &|x, y| at(w - 1 - x, h - 1 - y)), // rot180
+        _ => build(h, w, &|x, y| at(w - 1 - y, x)), // rot270 cw
+    }
 }
 
 /// Slide each cell of B over A (4 rotations per cell), take the best.
+/// A cell's rotation loop stops early on a perfect 1.0 match: NCC cannot
+/// exceed 1, so remaining rotations cannot change the recorded best.
 pub fn slice_match(a: &GrayImage, b: &GrayImage, rows: u32, cols: u32, threshold: f64) -> SliceMatchResult {
-    let a_small = image_io::resize_gray_max(a, MAX_SIDE);
-    let b_small = image_io::resize_gray_max(b, MAX_SIDE);
+    let a_small = fit_max(a, MAX_SIDE);
+    let b_small = fit_max(b, MAX_SIDE);
     let cells = grid_cells(&b_small, rows, cols);
 
     let results: Vec<SliceCell> = cells
@@ -79,13 +110,24 @@ pub fn slice_match(a: &GrayImage, b: &GrayImage, rows: u32, cols: u32, threshold
             let row = (i as u32) / cols;
             let col = (i as u32) % cols;
             let mut best = (0.0f64, 0u32, 0u32, 0u32);
-            for (ri, rot) in rotations(cell).iter().enumerate() {
+            for ri in 0..4u32 {
+                // ri == 0 borrows the cell; other rotations are built on demand.
+                let owned;
+                let rot = if ri == 0 {
+                    cell
+                } else {
+                    owned = rotate_cell(cell, ri);
+                    &owned
+                };
                 if rot.width > a_small.width || rot.height > a_small.height {
                     continue;
                 }
                 let (s, x, y) = template_match(&a_small, rot);
                 if s > best.0 {
-                    best = (s, x, y, (ri * 90) as u32);
+                    best = (s, x, y, ri * 90);
+                }
+                if best.0 >= 1.0 {
+                    break;
                 }
             }
             SliceCell {
@@ -113,11 +155,11 @@ pub fn slice_match(a: &GrayImage, b: &GrayImage, rows: u32, cols: u32, threshold
     }
 }
 
-/// Whole-image containment test: is `small` a crop/sub-image of `big`?
-/// Returns (score, x, y). Downscales for speed; tries both directions.
+/// Whole-image containment test: is either image a crop/sub-image of the other?
+/// Returns (score, contained). Downscales for speed; tries both directions.
 pub fn contains(a: &GrayImage, b: &GrayImage) -> (f64, bool) {
-    let a_s = image_io::resize_gray_max(a, MAX_SIDE);
-    let b_s = image_io::resize_gray_max(b, MAX_SIDE);
+    let a_s = fit_max(a, MAX_SIDE);
+    let b_s = fit_max(b, MAX_SIDE);
     // b inside a?
     if b_s.width <= a_s.width && b_s.height <= a_s.height {
         let (s, _, _) = template_match(&a_s, &b_s);
