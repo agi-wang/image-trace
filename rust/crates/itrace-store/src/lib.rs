@@ -237,11 +237,14 @@ impl Store {
     }
 
     /// Delete project row (CASCADE removes images/runs/features);
-    /// caller removes files.
+    /// caller removes files. Errors when the project does not exist.
     pub fn delete_project(&self, id: i64) -> anyhow::Result<Vec<ImageRecord>> {
         let images = self.list_images(id, 0, i64::MAX)?;
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        let n = conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        if n == 0 {
+            anyhow::bail!("项目不存在: {id}");
+        }
         Ok(images)
     }
 

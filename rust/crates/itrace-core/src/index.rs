@@ -1,18 +1,22 @@
 //! Candidate-pair retrieval for large-scale dedup.
 //!
 //! At 10^8+ images an N×N matrix is infeasible; instead we index each image's
-//! rotation-canonicalized 64-bit hash in a Multi-Index Hash (MIH) table and
-//! emit only near-duplicate candidate pairs for exact re-scoring — near-linear
-//! total work with sub-linear per-image candidate sets.
+//! per-variant 64-bit gate-hash keys in Multi-Index Hash (MIH) tables — one
+//! index per gate algorithm — and emit only near-duplicate candidate pairs
+//! for exact re-scoring. Indexing all 8 orientation variants reproduces
+//! variant-max comparison exactly (a rotated file's variant keys are a
+//! permutation of the original's).
 //!
 //! MIH: split the 64-bit key into eight 8-bit substrings; any two keys that
 //! agree on a whole substring are candidates. Hamming ≤ 7 ⇒ guaranteed recall
 //! (some substring must be identical); larger radii keep high empirical recall
-//! and are re-verified by exact variant-max scoring downstream.
+//! and are re-verified by exact cross-variant scoring downstream.
 //!
-//! Memory ≈ 40 bytes/image/index (u64 key + 8×u32 table refs) — ~4 GB per
-//! 100M-image index. For sharding beyond that, run one index per project or
-//! key-prefix.
+//! Memory ≈ 44 B per indexed key (u64 key + u32 owner + 8×u32 table refs);
+//! 8 keys/image/algorithm ⇒ ~350 B/image per algorithm index, i.e. ~35 GB
+//! per 100M-image index — shard by project or key-prefix beyond that.
+//! `canonical_rot64` remains as a single-key fast path for exact
+//! rotation/flip duplicates of ahash-style equivariant hashes.
 
 use std::collections::HashMap;
 
@@ -123,32 +127,38 @@ pub struct DedupKeys {
     pub variant_keys: Vec<Vec<u64>>,
 }
 
-/// Emit candidate image-index pairs that at least `min_votes` gate hashes
-/// flag within `radius` bits on ANY variant pair. Returns (i, j), i < j.
+/// Emit candidate image-index pairs flagged within `radius` bits by at
+/// least `min_votes` DISTINCT gate algorithms (one vote per algorithm,
+/// regardless of how many variant keys matched). Returns (i, j), i < j.
 pub fn dedup_candidates(entries: &[DedupKeys], radius: u32, min_votes: u32) -> Vec<(u32, u32)> {
     if entries.is_empty() || entries[0].variant_keys.is_empty() {
         return Vec::new();
     }
     let m = entries[0].variant_keys.len();
     let mut indexes: Vec<MihIndex> = (0..m).map(|_| MihIndex::new()).collect();
-    let mut votes: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let mut seen: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
     for (i, e) in entries.iter().enumerate() {
+        // algo bitmask per other-image: a match under algo a sets bit a
         let mut hit: HashMap<u32, u32> = HashMap::new();
         for (a, idx) in indexes.iter_mut().enumerate() {
-            for &key in &e.variant_keys[a] {
+            let mut uniq: Vec<u64> = e.variant_keys[a].clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            for key in uniq {
                 for j in idx.insert_query(key, i as u32, radius) {
                     if j != i as u32 {
-                        *hit.entry(j).or_insert(0) += 1;
+                        *hit.entry(j).or_insert(0) |= 1 << a;
                     }
                 }
             }
         }
         let i = i as u32;
-        for (j, v) in hit {
-            if v >= min_votes {
-                votes.insert((j.min(i), j.max(i)), v);
+        for (j, mask) in hit {
+            if mask.count_ones() >= min_votes && seen.insert((j.min(i), j.max(i))) {
+                out.push((j.min(i), j.max(i)));
             }
         }
     }
-    votes.into_keys().collect()
+    out
 }

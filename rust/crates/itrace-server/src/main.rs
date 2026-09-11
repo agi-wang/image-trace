@@ -221,32 +221,52 @@ fn validate_algorithm(a: &str) -> ApiResult<()> {
     }
 }
 
-/// Spawn background feature precomputation for one image.
+/// Spawn background feature precomputation for one image already decoded
+/// (the bytes were just written by the upload path — no second read/decode).
+fn enqueue_precompute_decoded(state: &AppState, image_id: i64, img: image::DynamicImage) {
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || {
+        run_precompute(&store, image_id, || Ok(img))
+    });
+}
+
+/// Spawn background feature precomputation reading the blob back
+/// (recompute path for images whose decode happened before upload-time).
 fn enqueue_precompute(state: &AppState, image_id: i64, key: String) {
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = store.set_feature_status(image_id, "computing") {
-            tracing::warn!("status update failed: {e}");
-            return;
-        }
-        let res = (|| -> anyhow::Result<()> {
-            let img = core::image_io::decode(&store.read_file(&key)?)?;
-            let rows = core::features::compute_all_variants(&img);
-            for (variant, name, bytes, dims) in rows {
-                store.put_feature(image_id, variant, &name, &bytes, dims)?;
-            }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => {
-                let _ = store.set_feature_status(image_id, "ready");
-            }
-            Err(e) => {
-                tracing::warn!("precompute failed for image {image_id}: {e:#}");
-                let _ = store.set_feature_status(image_id, "pending");
-            }
-        }
+        run_precompute(&store, image_id, || {
+            core::image_io::decode(&store.read_file(&key)?)
+        })
     });
+}
+
+fn run_precompute(
+    store: &Arc<itrace_store::Store>,
+    image_id: i64,
+    get_img: impl FnOnce() -> anyhow::Result<image::DynamicImage>,
+) {
+    if let Err(e) = store.set_feature_status(image_id, "computing") {
+        tracing::warn!("status update failed: {e}");
+        return;
+    }
+    let res = (|| -> anyhow::Result<()> {
+        let img = get_img()?;
+        let rows = core::features::compute_all_variants(&img);
+        for (variant, name, bytes, dims) in rows {
+            store.put_feature(image_id, variant, &name, &bytes, dims)?;
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            let _ = store.set_feature_status(image_id, "ready");
+        }
+        Err(e) => {
+            tracing::warn!("precompute failed for image {image_id}: {e:#}");
+            let _ = store.set_feature_status(image_id, "pending");
+        }
+    }
 }
 
 fn sanitize_filename(name: &str) -> ApiResult<String> {
@@ -645,11 +665,18 @@ async fn slice_match(
     Ok(Json(result))
 }
 
+/// Blob prefixes a client may download — anything else (e.g. the SQLite DB
+/// file under the fs backend) is off-limits.
+const DOWNLOAD_PREFIXES: &[&str] = &["uploads/", "extracted/", "thumbnails/", "visualizations/"];
+
 async fn download_file(
     State(s): State<AppState>,
     Path(path): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let rel = path.strip_prefix("data/").unwrap_or(&path);
+    if !DOWNLOAD_PREFIXES.iter().any(|p| rel.starts_with(p)) {
+        return Err(ApiError::not_found("文件不存在"));
+    }
     let bytes = s
         .store
         .read_file(rel)

@@ -31,6 +31,11 @@ pub fn hash_of(h: &HashSet, algo: &str) -> Option<u64> {
     }
 }
 
+/// BLAKE3 hex digest of file bytes.
+pub fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
 /// Convert hash to hex string (DB storage, compatible with old format).
 pub fn to_hex(h: u64) -> String {
     format!("{h:016x}")
@@ -275,18 +280,24 @@ pub fn compute_image_features(
 pub fn compute_image_features_bytes(
     bytes: &[u8],
 ) -> anyhow::Result<crate::ImageFeatures> {
-    let file_hash = blake3::hash(bytes).to_hex().to_string();
-    let file_size = bytes.len() as u64;
     let img = image_io::decode(bytes)?;
-    let (width, height) = image::GenericImageView::dimensions(&img);
-    let gray = image_io::to_gray(&img);
-    let rgb = image_io::to_rgb(&img);
+    Ok(compute_image_features_decoded(
+        &img,
+        blake3::hash(bytes).to_hex().to_string(),
+        bytes.len() as u64,
+    ))
+}
+
+/// Hashes + metadata for an already-decoded image (avoids a second decode
+/// when the caller already holds the image, e.g. the upload path).
+pub fn compute_image_features_decoded(
+    img: &image::DynamicImage,
+    file_hash: String,
+    file_size: u64,
+) -> crate::ImageFeatures {
+    let (width, height) = image::GenericImageView::dimensions(img);
+    let gray = image_io::to_gray(img);
+    let rgb = image_io::to_rgb(img);
     let hashes = compute_all(&gray, &rgb);
-    Ok(crate::ImageFeatures {
-        file_hash,
-        file_size,
-        width,
-        height,
-        hashes,
-    })
+    crate::ImageFeatures { file_hash, file_size, width, height, hashes }
 }

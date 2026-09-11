@@ -13,7 +13,7 @@ use itrace_core::{documents, hashes, image_io, index, slice};
 use itrace_core::{HASH_GATE_ALGOS, SMART_ALGOS};
 use itrace_store::{ImageRecord, NewImage, NewRun, Project, Store};
 
-use crate::{enqueue_precompute, unique_key, ApiError, ApiResult, AppState};
+use crate::{enqueue_precompute_decoded, unique_key, ApiError, ApiResult, AppState};
 
 // ---------- upload ----------
 
@@ -29,8 +29,10 @@ pub fn handle_upload(
     let file_size = data.len() as i64;
 
     if image_io::is_supported_image(filename) {
-        let rec = insert_one_image(store, project_id, &rel, filename, None)?;
-        enqueue_precompute(state, rec.id, rel.clone());
+        let img = image_io::decode(&data)
+            .map_err(|e| ApiError::unprocessable(format!("图片解码失败: {e:#}")))?;
+        let rec = insert_one_image(store, project_id, &rel, filename, None, &data, &img)?;
+        enqueue_precompute_decoded(state, rec.id, img);
         return Ok(json!({
             "project_id": project_id, "filename": filename, "file_path": rel,
             "file_size": file_size, "file_type": "image",
@@ -46,12 +48,13 @@ pub fn handle_upload(
         let extracted = documents::extract_named(filename, &data)
             .map_err(|e| ApiError::unprocessable(format!("文档解析失败: {e:#}")))?;
         let mut processed = Vec::new();
-        for img in extracted {
-            let key = unique_key(store, "extracted", &img.filename);
-            store.write_file(&key, &img.data)?;
-            match insert_one_image(store, project_id, &key, &img.filename, Some(&rel)) {
+        for ex in extracted {
+            let Ok(img) = image_io::decode(&ex.data) else { continue };
+            let key = unique_key(store, "extracted", &ex.filename);
+            store.write_file(&key, &ex.data)?;
+            match insert_one_image(store, project_id, &key, &ex.filename, Some(&rel), &ex.data, &img) {
                 Ok(rec) => {
-                    enqueue_precompute(state, rec.id, key.clone());
+                    enqueue_precompute_decoded(state, rec.id, img);
                     processed.push(json!({
                         "id": rec.id, "filename": rec.filename,
                         "file_path": rec.file_path, "type": "extracted_from_document"
@@ -77,8 +80,14 @@ fn insert_one_image(
     key: &str,
     filename: &str,
     extracted_from: Option<&str>,
+    raw: &[u8],
+    img: &image::DynamicImage,
 ) -> anyhow::Result<ImageRecord> {
-    let feats = hashes::compute_image_features_bytes(&store.read_file(key)?)?;
+    let feats = hashes::compute_image_features_decoded(
+        img,
+        hashes::blake3_hex(raw),
+        raw.len() as u64,
+    );
     store.insert_image(&NewImage {
         project_id,
         filename: filename.to_string(),
@@ -98,20 +107,32 @@ fn insert_one_image(
 
 // ---------- compare ----------
 
+/// Decode every image once for the precise path. Returns (kept index into
+/// `images`, Prepared) pairs — callers must map result indexes through
+/// `kept` because undecodable images are dropped.
 fn load_prepared(
     store: &Store,
     images: &[ImageRecord],
     algo: &str,
     rot_inv: bool,
-) -> Vec<Prepared> {
+) -> (Vec<usize>, Vec<Prepared>) {
     let desc_algos = compare::desc_algos_for(algo);
+    let mut kept = Vec::new();
+    let mut prepared = Vec::new();
     images
         .par_iter()
-        .filter_map(|img| {
+        .enumerate()
+        .filter_map(|(i, img)| {
             let bytes = store.read_file(&img.file_path).ok()?;
-            Prepared::from_bytes(&bytes, &desc_algos, rot_inv).ok()
+            Prepared::from_bytes(&bytes, &desc_algos, rot_inv).ok().map(|p| (i, p))
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .for_each(|(i, p)| {
+            kept.push(i);
+            prepared.push(p);
+        });
+    (kept, prepared)
 }
 
 /// Precise per-pair analysis (with pair_cache short-circuit for hash algos).
@@ -129,9 +150,7 @@ pub fn run_compare(
             "groups": [], "unique_images": [], "run_id": null
         }));
     }
-    let prepared = load_prepared(store, images, algo, rot_inv);
-    // map prepared order back to records by resolving paths
-    let ids: Vec<i64> = images.iter().map(|i| i.id).collect();
+    let (kept, prepared) = load_prepared(store, images, algo, rot_inv);
     let (groups, ungrouped, matrix) = compare::analyze(&prepared, algo, threshold, rot_inv);
 
     // group avg similarity
@@ -149,10 +168,11 @@ pub fn run_compare(
         group_json.push(json!({
             "group_id": group_json.len() + 1,
             "similarity_score": (avg * 10000.0).round() / 10000.0,
-            "images": members.iter().map(|&m| image_json(&images[m])).collect::<Vec<_>>(),
+            "images": members.iter().map(|&m| image_json(&images[kept[m]])).collect::<Vec<_>>(),
         }));
     }
-    let unique: Vec<Value> = ungrouped.iter().map(|&i| image_json(&images[i])).collect();
+    let unique: Vec<Value> =
+        ungrouped.iter().map(|&i| image_json(&images[kept[i]])).collect();
 
     let mut result = json!({
         "project_id": images[0].project_id,
@@ -171,7 +191,6 @@ pub fn run_compare(
         summary: Some(result.to_string()),
     })?;
     result["run_id"] = json!(run_id);
-    let _ = ids;
     Ok(result)
 }
 
@@ -461,11 +480,14 @@ pub fn pairwise_matrix(
         }
     }
 
-    // fallback: precise path on decoded images
-    let prepared = load_prepared(store, images, algo, rot_inv);
+    // fallback: precise path on decoded images; kept[] maps matrix indexes
+    // back to `images` (undecodable files are dropped)
+    let (kept, prepared) = load_prepared(store, images, algo, rot_inv);
     let m = compare::pairwise_matrix(&prepared, algo, rot_inv);
+    let kept_names: Vec<&str> = kept.iter().map(|&k| images[k].filename.as_str()).collect();
+    let kept_ids: Vec<i64> = kept.iter().map(|&k| images[k].id).collect();
     Ok(json!({
-        "names": names, "image_ids": ids, "matrix": m,
+        "names": kept_names, "image_ids": kept_ids, "matrix": m,
         "algorithm": algo, "engine": "precise"
     }))
 }
