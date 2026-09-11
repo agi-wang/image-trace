@@ -15,7 +15,7 @@
     "width": 256,
     "height": 256,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:43.756Z"
+    "created_at": "2026-09-11T22:45:08.995Z"
   },
   {
     "id": 2,
@@ -33,7 +33,7 @@
     "width": 256,
     "height": 256,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:43.791Z"
+    "created_at": "2026-09-11T22:45:09.031Z"
   },
   {
     "id": 3,
@@ -51,7 +51,7 @@
     "width": 256,
     "height": 256,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:43.813Z"
+    "created_at": "2026-09-11T22:45:09.053Z"
   },
   {
     "id": 4,
@@ -69,10 +69,46 @@
     "width": 179,
     "height": 179,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:43.835Z"
+    "created_at": "2026-09-11T22:45:09.073Z"
   },
   {
     "id": 5,
+    "project_id": 1,
+    "filename": "sem_synth_1__slice_r0c0.png",
+    "file_path": "uploads/sem_synth_1__slice_r0c0.png",
+    "file_hash": "1d1ae56d17d2e0364ae36697c48761154ed689e88ea3d8ed428c4f37e7aa65da",
+    "phash": "7fa694a8b2829d93",
+    "dhash": "8229b852a55629a4",
+    "ahash": "7ebd5ebbf3f3b75e",
+    "whash": "1f1505ca21e3976f",
+    "colorhash": "0000000000000000",
+    "extracted_from": null,
+    "file_size": 7692,
+    "width": 128,
+    "height": 128,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:09.089Z"
+  },
+  {
+    "id": 6,
+    "project_id": 1,
+    "filename": "sem_synth_1__slice_r1c1.png",
+    "file_path": "uploads/sem_synth_1__slice_r1c1.png",
+    "file_hash": "80a7bbe8688dd6a154a46efdfe883a0acb6d77a952552f7c689eb946502409f9",
+    "phash": "7382d28d3332de99",
+    "dhash": "36303472b5763130",
+    "ahash": "18181eff71181c18",
+    "whash": "129f82c24fc9fa4d",
+    "colorhash": "0000000000000000",
+    "extracted_from": null,
+    "file_size": 8668,
+    "width": 128,
+    "height": 128,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:09.101Z"
+  },
+  {
+    "id": 7,
     "project_id": 1,
     "filename": "sem_pollen_wiki__orig.png",
     "file_path": "uploads/sem_pollen_wiki__orig.png",
@@ -87,10 +123,10 @@
     "width": 1280,
     "height": 975,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:43.890Z"
+    "created_at": "2026-09-11T22:45:09.152Z"
   },
   {
-    "id": 6,
+    "id": 8,
     "project_id": 1,
     "filename": "sem_pollen_wiki__rot90.png",
     "file_path": "uploads/sem_pollen_wiki__rot90.png",
@@ -105,10 +141,10 @@
     "width": 975,
     "height": 1280,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.011Z"
+    "created_at": "2026-09-11T22:45:09.273Z"
   },
   {
-    "id": 7,
+    "id": 9,
     "project_id": 1,
     "filename": "sem_pollen_wiki__hflip.png",
     "file_path": "uploads/sem_pollen_wiki__hflip.png",
@@ -123,10 +159,10 @@
     "width": 1280,
     "height": 975,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.118Z"
+    "created_at": "2026-09-11T22:45:09.382Z"
   },
   {
-    "id": 8,
+    "id": 10,
     "project_id": 1,
     "filename": "sem_pollen_wiki__crop70.png",
     "file_path": "uploads/sem_pollen_wiki__crop70.png",
@@ -141,10 +177,46 @@
     "width": 896,
     "height": 682,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.205Z"
+    "created_at": "2026-09-11T22:45:09.469Z"
   },
   {
-    "id": 9,
+    "id": 11,
+    "project_id": 1,
+    "filename": "sem_pollen_wiki__slice_r0c0.png",
+    "file_path": "uploads/sem_pollen_wiki__slice_r0c0.png",
+    "file_hash": "85b2f17eb68357a1ee9962fc6f372b0184aeb04d111c38461cf64b7af4a72955",
+    "phash": "e9894a7858ee4a57",
+    "dhash": "b16f2a28381c3cc5",
+    "ahash": "d90783888e868720",
+    "whash": "215ea7947a4e6327",
+    "colorhash": "0000000000000000",
+    "extracted_from": null,
+    "file_size": 269771,
+    "width": 640,
+    "height": 488,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:09.550Z"
+  },
+  {
+    "id": 12,
+    "project_id": 1,
+    "filename": "sem_pollen_wiki__slice_r1c1.png",
+    "file_path": "uploads/sem_pollen_wiki__slice_r1c1.png",
+    "file_hash": "1ed118ad53d2d232448903864b5a5612a6c13eadd9203e0621603c74fb8866cd",
+    "phash": "b9a0a7b276d3680b",
+    "dhash": "643606c3c6c44428",
+    "ahash": "3f9f802173747088",
+    "whash": "6996be4b6430ad2d",
+    "colorhash": "0000000000000000",
+    "extracted_from": null,
+    "file_size": 275239,
+    "width": 640,
+    "height": 487,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:09.618Z"
+  },
+  {
+    "id": 13,
     "project_id": 1,
     "filename": "fluor_synth_1__orig.png",
     "file_path": "uploads/fluor_synth_1__orig.png",
@@ -159,10 +231,10 @@
     "width": 256,
     "height": 256,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.272Z"
+    "created_at": "2026-09-11T22:45:09.687Z"
   },
   {
-    "id": 10,
+    "id": 14,
     "project_id": 1,
     "filename": "fluor_synth_1__rot90.png",
     "file_path": "uploads/fluor_synth_1__rot90.png",
@@ -177,10 +249,10 @@
     "width": 256,
     "height": 256,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.289Z"
+    "created_at": "2026-09-11T22:45:09.707Z"
   },
   {
-    "id": 11,
+    "id": 15,
     "project_id": 1,
     "filename": "fluor_synth_1__hflip.png",
     "file_path": "uploads/fluor_synth_1__hflip.png",
@@ -195,10 +267,10 @@
     "width": 256,
     "height": 256,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.305Z"
+    "created_at": "2026-09-11T22:45:09.725Z"
   },
   {
-    "id": 12,
+    "id": 16,
     "project_id": 1,
     "filename": "fluor_synth_1__crop70.png",
     "file_path": "uploads/fluor_synth_1__crop70.png",
@@ -213,10 +285,46 @@
     "width": 179,
     "height": 179,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.320Z"
+    "created_at": "2026-09-11T22:45:09.756Z"
   },
   {
-    "id": 13,
+    "id": 17,
+    "project_id": 1,
+    "filename": "fluor_synth_1__slice_r0c0.png",
+    "file_path": "uploads/fluor_synth_1__slice_r0c0.png",
+    "file_hash": "1566a5280fcc0bde0821218eb7695e97c00952e344e22ab5c55f5b767ec3f3c3",
+    "phash": "8975c656897636c9",
+    "dhash": "c0c0c0c0c0400000",
+    "ahash": "3078f8f870000000",
+    "whash": "8e6060008b848a08",
+    "colorhash": "03003e0000000000",
+    "extracted_from": null,
+    "file_size": 3456,
+    "width": 128,
+    "height": 128,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:09.766Z"
+  },
+  {
+    "id": 18,
+    "project_id": 1,
+    "filename": "fluor_synth_1__slice_r1c1.png",
+    "file_path": "uploads/fluor_synth_1__slice_r1c1.png",
+    "file_hash": "ba0085a83dcc977a0072f59dd7f99717b92e3a7af69ab50c8202ceb1ee47b339",
+    "phash": "83076fc0c0817f7f",
+    "dhash": "000000031f3f7f78",
+    "ahash": "00000001030f1f1f",
+    "whash": "00117766051b777e",
+    "colorhash": "60607fe07be07de0",
+    "extracted_from": null,
+    "file_size": 4428,
+    "width": 128,
+    "height": 128,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:09.772Z"
+  },
+  {
+    "id": 19,
     "project_id": 1,
     "filename": "fluor_cells__orig.png",
     "file_path": "uploads/fluor_cells__orig.png",
@@ -231,10 +339,10 @@
     "width": 512,
     "height": 512,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.339Z"
+    "created_at": "2026-09-11T22:45:09.787Z"
   },
   {
-    "id": 14,
+    "id": 20,
     "project_id": 1,
     "filename": "fluor_cells__rot90.png",
     "file_path": "uploads/fluor_cells__rot90.png",
@@ -249,10 +357,10 @@
     "width": 512,
     "height": 512,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.406Z"
+    "created_at": "2026-09-11T22:45:09.852Z"
   },
   {
-    "id": 15,
+    "id": 21,
     "project_id": 1,
     "filename": "fluor_cells__hflip.png",
     "file_path": "uploads/fluor_cells__hflip.png",
@@ -267,10 +375,10 @@
     "width": 512,
     "height": 512,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.483Z"
+    "created_at": "2026-09-11T22:45:09.915Z"
   },
   {
-    "id": 16,
+    "id": 22,
     "project_id": 1,
     "filename": "fluor_cells__crop70.png",
     "file_path": "uploads/fluor_cells__crop70.png",
@@ -285,10 +393,46 @@
     "width": 358,
     "height": 358,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.561Z"
+    "created_at": "2026-09-11T22:45:09.973Z"
   },
   {
-    "id": 17,
+    "id": 23,
+    "project_id": 1,
+    "filename": "fluor_cells__slice_r0c0.png",
+    "file_path": "uploads/fluor_cells__slice_r0c0.png",
+    "file_hash": "1709226b4fa4aae46b53183cb1a2b50b7ff45906afaea18ecea26c26c0ad7363",
+    "phash": "9e6cf36448cd2713",
+    "dhash": "216062703836767c",
+    "ahash": "f0b838000e1f1f3f",
+    "whash": "46a1d5aa5c4f4b4e",
+    "colorhash": "87ffc7ff46780000",
+    "extracted_from": null,
+    "file_size": 74182,
+    "width": 256,
+    "height": 256,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:10.008Z"
+  },
+  {
+    "id": 24,
+    "project_id": 1,
+    "filename": "fluor_cells__slice_r1c1.png",
+    "file_path": "uploads/fluor_cells__slice_r1c1.png",
+    "file_hash": "5a8ccf23fdc80c753370e650ca6626ed6be1338f8fbafc6f3ead24cc4c8e5617",
+    "phash": "f8a00f1f1e0ca3eb",
+    "dhash": "030f7e7ffebcfcef",
+    "ahash": "000000071f1f3f7f",
+    "whash": "01174e110b76efbe",
+    "colorhash": "87ff07fe81ff0000",
+    "extracted_from": null,
+    "file_size": 69275,
+    "width": 256,
+    "height": 256,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:10.034Z"
+  },
+  {
+    "id": 25,
     "project_id": 1,
     "filename": "histo_synth_1__orig.png",
     "file_path": "uploads/histo_synth_1__orig.png",
@@ -303,10 +447,10 @@
     "width": 256,
     "height": 256,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.593Z"
+    "created_at": "2026-09-11T22:45:10.060Z"
   },
   {
-    "id": 18,
+    "id": 26,
     "project_id": 1,
     "filename": "histo_synth_1__rot90.png",
     "file_path": "uploads/histo_synth_1__rot90.png",
@@ -321,10 +465,10 @@
     "width": 256,
     "height": 256,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.619Z"
+    "created_at": "2026-09-11T22:45:10.084Z"
   },
   {
-    "id": 19,
+    "id": 27,
     "project_id": 1,
     "filename": "histo_synth_1__hflip.png",
     "file_path": "uploads/histo_synth_1__hflip.png",
@@ -339,10 +483,10 @@
     "width": 256,
     "height": 256,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.646Z"
+    "created_at": "2026-09-11T22:45:10.107Z"
   },
   {
-    "id": 20,
+    "id": 28,
     "project_id": 1,
     "filename": "histo_synth_1__crop70.png",
     "file_path": "uploads/histo_synth_1__crop70.png",
@@ -357,10 +501,46 @@
     "width": 179,
     "height": 179,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.670Z"
+    "created_at": "2026-09-11T22:45:10.140Z"
   },
   {
-    "id": 21,
+    "id": 29,
+    "project_id": 1,
+    "filename": "histo_synth_1__slice_r0c0.png",
+    "file_path": "uploads/histo_synth_1__slice_r0c0.png",
+    "file_hash": "c72e4d7e4a5fc5e4600c61395a8786892aeabf63aaff66af03e4af654fb58797",
+    "phash": "5332a064d7bb8e2d",
+    "dhash": "9888624cccc2c7c7",
+    "ahash": "ccffffe760707147",
+    "whash": "d720d5638d2f80fc",
+    "colorhash": "0000100080000000",
+    "extracted_from": null,
+    "file_size": 1838,
+    "width": 128,
+    "height": 128,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:10.155Z"
+  },
+  {
+    "id": 30,
+    "project_id": 1,
+    "filename": "histo_synth_1__slice_r1c1.png",
+    "file_path": "uploads/histo_synth_1__slice_r1c1.png",
+    "file_hash": "92ee25b50968a353b69805387546103826d1252eea5e2f0ed9b5e342172dfe86",
+    "phash": "ab09e41f48755f23",
+    "dhash": "121cccd038187454",
+    "ahash": "cbc4643f8fdfff3f",
+    "whash": "2ad78e20edae6323",
+    "colorhash": "0000100080000000",
+    "extracted_from": null,
+    "file_size": 1631,
+    "width": 128,
+    "height": 128,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:10.162Z"
+  },
+  {
+    "id": 31,
     "project_id": 1,
     "filename": "skimage_ihc__orig.png",
     "file_path": "uploads/skimage_ihc__orig.png",
@@ -375,10 +555,10 @@
     "width": 512,
     "height": 512,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.693Z"
+    "created_at": "2026-09-11T22:45:10.180Z"
   },
   {
-    "id": 22,
+    "id": 32,
     "project_id": 1,
     "filename": "skimage_ihc__rot90.png",
     "file_path": "uploads/skimage_ihc__rot90.png",
@@ -393,10 +573,10 @@
     "width": 512,
     "height": 512,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.770Z"
+    "created_at": "2026-09-11T22:45:10.254Z"
   },
   {
-    "id": 23,
+    "id": 33,
     "project_id": 1,
     "filename": "skimage_ihc__hflip.png",
     "file_path": "uploads/skimage_ihc__hflip.png",
@@ -411,10 +591,10 @@
     "width": 512,
     "height": 512,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.850Z"
+    "created_at": "2026-09-11T22:45:10.327Z"
   },
   {
-    "id": 24,
+    "id": 34,
     "project_id": 1,
     "filename": "skimage_ihc__crop70.png",
     "file_path": "uploads/skimage_ihc__crop70.png",
@@ -429,6 +609,42 @@
     "width": 358,
     "height": 358,
     "feature_status": "ready",
-    "created_at": "2026-09-11T18:07:44.914Z"
+    "created_at": "2026-09-11T22:45:10.397Z"
+  },
+  {
+    "id": 35,
+    "project_id": 1,
+    "filename": "skimage_ihc__slice_r0c0.png",
+    "file_path": "uploads/skimage_ihc__slice_r0c0.png",
+    "file_hash": "195ab3f9af240fcf4075811484550b9266540e5c3e6cddc530d47a45f1e191af",
+    "phash": "e391e631ccd38ac3",
+    "dhash": "380d87179fe6e664",
+    "ahash": "dfe7c1c000303216",
+    "whash": "b00ae76a643ba4ee",
+    "colorhash": "000300038003ffff",
+    "extracted_from": null,
+    "file_size": 122350,
+    "width": 256,
+    "height": 256,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:10.438Z"
+  },
+  {
+    "id": 36,
+    "project_id": 1,
+    "filename": "skimage_ihc__slice_r1c1.png",
+    "file_path": "uploads/skimage_ihc__slice_r1c1.png",
+    "file_hash": "e09eea17ccae3d499ffd10b6d968cd955b52a62b073d9f1219434ef74168c28b",
+    "phash": "dc446c06e43727bd",
+    "dhash": "a3c3c1c541a1999d",
+    "ahash": "f1f1f0f0f0f8ffc7",
+    "whash": "bc40df30d2955fb0",
+    "colorhash": "000300030607ffff",
+    "extracted_from": null,
+    "file_size": 114020,
+    "width": 256,
+    "height": 256,
+    "feature_status": "ready",
+    "created_at": "2026-09-11T22:45:10.460Z"
   }
 ]

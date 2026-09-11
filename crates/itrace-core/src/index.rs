@@ -60,6 +60,17 @@
 //! and the sorted image_id set vs current ready entries; any mismatch rebuilds
 //! and overwrites. Feature-blob changes for an unchanged image set are not
 //! detected — delete the project dir to force a rebuild.
+//!
+//! # Crop/slice recall channel (`project_{id}_crop/`)
+//!
+//! Whole-image gate hashes cannot recall crops/slices (they move too many
+//! bits). The crop channel indexes each image's `crophash_keys` windowed
+//! phashes — all window slots × orientation variants flattened into one key
+//! set — in a single `ShardedMihIndex`, and emits pairs with `min_hits`
+//! distinct probe-key hits. Candidates are verified by NCC containment
+//! (`slice::contains_rot4`), so a loose recall radius is safe. The bundle
+//! lives in its own `project_{id}_crop/` directory (`ITMIHC1` meta +
+//! `image_ids.bin` + `index/`) with the same invalidation rules.
 
 use std::collections::HashMap;
 
@@ -495,6 +506,18 @@ fn owner_plan(entries: &[DedupKeys]) -> (Vec<i64>, Vec<u32>) {
     (image_ids, owner_for_entry)
 }
 
+/// `owner_plan` for the crop channel's [`CropKeys`].
+fn owner_plan_crop(entries: &[CropKeys]) -> (Vec<i64>, Vec<u32>) {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_unstable_by_key(|&i| entries[i].image_id);
+    let image_ids: Vec<i64> = order.iter().map(|&i| entries[i].image_id).collect();
+    let mut owner_for_entry = vec![0u32; entries.len()];
+    for (owner, &ei) in order.iter().enumerate() {
+        owner_for_entry[ei] = owner as u32;
+    }
+    (image_ids, owner_for_entry)
+}
+
 fn write_image_ids_bin(path: &std::path::Path, image_ids: &[i64]) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::File::create(path)?;
@@ -533,15 +556,14 @@ fn read_image_ids_bin(path: &std::path::Path, expected: usize) -> std::io::Resul
     Ok(out)
 }
 
-fn image_id_sets_equal(persisted: &[i64], entries: &[DedupKeys]) -> bool {
-    if persisted.len() != entries.len() {
+fn image_id_sets_equal(persisted: &[i64], mut current: Vec<i64>) -> bool {
+    if persisted.len() != current.len() {
         return false;
     }
     let mut a: Vec<i64> = persisted.to_vec();
-    let mut b: Vec<i64> = entries.iter().map(|e| e.image_id).collect();
     a.sort_unstable();
-    b.sort_unstable();
-    a == b
+    current.sort_unstable();
+    a == current
 }
 
 fn build_sharded_indexes(
@@ -653,7 +675,7 @@ pub fn try_load_project_gate_index(
         Ok(ids) => ids,
         Err(_) => return Ok(None),
     };
-    if !image_id_sets_equal(&image_ids, entries) {
+    if !image_id_sets_equal(&image_ids, entries.iter().map(|e| e.image_id).collect()) {
         return Ok(None);
     }
     let indexes_dir = dir.join("indexes");
@@ -973,6 +995,249 @@ pub fn dedup_confirmed_cached(
     Ok((pairs.len(), confirmed, loaded))
 }
 
+// ---------- crop/slice recall channel ----------
+//
+// The gate channel indexes whole-image hashes: a crop or slice tile moves
+// too many bits to ever be recalled. The crop channel indexes the
+// `crophash_keys` windowed-phash payloads instead — every image contributes
+// all of its window keys (slots × orientation variants, deduplicated) to a
+// single sharded index, and a pair is emitted when at least `min_hits` of
+// the query image's distinct probe keys return the other owner. Candidates
+// are verified downstream by NCC containment (`slice::contains_rot4`), not
+// by the hash keys themselves.
+
+/// One image's flattened crop-recall key set (window slots × variants).
+#[derive(Clone)]
+pub struct CropKeys {
+    pub image_id: i64,
+    pub keys: Vec<u64>,
+}
+
+/// Default minimum number of distinct probe-key hits needed to emit a
+/// crop-channel candidate pair. Env override: `ITRACE_CROP_MIN_HITS`.
+pub const DEFAULT_CROP_MIN_HITS: u32 = 2;
+
+/// Resolve the crop-channel minimum distinct-key hits.
+/// Precedence: `override_hits` > env `ITRACE_CROP_MIN_HITS` >
+/// [`DEFAULT_CROP_MIN_HITS`]; clamped to ≥1.
+pub fn resolve_crop_min_hits(override_hits: Option<u32>) -> u32 {
+    let raw = override_hits.or_else(|| {
+        std::env::var("ITRACE_CROP_MIN_HITS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+    });
+    raw.unwrap_or(DEFAULT_CROP_MIN_HITS).max(1)
+}
+
+/// `{base}/project_{id}_crop` — the crop channel's own bundle root, kept
+/// separate from the gate bundle so each invalidates independently.
+pub fn project_crop_mih_index_path(
+    base: &std::path::Path,
+    project_id: i64,
+) -> std::path::PathBuf {
+    base.join(format!("project_{project_id}_crop"))
+}
+
+/// Candidate pairs from a pre-built crop index. `hits` counts an owner at
+/// most once per probe key (owners are deduped inside `query_into`), so
+/// `min_hits` counts independent key matches, not repeats of one key.
+pub fn crop_candidates_with_index(
+    entries: &[CropKeys],
+    idx: &ShardedMihIndex,
+    image_ids: &[i64],
+    radius: u32,
+    min_hits: u32,
+) -> Vec<(u32, u32)> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    // owner slot → entry index in the caller's `entries` slice
+    let id_to_entry: HashMap<i64, u32> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.image_id, i as u32))
+        .collect();
+    let entry_of_owner: Vec<Option<u32>> = image_ids
+        .iter()
+        .map(|id| id_to_entry.get(id).copied())
+        .collect();
+
+    let mut out: Vec<(u32, u32)> = entries
+        .par_iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            let i = i as u32;
+            let mut hit_count: HashMap<u32, u32, std::hash::BuildHasherDefault<VoteHasher>> =
+                HashMap::default();
+            let mut uniq: Vec<u64> = e.keys.clone();
+            uniq.sort_unstable();
+            uniq.dedup();
+            let mut hits: Vec<u32> = Vec::new();
+            for &key in &uniq {
+                idx.query_into(key, radius, &mut hits);
+                for &owner in &hits {
+                    if let Some(Some(j)) = entry_of_owner.get(owner as usize) {
+                        if *j != i {
+                            *hit_count.entry(*j).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            hit_count
+                .into_iter()
+                .filter(|(_, c)| *c >= min_hits)
+                .map(|(j, _)| (j.min(i), j.max(i)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// In-memory sibling of [`crop_candidates_with_index`]: builds a sharded
+/// index over `entries` and queries it.
+pub fn crop_candidates(
+    entries: &[CropKeys],
+    radius: u32,
+    min_hits: u32,
+    shard_bits: u32,
+) -> Vec<(u32, u32)> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let (image_ids, owner_for_entry) = owner_plan_crop(entries);
+    let idx = build_crop_index(entries, shard_bits, &owner_for_entry);
+    crop_candidates_with_index(entries, &idx, &image_ids, radius, min_hits)
+}
+
+fn build_crop_index(
+    entries: &[CropKeys],
+    shard_bits: u32,
+    owner_for_entry: &[u32],
+) -> ShardedMihIndex {
+    let mut idx = ShardedMihIndex::new(shard_bits);
+    let mut uniq: Vec<u64> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        uniq.clear();
+        uniq.extend_from_slice(&e.keys);
+        uniq.sort_unstable();
+        uniq.dedup();
+        let owner = owner_for_entry[i];
+        for &key in &uniq {
+            idx.insert(key, owner);
+        }
+    }
+    idx
+}
+
+const CROP_MIH_MAGIC: &str = "ITMIHC1";
+
+fn save_crop_index(
+    dir: &std::path::Path,
+    idx: &ShardedMihIndex,
+    image_ids: &[i64],
+    shard_bits: u32,
+) -> std::io::Result<()> {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    let meta = serde_json::json!({
+        "magic": CROP_MIH_MAGIC,
+        "version": PROJECT_MIH_VERSION,
+        "shard_bits": shard_bits,
+        "image_count": image_ids.len(),
+        "key_count": idx.len(),
+    });
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_vec_pretty(&meta).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?,
+    )?;
+    write_image_ids_bin(&dir.join("image_ids.bin"), image_ids)?;
+    idx.save_dir(&dir.join("index"))
+}
+
+fn try_load_crop_index(
+    dir: &std::path::Path,
+    entries: &[CropKeys],
+    shard_bits: u32,
+) -> std::io::Result<Option<(ShardedMihIndex, Vec<i64>)>> {
+    let meta_path = dir.join("meta.json");
+    if entries.is_empty() || !meta_path.is_file() {
+        return Ok(None);
+    }
+    let meta_bytes = std::fs::read(&meta_path)?;
+    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if meta.get("magic").and_then(|v| v.as_str()) != Some(CROP_MIH_MAGIC)
+        || meta.get("version").and_then(|v| v.as_u64()) != Some(PROJECT_MIH_VERSION)
+        || meta.get("shard_bits").and_then(|v| v.as_u64()) != Some(shard_bits as u64)
+    {
+        return Ok(None);
+    }
+    let image_count = meta
+        .get("image_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let image_ids = match read_image_ids_bin(&dir.join("image_ids.bin"), image_count) {
+        Ok(ids) => ids,
+        Err(_) => return Ok(None),
+    };
+    if !image_id_sets_equal(&image_ids, entries.iter().map(|e| e.image_id).collect()) {
+        return Ok(None);
+    }
+    let idx = match ShardedMihIndex::load_dir(&dir.join("index")) {
+        Ok(i) => i,
+        Err(_) => return Ok(None),
+    };
+    if idx.shard_bits() != shard_bits {
+        return Ok(None);
+    }
+    Ok(Some((idx, image_ids)))
+}
+
+/// Load a compatible crop bundle or build+save one (see
+/// [`load_or_build_project_gate_index`] — same contract, crop layout).
+pub fn load_or_build_crop_index(
+    dir: &std::path::Path,
+    entries: &[CropKeys],
+    shard_bits: u32,
+) -> std::io::Result<(ShardedMihIndex, Vec<i64>, bool)> {
+    if let Some((idx, image_ids)) = try_load_crop_index(dir, entries, shard_bits)? {
+        return Ok((idx, image_ids, true));
+    }
+    let (image_ids, owner_for_entry) = owner_plan_crop(entries);
+    let idx = build_crop_index(entries, shard_bits, &owner_for_entry);
+    save_crop_index(dir, &idx, &image_ids, shard_bits)?;
+    Ok((idx, image_ids, false))
+}
+
+/// Like [`crop_candidates`] but load-or-builds a persistent bundle under
+/// `dir` when given (`{ITRACE_MIH_INDEX_DIR}/project_{id}_crop/`).
+/// Returns `(pairs, index_loaded)`.
+pub fn crop_candidates_cached(
+    entries: &[CropKeys],
+    radius: u32,
+    min_hits: u32,
+    shard_bits: u32,
+    dir: Option<&std::path::Path>,
+) -> std::io::Result<(Vec<(u32, u32)>, bool)> {
+    let Some(dir) = dir else {
+        return Ok((crop_candidates(entries, radius, min_hits, shard_bits), false));
+    };
+    if entries.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let (idx, image_ids, loaded) = load_or_build_crop_index(dir, entries, shard_bits)?;
+    Ok((
+        crop_candidates_with_index(entries, &idx, &image_ids, radius, min_hits),
+        loaded,
+    ))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1278,5 +1543,73 @@ mod tests {
     fn project_mih_index_path_layout() {
         let p = project_mih_index_path(std::path::Path::new("/tmp/mih"), 42);
         assert_eq!(p, std::path::PathBuf::from("/tmp/mih/project_42"));
+        let c = project_crop_mih_index_path(std::path::Path::new("/tmp/mih"), 42);
+        assert_eq!(c, std::path::PathBuf::from("/tmp/mih/project_42_crop"));
+    }
+
+    /// Crop channel: pairs are emitted on `min_hits` distinct probe-key
+    /// hits (a hit counts an owner once per probe), not per-algo votes.
+    #[test]
+    fn crop_candidates_hit_counting() {
+        let mut rng = 0xBADC0FFEE_u64;
+        // 30 images with 16 random window keys each.
+        let mut entries: Vec<CropKeys> = (0..30i64)
+            .map(|image_id| CropKeys {
+                image_id,
+                keys: (0..16).map(|_| xorshift(&mut rng)).collect(),
+            })
+            .collect();
+        // entry 1 is a "crop" of entry 0: 3 keys within radius 4.
+        for k in 0..3 {
+            entries[1].keys[k] = entries[0].keys[k] ^ 0x5;
+        }
+        // entry 2 shares exactly one near key with entry 0.
+        entries[2].keys[0] = entries[0].keys[0] ^ 0x3;
+
+        let pairs1 = crop_candidates(&entries, 4, 1, 0);
+        assert!(pairs1.contains(&(0, 1)));
+        assert!(pairs1.contains(&(0, 2)));
+        let pairs2 = crop_candidates(&entries, 4, 2, 0);
+        assert!(pairs2.contains(&(0, 1)));
+        assert!(!pairs2.contains(&(0, 2)), "single hit must not emit");
+        // sharded parity
+        let pairs_s = crop_candidates(&entries, 4, 2, 6);
+        assert_eq!(pairs2, pairs_s);
+    }
+
+    #[test]
+    fn crop_index_save_load_roundtrip() {
+        let mut rng = 0xFEED_FACE_u64;
+        let entries: Vec<CropKeys> = (0..25i64)
+            .map(|image_id| CropKeys {
+                image_id: image_id + 7, // non-dense
+                keys: (0..12).map(|_| xorshift(&mut rng)).collect(),
+            })
+            .collect();
+        let dir = std::env::temp_dir().join(format!(
+            "itrace-mih-crop-{}-{}",
+            std::process::id(),
+            xorshift(&mut rng)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let expected = crop_candidates(&entries, 5, 1, 4);
+        let (p1, loaded1) = crop_candidates_cached(&entries, 5, 1, 4, Some(&dir)).expect("build");
+        assert!(!loaded1);
+        assert_eq!(p1, expected);
+        let (p2, loaded2) = crop_candidates_cached(&entries, 5, 1, 4, Some(&dir)).expect("load");
+        assert!(loaded2);
+        assert_eq!(p1, p2);
+        assert!(dir.join("index/meta.json").is_file());
+
+        // different image set → invalidate → rebuild
+        let mut changed = entries.clone();
+        changed[0].image_id = 4242;
+        let (p3, loaded3) =
+            crop_candidates_cached(&changed, 5, 1, 4, Some(&dir)).expect("rebuild");
+        assert!(!loaded3);
+        assert_eq!(p3, crop_candidates(&changed, 5, 1, 4));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

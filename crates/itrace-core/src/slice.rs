@@ -12,14 +12,27 @@ use crate::{image_io, GrayImage};
 
 const MAX_SIDE: u32 = 384;
 
-/// Borrow `g` when already ≤ `max_side`; owned downscale otherwise.
-/// (`resize_gray_max` clones the buffer even on a no-op.)
-fn fit_max(g: &GrayImage, max_side: u32) -> Cow<'_, GrayImage> {
-    if g.width.max(g.height) <= max_side {
-        Cow::Borrowed(g)
-    } else {
-        Cow::Owned(image_io::resize_gray_max(g, max_side))
+/// Downscale `a` and `b` by one shared factor so the larger fits
+/// `max_side`. Independent `fit_max` calls would break containment
+/// geometry: a >max_side crop and its >max_side parent would both scale
+/// to the same size, making the "smaller" image impossible to locate
+/// inside the other. A shared factor preserves relative extents.
+fn fit_pair<'a>(
+    a: &'a GrayImage,
+    b: &'a GrayImage,
+    max_side: u32,
+) -> (Cow<'a, GrayImage>, Cow<'a, GrayImage>) {
+    let m = a.width.max(a.height).max(b.width).max(b.height);
+    if m <= max_side {
+        return (Cow::Borrowed(a), Cow::Borrowed(b));
     }
+    let s = max_side as f64 / m as f64;
+    let rs = |g: &GrayImage| {
+        let w = ((g.width as f64) * s).round().max(1.0) as u32;
+        let h = ((g.height as f64) * s).round().max(1.0) as u32;
+        image_io::resize_gray_exact(g, w, h)
+    };
+    (Cow::Owned(rs(a)), Cow::Owned(rs(b)))
 }
 
 /// Result for one slice cell.
@@ -99,8 +112,9 @@ fn rotate_cell(cell: &GrayImage, ri: u32) -> GrayImage {
 /// A cell's rotation loop stops early on a perfect 1.0 match: NCC cannot
 /// exceed 1, so remaining rotations cannot change the recorded best.
 pub fn slice_match(a: &GrayImage, b: &GrayImage, rows: u32, cols: u32, threshold: f64) -> SliceMatchResult {
-    let a_small = fit_max(a, MAX_SIDE);
-    let b_small = fit_max(b, MAX_SIDE);
+    // Shared downscale: B's cells must stay proportional to their true
+    // extent inside A (see `fit_pair`).
+    let (a_small, b_small) = fit_pair(a, b, MAX_SIDE);
     let cells = grid_cells(&b_small, rows, cols);
 
     let results: Vec<SliceCell> = cells
@@ -168,8 +182,7 @@ pub fn slice_match(a: &GrayImage, b: &GrayImage, rows: u32, cols: u32, threshold
 /// parallel. Return semantics are unchanged: a ≥0.8 b-in-a score short-circuits,
 /// otherwise the a-in-b result (or none) decides.
 pub fn contains(a: &GrayImage, b: &GrayImage) -> (f64, bool) {
-    let a_s = fit_max(a, MAX_SIDE);
-    let b_s = fit_max(b, MAX_SIDE);
+    let (a_s, b_s) = fit_pair(a, b, MAX_SIDE);
     // `fwd` = score of b inside a, `rev` = score of a inside b; each is `None`
     // when the inner image cannot fit inside the outer one.
     let (fwd, rev) = rayon::join(
@@ -198,5 +211,89 @@ pub fn contains(a: &GrayImage, b: &GrayImage) -> (f64, bool) {
     match rev {
         Some(s) => (s, s >= 0.8),
         None => (0.0, false),
+    }
+}
+
+/// `contains` under all four relative quarter-turns: the best score over
+/// `b` rotated 0/90/180/270 (rotating one side covers every relative
+/// rotation, in both containment directions). Catches a crop/slice whose
+/// content was also rotated.
+pub fn contains_rot4(a: &GrayImage, b: &GrayImage) -> (f64, bool) {
+    let mut best = contains(a, b);
+    if best.1 {
+        return best;
+    }
+    let mut rb = b.clone();
+    for _ in 0..3 {
+        rb = rotate_cell(&rb, 1);
+        let s = contains(a, &rb);
+        if s.0 > best.0 {
+            best = s;
+        }
+        if best.1 {
+            return best;
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{DynamicImage, ImageBuffer, Luma};
+
+    /// Deterministic textured image larger than MAX_SIDE so the shared
+    /// downscale path in `contains`/`slice_match` is exercised.
+    fn big_textured(seed: u32, size: u32) -> GrayImage {
+        let mut st = seed | 1;
+        let mut rng = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            st
+        };
+        let cell = 16usize;
+        let gw = size as usize / cell + 2;
+        let noise: Vec<u8> = (0..gw * gw).map(|_| (rng() & 0xff) as u8).collect();
+        let mut buf = ImageBuffer::<Luma<u8>, Vec<u8>>::new(size, size);
+        for y in 0..size {
+            for x in 0..size {
+                let fx = x as f32 / cell as f32;
+                let fy = y as f32 / cell as f32;
+                let (ix, iy) = (fx.floor() as usize, fy.floor() as usize);
+                let (tx, ty) = (fx - ix as f32, fy - iy as f32);
+                let s = |xx: usize, yy: usize| noise[yy * gw + xx] as f32;
+                let v = s(ix, iy) * (1.0 - tx) * (1.0 - ty)
+                    + s(ix + 1, iy) * tx * (1.0 - ty)
+                    + s(ix, iy + 1) * tx * ty;
+                buf.put_pixel(x, y, Luma([v as u8]));
+            }
+        }
+        image_io::to_gray(&DynamicImage::ImageLuma8(buf))
+    }
+
+    #[test]
+    fn contains_crop_of_large_image() {
+        // Both parent and 70% crop exceed MAX_SIDE: a shared downscale
+        // must keep the crop findable inside the parent.
+        let img = big_textured(3, 640);
+        let (w, h) = (img.width, img.height);
+        let (cw, ch) = (w * 7 / 10, h * 7 / 10);
+        let (x0, y0) = ((w - cw) / 2, (h - ch) / 2);
+        let mut data = Vec::with_capacity((cw * ch) as usize);
+        for y in y0..y0 + ch {
+            data.extend_from_slice(
+                &img.data[(y * w + x0) as usize..(y * w + x0 + cw) as usize],
+            );
+        }
+        let crop = GrayImage::new(cw, ch, data);
+        let (s, contained) = contains(&img, &crop);
+        assert!(contained && s >= 0.9, "crop containment score {s}");
+        let (s, contained) = contains_rot4(&img, &crop);
+        assert!(contained && s >= 0.9, "crop containment(rot) score {s}");
+        // unrelated large image must NOT be contained
+        let other = big_textured(77, 640);
+        let (s2, c2) = contains(&img, &other);
+        assert!(!c2, "foreign containment score {s2}");
     }
 }

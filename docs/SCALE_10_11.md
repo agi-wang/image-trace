@@ -133,12 +133,41 @@ Server + CLI wiring for sharded MIH recall **and** optional persistent index:
   3. else default **8**
   4. clamp to **0..=16** (`0` = single shard ≡ monolithic)
 
+### Crop/slice recall channel
+
+Whole-image gate hashes structurally cannot recall crops or slice tiles —
+a 70% center crop or a 2×2 quadrant moves ~40% of the bits, far outside
+any MIH radius. A second channel indexes the `crophash_keys` stored
+feature: 15 windowed phash keys (a 1.0→0.25 center-scale chain plus a 3×3
+grid of half-size windows) × 8 orientation variants per image, flattened
+into one sharded MIH (`project_{id}_crop/`, magic `ITMIHC1`, same
+invalidation rules as the gate bundle). A pair becomes a candidate when
+`min_hits` distinct probe keys hit the other owner
+(`ITRACE_CROP_MIN_HITS`, default 2), and is then **verified by NCC
+containment** (`slice::contains_rot4`, shared-scale downscale + all four
+quarter-turns) before joining the confirmed groups — hash hits alone
+never confirm.
+
+Measured on `datasets/built` (36 images, 6 microscopy families):
+crop70 and slice tiles recover 6/6 and 12/12 in dedup — previously 0 —
+with zero cross-family merges; `crophash` similarity is ~0.9–1.0 on
+same-source crops/slices vs ≤0.8 foreign. `smart` accepts `crophash` as a
+crop-gate vote (`smart_pair_confirmed`); `blockhash` was evaluated and
+rejected as a gate (best-overlap tiling over-fires ~0.88 on unrelated
+small tiles).
+
+Scale note: the crop channel indexes ~120 keys/image (~8× the gate
+channel's per-image key count at 3 gate algos), so its memory/disk
+footprint scales the same way — shard ownership, persist, verify. Exact
+verification cost is bounded by `min_hits` + radius, not pair count.
+
 ### Env knobs
 
 | Variable | Effect |
 |----------|--------|
 | `ITRACE_MIH_SHARD_BITS` | Default shard bit-width when body/CLI omit override |
 | `ITRACE_MIH_INDEX_DIR` | If set, dedup load-or-builds `{DIR}/project_{id}/` gate-index bundle. Unset → identical in-memory rebuild behaviour as before. |
+| `ITRACE_CROP_MIN_HITS` | Distinct probe-key hits required for a crop-channel candidate (default 2) |
 
 ### Example
 

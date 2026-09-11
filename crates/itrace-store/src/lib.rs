@@ -578,6 +578,20 @@ impl Store {
         Ok(map)
     }
 
+    /// Distinct feature algorithms stored for an image at variant 0 —
+    /// a cheap completeness probe so `precompute` can backfill images
+    /// marked `ready` before a newly registered extractor existed.
+    pub fn feature_algorithm_count(&self, image_id: i64) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(DISTINCT algorithm) FROM feature_store
+                 WHERE image_id = ?1 AND variant_idx = 0",
+            )?
+            .query_row(params![image_id], |r| r.get(0))?;
+        Ok(n)
+    }
+
     /// Count images in `ids` whose feature_status = 'ready'.
     pub fn features_ready(&self, ids: &[i64]) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();

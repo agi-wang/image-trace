@@ -29,6 +29,7 @@ pub const FUSION_ALGOS: &[&str] = &["auto"];
 pub const SMART_ALGOS: &[&str] = &[
     "phash", "dhash", "ahash", "whash", "ssim", "histogram", "orb",
     "edgehash", "blockhash", "colorlayout", "hu", "orbscale", "sliceprofile",
+    "crophash",
 ];
 
 /// Algorithms that must contribute at least one vote for a confirmed duplicate
@@ -36,6 +37,35 @@ pub const SMART_ALGOS: &[&str] = &[
 /// 64-bit ahash collides on ~half of unrelated real photos at 0.85, and
 /// colorhash's coarse bins similarly over-fire.
 pub const HASH_GATE_ALGOS: &[&str] = &["phash", "dhash", "whash", "edgehash"];
+
+/// Crop/slice-robust gate for smart-compare: a pair whose votes all come
+/// from geometry-blind features still confirms when a crop-aware algorithm
+/// fires. Global gate hashes sit at ~0.6 on a 70% crop or a 2×2 slice tile,
+/// so the hash gate alone structurally misses containment duplicates.
+/// `crophash` (windowed phash keys) is measured at ~0.9–1.0 on same-source
+/// crops/slices vs ≤0.8 on unrelated images; `blockhash` is deliberately
+/// NOT a gate — its best-overlap tile matching over-fires (~0.88) on
+/// unrelated slice tiles, though it still counts as a normal vote.
+pub const CROP_GATE_ALGOS: &[&str] = &["crophash"];
+
+/// Smart-compare pair confirmation, shared by the server and CLI paths:
+/// enough distinct algorithm votes AND at least one vote from the hash
+/// gate — or, for crop/slice near-dups the global hashes cannot see, one
+/// vote from the crop-robust gate.
+pub fn smart_pair_confirmed<'a>(
+    hits: impl IntoIterator<Item = &'a str>,
+    min_agree: usize,
+) -> bool {
+    let mut n = 0usize;
+    let mut gate = false;
+    let mut crop_gate = false;
+    for a in hits {
+        n += 1;
+        gate |= HASH_GATE_ALGOS.contains(&a);
+        crop_gate |= CROP_GATE_ALGOS.contains(&a);
+    }
+    n >= min_agree && (gate || crop_gate)
+}
 
 /// All comparison algorithm names: every registered extractor's algos,
 /// plus descriptor algos handled by the precise path even when no extractor

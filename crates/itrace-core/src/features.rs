@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 
 pub mod blockhash;
 pub mod colorlayout;
+pub mod crophash;
 pub mod edgehash;
 pub mod hu;
 pub mod orbscale;
@@ -49,6 +50,9 @@ pub enum FeatureKind {
 pub enum MatrixKernel {
     /// u64-LE bit signature → `hashes::hash_similarity`.
     Bits,
+    /// Several u64-LE keys per payload → best key-pair hash similarity
+    /// (`crophash` window keys).
+    MultiBits,
     /// f32-LE vector → `cosine`.
     Cosine,
     /// f32-LE vector → mean-centered cosine (`orbscale`).
@@ -379,6 +383,7 @@ pub const EXTRACTORS: &[&dyn FeatureExtractor] = &[
     &OrbPooledExtractor,
     &blockhash::BlockhashExtractor,
     &colorlayout::ColorLayoutExtractor,
+    &crophash::CrophashExtractor,
     &edgehash::EdgeHashExtractor,
     &hu::HuExtractor,
     &orbscale::OrbScaleExtractor,
@@ -521,6 +526,8 @@ pub type FeatureMap = HashMap<i64, HashMap<u8, Vec<u8>>>;
 /// A stored payload decoded once per (image, variant) for the matrix loop.
 enum Decoded<'a> {
     Bits(u64),
+    /// `crophash` payload unpacked to its per-window u64 keys.
+    MultiBits(Vec<u64>),
     F32(Vec<f32>),
     U8(&'a [u8]),
     /// `blockhash` payload unpacked to its 32 tile-row bitmasks.
@@ -534,6 +541,13 @@ impl MatrixKernel {
     fn decode<'a>(self, b: &'a [u8]) -> Decoded<'a> {
         match self {
             Self::Bits => Decoded::Bits(unpack_bits(b)),
+            Self::MultiBits => Decoded::MultiBits(
+                b.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| u64::from_le_bytes(*c))
+                    .collect(),
+            ),
             Self::Cosine | Self::CenteredCosine | Self::ExpDist => Decoded::F32(unpack_f32(b)),
             Self::U8Cosine => Decoded::U8(b),
             Self::Blockhash => Decoded::Blockhash(Box::new(blockhash::payload_rows(b))),
@@ -544,6 +558,9 @@ impl MatrixKernel {
     fn score(self, a: &Decoded<'_>, b: &Decoded<'_>) -> f64 {
         match (self, a, b) {
             (Self::Bits, &Decoded::Bits(x), &Decoded::Bits(y)) => hashes::hash_similarity(x, y),
+            (Self::MultiBits, Decoded::MultiBits(x), Decoded::MultiBits(y)) => {
+                crophash::keys_similarity(x, y)
+            }
             (Self::Cosine, Decoded::F32(x), Decoded::F32(y)) => cosine(x, y),
             (Self::CenteredCosine, Decoded::F32(x), Decoded::F32(y)) => {
                 orbscale::centered_cosine(x, y)

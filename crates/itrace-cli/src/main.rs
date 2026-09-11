@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 
 use itrace_core::compare::{self, Prepared};
-use itrace_core::{documents, hashes, image_io, features, index};
+use itrace_core::{documents, hashes, image_io, features, index, slice};
 use itrace_core::HASH_GATE_ALGOS;
 use itrace_store::{NewImage, Store};
 
@@ -113,10 +113,15 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Precompute { project_id } => {
             let images = store.list_image_meta(project_id)?;
-            // decode + feature compute in parallel; DB writes stay sequential
+            // Backfill when `ready` predates newly registered extractors
+            // (e.g. crophash): stored algorithm coverage < EXTRACTORS.len().
+            let want = features::EXTRACTORS.len() as i64;
             let computed: Vec<_> = images
                 .par_iter()
-                .filter(|i| i.feature_status != "ready")
+                .filter(|i| {
+                    i.feature_status != "ready"
+                        || store.feature_algorithm_count(i.id).unwrap_or(0) < want
+                })
                 .map(|i| (i.id, compute_rows(&store, &i.file_path)))
                 .collect();
             for (id, rows) in computed {
@@ -199,8 +204,10 @@ fn main() -> anyhow::Result<()> {
             let confirmed: Vec<(usize, usize)> = pair_hits
                 .iter()
                 .filter(|(_, hits)| {
-                    hits.len() >= min_agree
-                        && hits.iter().any(|a| itrace_core::HASH_GATE_ALGOS.contains(&a.as_str()))
+                    itrace_core::smart_pair_confirmed(
+                        hits.iter().map(|s| s.as_str()),
+                        min_agree,
+                    )
                 })
                 .map(|(&k, _)| k)
                 .collect();
@@ -294,6 +301,11 @@ fn run_cli_dedup(
             })
         })
         .collect();
+    // Crop-recall channel feature rides the same batched load.
+    let crop_fi = features::algo_to_feature("crophash").map(|f| {
+        feat_names.push(f);
+        feat_names.len() - 1
+    });
     let maps = store.load_feature_maps(&ids, &feat_names, &variants)?;
     let entries: Vec<index::DedupKeys> = ready
         .iter()
@@ -334,9 +346,66 @@ fn run_cli_dedup(
         shard_bits,
         index_dir.as_deref(),
     )?;
+
+    // Crop/slice recall channel: windowed-phash keys → hit-counted
+    // candidates verified by NCC containment on the decoded images.
+    let crop_entries: Vec<index::CropKeys> = match crop_fi.filter(|&fi| !maps[fi].is_empty()) {
+        Some(fi) => ready
+            .par_iter()
+            .filter_map(|img| {
+                let vm = maps[fi].get(&img.id)?;
+                let mut keys =
+                    Vec::with_capacity(features::crophash::N_KEYS * variants.len());
+                for &v in &variants {
+                    keys.extend_from_slice(&features::crophash::payload_keys(vm.get(&v)?)?);
+                }
+                keys.sort_unstable();
+                keys.dedup();
+                Some(index::CropKeys {
+                    image_id: img.id,
+                    keys,
+                })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let (crop_pairs, crop_index_loaded) = if crop_entries.len() >= 2 {
+        let crop_dir = index::resolve_mih_index_dir()
+            .map(|base| index::project_crop_mih_index_path(&base, project_id));
+        index::crop_candidates_cached(
+            &crop_entries,
+            radius,
+            index::resolve_crop_min_hits(None),
+            shard_bits,
+            crop_dir.as_deref(),
+        )?
+    } else {
+        (Vec::new(), false)
+    };
+    let ready_by_id: std::collections::HashMap<i64, &itrace_store::ImageMeta> =
+        ready.iter().map(|r| (r.id, *r)).collect();
+    let crop_confirmed: Vec<(i64, i64, f64)> = crop_pairs
+        .par_iter()
+        .filter_map(|&(i, j)| {
+            let ia = crop_entries[i as usize].image_id;
+            let ib = crop_entries[j as usize].image_id;
+            let (Some(ra), Some(rb)) = (ready_by_id.get(&ia), ready_by_id.get(&ib)) else {
+                return None;
+            };
+            let ga = image_io::to_gray(&image_io::decode(&store.read_file(&ra.file_path).ok()?).ok()?);
+            let gb = image_io::to_gray(&image_io::decode(&store.read_file(&rb.file_path).ok()?).ok()?);
+            let (s, contained) = slice::contains_rot4(&ga, &gb);
+            if contained && s >= threshold {
+                Some((ia, ib, s))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let pos: std::collections::HashMap<i64, usize> =
         ready.iter().enumerate().map(|(p, r)| (r.id, p)).collect();
-    let pairs: Vec<(usize, usize)> = confirmed
+    let mut pairs: Vec<(usize, usize)> = confirmed
         .iter()
         .filter_map(|&(i, j, _)| {
             let ia = entries[i].image_id;
@@ -346,6 +415,13 @@ fn run_cli_dedup(
             Some((pi.min(pj), pi.max(pj)))
         })
         .collect();
+    for &(ia, ib, _) in &crop_confirmed {
+        if let (Some(&pi), Some(&pj)) = (pos.get(&ia), pos.get(&ib)) {
+            pairs.push((pi.min(pj), pi.max(pj)));
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
     // Build score lookup for group confidence
     let mut score_cache: std::collections::HashMap<(i64, i64), f64> =
         std::collections::HashMap::new();
@@ -353,6 +429,12 @@ fn run_cli_dedup(
         let ia = entries[i].image_id;
         let ib = entries[j].image_id;
         score_cache.insert((ia.min(ib), ia.max(ib)), s);
+    }
+    for &(ia, ib, s) in &crop_confirmed {
+        score_cache
+            .entry((ia.min(ib), ia.max(ib)))
+            .and_modify(|e| *e = e.max(s))
+            .or_insert(s);
     }
     let groups = compare::components_from_pairs(ready.len(), &pairs);
     let mut shown = 0;
@@ -380,14 +462,16 @@ fn run_cli_dedup(
     }
     let naive = (n as u64) * (n as u64 - 1) / 2;
     println!(
-        "indexed {}, candidates {} (naive {}), {} dup groups / {} images, scan {:.3}s, index_loaded={}",
+        "indexed {}, candidates {} (+{} crop), naive {}, {} dup groups / {} images, scan {:.3}s, index_loaded={}, crop_index_loaded={}",
         entries.len(),
         cand_n,
+        crop_pairs.len(),
         naive,
         shown,
         grouped,
         t0.elapsed().as_secs_f64(),
-        index_loaded
+        index_loaded,
+        crop_index_loaded
     );
     Ok(())
 }

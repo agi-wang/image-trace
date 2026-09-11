@@ -12,6 +12,7 @@ use itrace_core::descriptors;
 use itrace_core::features;
 use itrace_core::{documents, hashes, image_io, index, slice};
 use itrace_core::{GrayImage, RgbImage, HASH_GATE_ALGOS, SMART_ALGOS};
+use itrace_core::smart_pair_confirmed;
 use itrace_store::{ImageMeta, ImageRecord, NewImage, NewRun, Project, Store};
 
 use crate::{enqueue_precompute_decoded, unique_key, ApiError, ApiResult, AppState};
@@ -447,13 +448,11 @@ pub fn run_smart_compare(
         }
     }
 
-    // gate: enough votes AND at least one hash-algorithm hit
+    // gate: enough votes AND at least one hash-algorithm hit — or, for
+    // crop/slice near-dups the global hashes can't see, a crop-robust hit
     let mut confirmed = Vec::new();
     for ((i, j), hits) in &pair_hits {
-        if hits.len() < min_agree {
-            continue;
-        }
-        if !hits.iter().any(|(a, _)| HASH_GATE_ALGOS.contains(&a.as_str())) {
+        if !smart_pair_confirmed(hits.iter().map(|(a, _)| a.as_str()), min_agree) {
             continue;
         }
         confirmed.push((*i, *j));
@@ -554,6 +553,11 @@ pub fn run_dedup_scan(
     let mut feat_names: Vec<&'static str> = Vec::new();
     let gate_feat = feature_index(HASH_GATE_ALGOS, &mut feat_names);
     let gate_feats: Vec<usize> = gate_feat.iter().flatten().copied().collect();
+    // The crop channel's feature rides the same batched load.
+    let crop_fi = features::algo_to_feature("crophash").map(|f| {
+        feat_names.push(f);
+        feat_names.len() - 1
+    });
     let maps = store.load_feature_maps(&ids, &feat_names, &variants)?;
 
     // Per-image key extraction in parallel; the Option collect preserves
@@ -598,6 +602,46 @@ pub fn run_dedup_scan(
     )?;
     let naive = (n as u64) * (n as u64 - 1) / 2;
 
+    // ---------- crop/slice recall channel ----------
+    // Gate hashes are whole-image: a crop70 or 2×2 slice tile moves too
+    // many bits to be recalled at all. The `crophash_keys` payload indexes
+    // windowed phashes (slots × variants); candidates are verified by NCC
+    // containment (`slice::contains_rot4`) on decoded images. Images
+    // without crophash payloads simply drop out of this channel.
+    let crop_entries: Vec<index::CropKeys> = match crop_fi.filter(|&fi| !maps[fi].is_empty()) {
+        Some(fi) => ready
+            .par_iter()
+            .filter_map(|img| {
+                let vm = maps[fi].get(&img.id)?;
+                let mut keys =
+                    Vec::with_capacity(features::crophash::N_KEYS * variants.len());
+                for &v in &variants {
+                    keys.extend_from_slice(&features::crophash::payload_keys(vm.get(&v)?)?);
+                }
+                keys.sort_unstable();
+                keys.dedup();
+                Some(index::CropKeys {
+                    image_id: img.id,
+                    keys,
+                })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let (crop_pairs, crop_index_loaded) = if crop_entries.len() >= 2 {
+        let crop_dir = index::resolve_mih_index_dir()
+            .map(|base| index::project_crop_mih_index_path(&base, project_id));
+        index::crop_candidates_cached(
+            &crop_entries,
+            radius,
+            index::resolve_crop_min_hits(None),
+            shard_bits,
+            crop_dir.as_deref(),
+        )?
+    } else {
+        (Vec::new(), false)
+    };
+
     // Cross-variant max scored directly on the u64 keys unpacked into
     // `entries` above — the gate features are all Bits-kind, so
     // hash_similarity(a, b) is exactly ext.similarity(blob_a, blob_b)
@@ -632,7 +676,7 @@ pub fn run_dedup_scan(
     // position of each image_id inside `ready`
     let pos: HashMap<i64, usize> =
         ready.iter().enumerate().map(|(p, i)| (i.id, p)).collect();
-    let confirmed: Vec<(usize, usize)> = pairs
+    let mut confirmed: Vec<(usize, usize)> = pairs
         .iter()
         .zip(&scores)
         .filter_map(|(&(i, j), &s)| {
@@ -645,6 +689,42 @@ pub fn run_dedup_scan(
             }
         })
         .collect();
+
+    // Verify crop-channel candidates by NCC containment on the decoded
+    // images — a recalled pair confirms when either image contains the
+    // other under some quarter-turn at the requested score bar (with the
+    // 0.8 containment floor baked into `contains`).
+    let ready_by_id: HashMap<i64, &ImageMeta> = ready.iter().map(|r| (r.id, *r)).collect();
+    let crop_confirmed: Vec<(i64, i64, f64)> = crop_pairs
+        .par_iter()
+        .filter_map(|&(i, j)| {
+            let ia = crop_entries[i as usize].image_id;
+            let ib = crop_entries[j as usize].image_id;
+            let (Some(ra), Some(rb)) = (ready_by_id.get(&ia), ready_by_id.get(&ib)) else {
+                return None;
+            };
+            let ga = load_gray_cached(state, ia, &ra.file_path).ok()?;
+            let gb = load_gray_cached(state, ib, &rb.file_path).ok()?;
+            let (s, contained) = slice::contains_rot4(&ga, &gb);
+            if contained && s >= threshold {
+                Some((ia, ib, s))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for &(ia, ib, s) in &crop_confirmed {
+        let key = (ia.min(ib), ia.max(ib));
+        score_cache
+            .entry(key)
+            .and_modify(|e| *e = e.max(s))
+            .or_insert(s);
+        if let (Some(&pi), Some(&pj)) = (pos.get(&ia), pos.get(&ib)) {
+            confirmed.push((pi.min(pj), pi.max(pj)));
+        }
+    }
+    confirmed.sort_unstable();
+    confirmed.dedup();
     let mut score_pair = |ia: i64, ib: i64| -> f64 {
         let key = (ia.min(ib), ia.max(ib));
         if let Some(&s) = score_cache.get(&key) {
@@ -687,15 +767,17 @@ pub fn run_dedup_scan(
         "total_images": n,
         "indexed_images": entries.len(),
         "candidate_pairs": pairs.len(),
+        "crop_candidates": crop_pairs.len(),
         "naive_pairs": naive,
         "found_duplicates": !dup_groups.is_empty(),
         "duplicate_groups": dup_groups,
         "unique_count": n - dup_n,
         "scan_seconds": (t * 1000.0).round() / 1000.0,
         "index_loaded": index_loaded,
+        "crop_index_loaded": crop_index_loaded,
         "summary": format!(
-            "索引扫描 {} 张图片：召回候选 {} 对（全量需 {} 对），确认 {} 组共 {} 张",
-            entries.len(), pairs.len(), naive, dup_groups.len(), dup_n)
+            "索引扫描 {} 张图片：召回候选 {}+{}(crop) 对（全量需 {} 对），确认 {} 组共 {} 张",
+            entries.len(), pairs.len(), crop_pairs.len(), naive, dup_groups.len(), dup_n)
     }))
 }
 

@@ -530,13 +530,17 @@ async fn recompute_features(
     let pending = blocking(move || {
         st.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
         let images = st.store.list_image_meta(id)?;
-        // file_exists is a syscall per image — run the pending filter in
-        // parallel; the Option collect preserves list order (and thus the
-        // enqueue order) identically to the old sequential filter.
+        // Also recompute `ready` images missing newly registered feature
+        // algorithms (e.g. crophash backfill); file_exists is a syscall per
+        // image — run the filter in parallel; the Option collect preserves
+        // list order (and thus the enqueue order) identically.
+        let want = itrace_core::features::EXTRACTORS.len() as i64;
         Ok(images
             .into_par_iter()
             .map(|i| {
-                (i.feature_status != "ready" && st.store.file_exists(&i.file_path)).then_some(i)
+                let needs = i.feature_status != "ready"
+                    || st.store.feature_algorithm_count(i.id).unwrap_or(0) < want;
+                (needs && st.store.file_exists(&i.file_path)).then_some(i)
             })
             .collect::<Vec<_>>()
             .into_iter()
