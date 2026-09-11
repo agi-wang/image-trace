@@ -7,10 +7,14 @@ use crate::{GrayImage, RgbImage};
 /// Structural similarity index (uniform 7×7 window, K1=0.01 K2=0.03).
 /// Both inputs must share dimensions.
 ///
-/// Window statistics come from u64 summed-area tables (Σa, Σb, Σa², Σb², Σab)
-/// instead of filtered f64 planes. Every accumulated value is an exact
-/// integer — at the ≤512-px working size a table entry is ≤ 255²·512² ≪ 2⁵³ —
-/// so the resulting score matches the old box-filter version to ~1e-13.
+/// Window statistics come from a separable sliding pass in exact integers:
+/// each row is first reduced to its 7-wide column sums (Σa, Σb, Σa², Σb², Σab —
+/// u32 lanes over u8/u16 source rows) held in a 7-row ring (~5·w u32), and a
+/// vertical accumulator slides down one row at a time to yield each 7×7
+/// window sum. Every accumulated value is an exact integer — a window sum is
+/// ≤ 255²·49 < 2³² — so each per-window sum is the same exact integer the old
+/// summed-area tables produced and the score is bit-identical
+/// (see `tests::ref_ssim_sat`).
 pub fn ssim(a: &GrayImage, b: &GrayImage) -> f64 {
     let w = a.width.min(b.width) as usize;
     let h = a.height.min(b.height) as usize;
@@ -18,66 +22,152 @@ pub fn ssim(a: &GrayImage, b: &GrayImage) -> f64 {
         return 0.0;
     }
     let (aw, bw) = (a.width as usize, b.width as usize);
-    let sw = w + 1; // table row stride
-    let cells = sw * (h + 1);
-    let mut sa = vec![0u64; cells];
-    let mut sb = vec![0u64; cells];
-    let mut saa = vec![0u64; cells];
-    let mut sbb = vec![0u64; cells];
-    let mut sab = vec![0u64; cells];
-    for y in 0..h {
-        let arow = &a.data[y * aw..y * aw + w];
-        let brow = &b.data[y * bw..y * bw + w];
-        let (up, cur) = (y * sw, (y + 1) * sw);
-        let (mut ra, mut rb, mut raa, mut rbb, mut rab) = (0u64, 0u64, 0u64, 0u64, 0u64);
-        for x in 0..w {
-            let (va, vb) = (arow[x] as u64, brow[x] as u64);
-            ra += va;
-            rb += vb;
-            raa += va * va;
-            rbb += vb * vb;
-            rab += va * vb;
-            sa[cur + x + 1] = sa[up + x + 1] + ra;
-            sb[cur + x + 1] = sb[up + x + 1] + rb;
-            saa[cur + x + 1] = saa[up + x + 1] + raa;
-            sbb[cur + x + 1] = sbb[up + x + 1] + rbb;
-            sab[cur + x + 1] = sab[up + x + 1] + rab;
-        }
-    }
-    // Exact-integer sum of `t` over the rect [x0,x1) × [y0,y1).
-    // (A + D) − (B + C) ordering: the bracketed terms never underflow.
-    let wsum = |t: &[u64], x0: usize, y0: usize, x1: usize, y1: usize| -> f64 {
-        ((t[y1 * sw + x1] + t[y0 * sw + x0]) - (t[y0 * sw + x1] + t[y1 * sw + x0])) as f64
-    };
+    const R: usize = 3; // half-window
+    const K: usize = 2 * R + 1; // window side = 7
+    const S: usize = 5; // per-window stats: a, b, a², b², ab
+    // skip a half-window border like scikit-image's crop
+    let pad = R.min(w / 2).min(h / 2);
+    debug_assert_eq!(pad, R); // w,h ≥ 8 ⇒ pad == R ⇒ every scored window is full 7×7
+    let nw = w - 2 * pad; // scored windows per row == column-window positions
+    let wn = (K * K) as f64;
     let c1 = (0.01f64 * 255.0).powi(2);
     let c2 = (0.03f64 * 255.0).powi(2);
 
+    // ring[y % K] holds row y's column-window sums in [a|b|a²|b²|ab] lanes of
+    // width nw; vacc is the running K-row vertical sum in the same layout.
+    // Everything fits u32: a window sum is ≤ 49·255² = 3.19M < 2³².
+    let mut ring = vec![0u32; K * S * nw];
+    let mut vacc = vec![0u32; S * nw];
+    // Per-row product planes (a², b², ab) — vectorized elementwise pass.
+    // u16 suffices: 255² = 65025 < 2¹⁶.
+    let (mut pa, mut pb, mut pab) = (vec![0u16; w], vec![0u16; w], vec![0u16; w]);
     let mut sum = 0.0;
-    // skip a half-window border like scikit-image's crop
-    let r = 3usize;
-    let pad = r.min(w / 2).min(h / 2);
-    debug_assert_eq!(pad, r); // w,h ≥ 8 ⇒ pad == r ⇒ every scored window is full 7×7
-    let wn = ((2 * r + 1) * (2 * r + 1)) as f64;
     let mut cnt = 0usize;
-    for y in pad..h - pad {
-        for x in pad..w - pad {
-            let (x0, x1) = (x - r, x + r + 1);
-            let (y0, y1) = (y - r, y + r + 1);
-            let mux = wsum(&sa, x0, y0, x1, y1) / wn;
-            let muy = wsum(&sb, x0, y0, x1, y1) / wn;
-            let vx = (wsum(&saa, x0, y0, x1, y1) / wn - mux * mux).max(0.0);
-            let vy = (wsum(&sbb, x0, y0, x1, y1) / wn - muy * muy).max(0.0);
-            let cxy = wsum(&sab, x0, y0, x1, y1) / wn - mux * muy;
-            let num = (2.0 * mux * muy + c1) * (2.0 * cxy + c2);
-            let den = (mux * mux + muy * muy + c1) * (vx + vy + c2);
-            sum += num / den;
-            cnt += 1;
+    for y in 0..h {
+        let arow = &a.data[y * aw..y * aw + w];
+        let brow = &b.data[y * bw..y * bw + w];
+        for (((aa, bb), ab), (&va, &vb)) in pa
+            .iter_mut()
+            .zip(pb.iter_mut())
+            .zip(pab.iter_mut())
+            .zip(arow.iter().zip(brow.iter()))
+        {
+            let (va, vb) = (va as u16, vb as u16);
+            *aa = va * va;
+            *bb = vb * vb;
+            *ab = va * vb;
+        }
+        let slot = &mut ring[(y % K) * S * nw..(y % K) * S * nw + S * nw];
+        // The slot being overwritten holds row y−K's sums (zeros while
+        // y < K): row_win_sums retires them and adds row y's sums in one pass.
+        row_win_sums::<K>(arow, brow, &pa, &pb, &pab, slot, &mut vacc);
+        if y >= K - 1 {
+            // vacc sums rows [y−(K−1), y] → windows centered on row y−R; each
+            // lane position i is the window centered at x = i + R, so the
+            // (row, col) emit order matches the old pad..h−pad × pad..w−pad scan.
+            let (sa, rest) = vacc.split_at(nw);
+            let (sb, rest) = rest.split_at(nw);
+            let (saa, rest) = rest.split_at(nw);
+            let (sbb, sab) = rest.split_at(nw);
+            for ((((&wa, &wb), &waa), &wbb), &wab) in sa
+                .iter()
+                .zip(sb.iter())
+                .zip(saa.iter())
+                .zip(sbb.iter())
+                .zip(sab.iter())
+            {
+                let mux = wa as f64 / wn;
+                let muy = wb as f64 / wn;
+                let vx = (waa as f64 / wn - mux * mux).max(0.0);
+                let vy = (wbb as f64 / wn - muy * muy).max(0.0);
+                let cxy = wab as f64 / wn - mux * muy;
+                let num = (2.0 * mux * muy + c1) * (2.0 * cxy + c2);
+                let den = (mux * mux + muy * muy + c1) * (vx + vy + c2);
+                sum += num / den;
+            }
+            cnt += nw;
         }
     }
     if cnt == 0 {
         return 0.0;
     }
     (sum / cnt as f64).clamp(0.0, 1.0)
+}
+
+/// Column-window sums for one row pair, fused with the vertical accumulator:
+/// `slot[s*nw + i]` = Σ over x ∈ [i, i+K) of stat s (lanes [a, b, a², b², ab]),
+/// and `vacc[s*nw + i] += new − old` where `old` is the slot's previous value
+/// (the outgoing row's sums, or zeros for the first K rows). `vacc` already
+/// contains `old` as one of its ≤K terms, so `vacc + new ≥ old` — the
+/// subtraction never underflows even in debug builds, and all window sums
+/// stay exact integers, identical to the summed-area-table values.
+///
+/// `arow`/`brow` must be exactly `nw + K − 1` wide where `nw = slot.len() / 5`;
+/// `pa`/`pb`/`pab` are the precomputed per-row products a², b², ab.
+fn row_win_sums<const K: usize>(
+    arow: &[u8],
+    brow: &[u8],
+    pa: &[u16],
+    pb: &[u16],
+    pab: &[u16],
+    slot: &mut [u32],
+    vacc: &mut [u32],
+) {
+    let nw = slot.len() / 5;
+    debug_assert_eq!(arow.len(), nw + K - 1);
+    debug_assert_eq!(brow.len(), nw + K - 1);
+    // Per-lane slices keep the inner loops bounds-check free; each loop
+    // vectorizes (the FIR sum is per-window independent).
+    for ((v, o), win) in vacc[..nw]
+        .iter_mut()
+        .zip(slot[..nw].iter_mut())
+        .zip(arow.windows(K))
+    {
+        let s = win.iter().map(|&x| x as u32).sum::<u32>();
+        let old = core::mem::replace(o, s);
+        *v += s;
+        *v -= old;
+    }
+    for ((v, o), win) in vacc[nw..2 * nw]
+        .iter_mut()
+        .zip(slot[nw..2 * nw].iter_mut())
+        .zip(brow.windows(K))
+    {
+        let s = win.iter().map(|&x| x as u32).sum::<u32>();
+        let old = core::mem::replace(o, s);
+        *v += s;
+        *v -= old;
+    }
+    for ((v, o), win) in vacc[2 * nw..3 * nw]
+        .iter_mut()
+        .zip(slot[2 * nw..3 * nw].iter_mut())
+        .zip(pa.windows(K))
+    {
+        let s = win.iter().map(|&x| x as u32).sum::<u32>();
+        let old = core::mem::replace(o, s);
+        *v += s;
+        *v -= old;
+    }
+    for ((v, o), win) in vacc[3 * nw..4 * nw]
+        .iter_mut()
+        .zip(slot[3 * nw..4 * nw].iter_mut())
+        .zip(pb.windows(K))
+    {
+        let s = win.iter().map(|&x| x as u32).sum::<u32>();
+        let old = core::mem::replace(o, s);
+        *v += s;
+        *v -= old;
+    }
+    for ((v, o), win) in vacc[4 * nw..5 * nw]
+        .iter_mut()
+        .zip(slot[4 * nw..5 * nw].iter_mut())
+        .zip(pab.windows(K))
+    {
+        let s = win.iter().map(|&x| x as u32).sum::<u32>();
+        let old = core::mem::replace(o, s);
+        *v += s;
+        *v -= old;
+    }
 }
 
 /// HSV histogram: 50 hue × 60 sat bins, L2-normalized (OpenCV-compatible dims).
@@ -620,6 +710,74 @@ mod tests {
         (sum / cnt as f64).clamp(0.0, 1.0)
     }
 
+    /// Verbatim copy of the previous summed-area-table `ssim` — kept as the
+    /// exact reference for the sliding-window rewrite. Every window sum is an
+    /// exact u64 integer, so equality must be *bit*-identical, not approximate.
+    fn ref_ssim_sat(a: &GrayImage, b: &GrayImage) -> f64 {
+        let w = a.width.min(b.width) as usize;
+        let h = a.height.min(b.height) as usize;
+        if w < 8 || h < 8 {
+            return 0.0;
+        }
+        let (aw, bw) = (a.width as usize, b.width as usize);
+        let sw = w + 1;
+        let cells = sw * (h + 1);
+        let mut sa = vec![0u64; cells];
+        let mut sb = vec![0u64; cells];
+        let mut saa = vec![0u64; cells];
+        let mut sbb = vec![0u64; cells];
+        let mut sab = vec![0u64; cells];
+        for y in 0..h {
+            let arow = &a.data[y * aw..y * aw + w];
+            let brow = &b.data[y * bw..y * bw + w];
+            let (up, cur) = (y * sw, (y + 1) * sw);
+            let (mut ra, mut rb, mut raa, mut rbb, mut rab) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
+            for x in 0..w {
+                let (va, vb) = (arow[x] as u64, brow[x] as u64);
+                ra += va;
+                rb += vb;
+                raa += va * va;
+                rbb += vb * vb;
+                rab += va * vb;
+                sa[cur + x + 1] = sa[up + x + 1] + ra;
+                sb[cur + x + 1] = sb[up + x + 1] + rb;
+                saa[cur + x + 1] = saa[up + x + 1] + raa;
+                sbb[cur + x + 1] = sbb[up + x + 1] + rbb;
+                sab[cur + x + 1] = sab[up + x + 1] + rab;
+            }
+        }
+        let wsum = |t: &[u64], x0: usize, y0: usize, x1: usize, y1: usize| -> f64 {
+            ((t[y1 * sw + x1] + t[y0 * sw + x0]) - (t[y0 * sw + x1] + t[y1 * sw + x0])) as f64
+        };
+        let c1 = (0.01f64 * 255.0).powi(2);
+        let c2 = (0.03f64 * 255.0).powi(2);
+        let mut sum = 0.0;
+        let r = 3usize;
+        let pad = r.min(w / 2).min(h / 2);
+        let wn = ((2 * r + 1) * (2 * r + 1)) as f64;
+        let mut cnt = 0usize;
+        for y in pad..h - pad {
+            for x in pad..w - pad {
+                let (x0, x1) = (x - r, x + r + 1);
+                let (y0, y1) = (y - r, y + r + 1);
+                let mux = wsum(&sa, x0, y0, x1, y1) / wn;
+                let muy = wsum(&sb, x0, y0, x1, y1) / wn;
+                let vx = (wsum(&saa, x0, y0, x1, y1) / wn - mux * mux).max(0.0);
+                let vy = (wsum(&sbb, x0, y0, x1, y1) / wn - muy * muy).max(0.0);
+                let cxy = wsum(&sab, x0, y0, x1, y1) / wn - mux * muy;
+                let num = (2.0 * mux * muy + c1) * (2.0 * cxy + c2);
+                let den = (mux * mux + muy * muy + c1) * (vx + vy + c2);
+                sum += num / den;
+                cnt += 1;
+            }
+        }
+        if cnt == 0 {
+            return 0.0;
+        }
+        (sum / cnt as f64).clamp(0.0, 1.0)
+    }
+
     fn ref_ncc(a: &GrayImage, b: &GrayImage) -> f64 {
         let w = a.width.min(b.width) as usize;
         let h = a.height.min(b.height) as usize;
@@ -722,6 +880,49 @@ mod tests {
 
     // ---- equivalence tests ----
 
+    fn uniform(w: u32, h: u32, v: u8) -> GrayImage {
+        GrayImage::new(w, h, vec![v; (w * h) as usize])
+    }
+
+    /// xorshift64 white noise — decorrelated pixels stress every window sum.
+    fn noise(w: u32, h: u32, seed: u64) -> GrayImage {
+        let mut s = seed | 1;
+        let data = (0..w * h)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 32) as u8
+            })
+            .collect();
+        GrayImage::new(w, h, data)
+    }
+
+    fn gradient(w: u32, h: u32) -> GrayImage {
+        let data = (0..h)
+            .flat_map(|y| {
+                (0..w).map(move |x| ((x * 255 / w.max(1) + y * 255 / h.max(1)) / 2) as u8)
+            })
+            .collect();
+        GrayImage::new(w, h, data)
+    }
+
+    fn checker(w: u32, h: u32, cell: u32) -> GrayImage {
+        let cell = cell.max(1);
+        let data = (0..h)
+            .flat_map(|y| {
+                (0..w).map(move |x| {
+                    if (x / cell + y / cell).is_multiple_of(2) {
+                        30
+                    } else {
+                        220
+                    }
+                })
+            })
+            .collect();
+        GrayImage::new(w, h, data)
+    }
+
     #[test]
     fn ssim_matches_reference() {
         let a = photo(160, 120, 3);
@@ -732,6 +933,53 @@ mod tests {
         // small / degenerate
         let tiny = photo(8, 8, 1);
         assert_eq!(ssim(&tiny, &tiny), ref_ssim(&tiny, &tiny));
+    }
+
+    /// Sliding-window `ssim` must be BIT-identical to the summed-area-table
+    /// implementation: all window sums are exact u64 integers and the emit
+    /// order (and therefore the f64 accumulation order) is unchanged.
+    #[test]
+    fn ssim_matches_sat_reference() {
+        let cases: Vec<(GrayImage, GrayImage)> = vec![
+            // same dims
+            (photo(64, 48, 1), photo(64, 48, 2)),
+            (photo(160, 120, 3), photo(160, 120, 9)),
+            // differing dims (scored on the min-dim overlap)
+            (photo(200, 150, 4), photo(160, 120, 5)),
+            (photo(90, 200, 6), photo(140, 80, 7)),
+            (photo(160, 120, 8), photo(160, 120, 8)), // identical
+            // <8px → 0.0, boundary 8×8, thin strips
+            (photo(7, 7, 1), photo(7, 7, 1)),
+            (photo(4, 40, 1), photo(4, 40, 2)),
+            (photo(8, 8, 1), photo(8, 8, 2)),
+            (photo(30, 8, 1), photo(8, 30, 2)),
+            (noise(9, 9, 3), noise(9, 9, 4)),   // h=9: only 3 emitted rows
+            (noise(14, 8, 5), noise(14, 8, 6)), // h=8: only 2 emitted rows
+            // uniform (zero-variance windows)
+            (uniform(64, 64, 0), uniform(64, 64, 0)),
+            (uniform(64, 64, 255), uniform(64, 64, 255)),
+            (uniform(64, 64, 128), uniform(64, 64, 129)),
+            (uniform(33, 17, 7), noise(33, 17, 9)),
+            // random noise, incl. non-round dims
+            (noise(97, 61, 42), noise(97, 61, 43)),
+            (noise(33, 33, 7), noise(33, 33, 7)),
+            (noise(512, 384, 1), noise(512, 384, 2)), // full working size
+            // structured
+            (gradient(120, 90), checker(120, 90, 4)),
+            (checker(80, 60, 1), checker(80, 60, 2)),
+            (gradient(11, 257), gradient(11, 257)), // h not multiple of K±1
+        ];
+        for (i, (a, b)) in cases.iter().enumerate() {
+            assert_eq!(
+                ssim(a, b).to_bits(),
+                ref_ssim_sat(a, b).to_bits(),
+                "case {i}: {}x{} vs {}x{}",
+                a.width,
+                a.height,
+                b.width,
+                b.height
+            );
+        }
     }
 
     #[test]

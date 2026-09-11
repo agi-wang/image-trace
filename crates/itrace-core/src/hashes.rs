@@ -114,17 +114,33 @@ fn median_f64(values: &mut [f64]) -> f64 {
     }
 }
 
+/// cos((x + 0.5) * k * pi/n) table for the separable DCT — the same f64
+/// values the inner loops indexed, but computed once for n=32 (the only
+/// size `phash` uses) instead of 1024 `cos` calls per hash.
+fn dct_cos_table(n: usize) -> std::borrow::Cow<'static, [f64]> {
+    fn build(n: usize) -> Vec<f64> {
+        let pi_n = std::f64::consts::PI / n as f64;
+        let mut t = vec![0.0f64; n * n];
+        for k in 0..n {
+            for x in 0..n {
+                t[k * n + x] = ((x as f64 + 0.5) * k as f64 * pi_n).cos();
+            }
+        }
+        t
+    }
+    if n == 32 {
+        static T32: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+        std::borrow::Cow::Borrowed(T32.get_or_init(|| build(32)).as_slice())
+    } else {
+        std::borrow::Cow::Owned(build(n))
+    }
+}
+
 /// Separable 2D DCT-II on an N×N f32 block.
 fn dct_2d(input: &[f64], n: usize) -> Vec<f64> {
     let mut out = vec![0.0f64; n * n];
-    let pi_n = std::f64::consts::PI / n as f64;
-    // cos((x + 0.5) * k * pi/n) table, shared by the row and column passes.
-    let mut cos_t = vec![0.0f64; n * n];
-    for k in 0..n {
-        for x in 0..n {
-            cos_t[k * n + x] = ((x as f64 + 0.5) * k as f64 * pi_n).cos();
-        }
-    }
+    // cos table shared by the row and column passes (cached for n=32).
+    let cos_t = dct_cos_table(n);
     let s0 = (1.0 / n as f64).sqrt();
     let sk = (2.0 / n as f64).sqrt();
     // rows
@@ -156,8 +172,10 @@ pub fn phash(gray: &GrayImage) -> u64 {
     phash_small(&image_io::resize_gray_exact(gray, 32, 32))
 }
 
-/// phash on an already-32×32 grayscale image.
-fn phash_small(small: &GrayImage) -> u64 {
+/// phash on an already-32×32 grayscale image. `pub(crate)` so the feature
+/// extractor can feed it a shared downscale (`VariantCtx::small32`) —
+/// `phash(g)` is exactly `phash_small(resize_gray_exact(g, 32, 32))`.
+pub(crate) fn phash_small(small: &GrayImage) -> u64 {
     let f: Vec<f64> = small.data.iter().map(|&v| v as f64).collect();
     let dct = dct_2d(&f, 32);
     // low-frequency 8×8
@@ -217,8 +235,9 @@ pub fn whash(gray: &GrayImage) -> u64 {
     whash_small(&image_io::resize_gray_exact(gray, 32, 32))
 }
 
-/// whash on an already-32×32 grayscale image.
-fn whash_small(small: &GrayImage) -> u64 {
+/// whash on an already-32×32 grayscale image. `pub(crate)` for the same
+/// shared-downscale reason as [`phash_small`].
+pub(crate) fn whash_small(small: &GrayImage) -> u64 {
     let mut f: Vec<f64> = small.data.iter().map(|&v| v as f64).collect();
     haar_2d(&mut f, 32);
     // remove DC (top-left) for brightness invariance

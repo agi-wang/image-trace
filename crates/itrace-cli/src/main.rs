@@ -96,7 +96,7 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&store.list_images(project_id, 0, i64::MAX)?)?);
         }
         Cmd::Precompute { project_id } => {
-            let images = store.list_images(project_id, 0, i64::MAX)?;
+            let images = store.list_image_meta(project_id)?;
             // decode + feature compute in parallel; DB writes stay sequential
             let computed: Vec<_> = images
                 .par_iter()
@@ -111,7 +111,7 @@ fn main() -> anyhow::Result<()> {
             println!("done");
         }
         Cmd::Compare { project_id, algorithm, threshold, rotation_invariant } => {
-            let images = store.list_images(project_id, 0, i64::MAX)?;
+            let images = store.list_image_meta(project_id)?;
             let desc_algos = compare::desc_algos_for(&algorithm);
             // Keep original positions — members index `prepared`, not `images`
             let (idx, prepared): (Vec<usize>, Vec<Prepared>) = images
@@ -135,7 +135,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Smart { project_id, threshold, min_agree } => {
-            let images = store.list_images(project_id, 0, i64::MAX)?;
+            let images = store.list_image_meta(project_id)?;
             let n = images.len();
             if n < 2 {
                 println!("图片不足");
@@ -203,7 +203,7 @@ fn main() -> anyhow::Result<()> {
             println!("scan: {:.2}s, {} dup groups", t0.elapsed().as_secs_f64(), shown);
         }
         Cmd::Report { project_id, algorithm, threshold } => {
-            let images = store.list_images(project_id, 0, i64::MAX)?;
+            let images = store.list_image_meta(project_id)?;
             let desc_algos = compare::desc_algos_for(&algorithm);
             let prepared: Vec<Prepared> = images
                 .par_iter()
@@ -221,10 +221,10 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Slice { image_a, image_b, rows, cols } => {
-            let ia = store.get_image(image_a)?;
-            let ib = store.get_image(image_b)?;
-            let ga = image_io::to_gray(&image_io::decode(&store.read_file(&ia.file_path)?)?);
-            let gb = image_io::to_gray(&image_io::decode(&store.read_file(&ib.file_path)?)?);
+            let pa = store.get_image_path(image_a)?;
+            let pb = store.get_image_path(image_b)?;
+            let ga = image_io::to_gray(&image_io::decode(&store.read_file(&pa)?)?);
+            let gb = image_io::to_gray(&image_io::decode(&store.read_file(&pb)?)?);
             let res = itrace_core::slice::slice_match(&ga, &gb, rows, cols, 0.7);
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
@@ -271,15 +271,27 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
         let rel_doc = unique_key(store, "uploads", name);
         store.write_file(&rel_doc, &data)?;
         let extracted = documents::extract_named(name, &data)?;
-        for img in extracted {
+        // Decode + insert-time hashes in parallel (same shape as the
+        // server's document upload); unique_key/write/insert stay
+        // sequential so key assignment, row ids, output order and the
+        // first-error bail position are all unchanged.
+        let decoded: Vec<anyhow::Result<(image::DynamicImage, itrace_core::ImageFeatures)>> =
+            extracted
+                .par_iter()
+                .map(|im| {
+                    let d = image_io::decode(&im.data)?;
+                    let feats = hashes::compute_image_features_decoded(
+                        &d,
+                        hashes::blake3_hex(&im.data),
+                        im.data.len() as u64,
+                    );
+                    Ok((d, feats))
+                })
+                .collect();
+        for (img, pair) in extracted.iter().zip(decoded) {
             let key = unique_key(store, "extracted", &img.filename);
             store.write_file(&key, &img.data)?;
-            let decoded = image_io::decode(&img.data)?;
-            let feats = hashes::compute_image_features_decoded(
-                &decoded,
-                hashes::blake3_hex(&img.data),
-                img.data.len() as u64,
-            );
+            let (decoded, feats) = pair?;
             let rec = store.insert_image(&NewImage {
                 project_id,
                 filename: img.filename.clone(),

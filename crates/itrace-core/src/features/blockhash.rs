@@ -89,18 +89,27 @@ impl FeatureExtractor for BlockhashExtractor {
         BITS
     }
     fn similarity(&self, a: &[u8], b: &[u8]) -> f64 {
-        let ga = payload_rows(a);
-        let gb = payload_rows(b);
-        // Both directions: either image may be the cropped one.
-        best_overlap(&ga, &gb).max(best_overlap(&gb, &ga))
+        rows_similarity(&payload_rows(a), &payload_rows(b))
     }
+    fn matrix_kernel(&self) -> Option<super::MatrixKernel> {
+        Some(super::MatrixKernel::Blockhash)
+    }
+}
+
+/// `similarity` on pre-decoded row masks — the matrix kernel applies this
+/// to `payload_rows` decodings, giving byte-path-identical scores without
+/// per-pair unpacking.
+pub(crate) fn rows_similarity(a: &[u64; GRID], b: &[u64; GRID]) -> f64 {
+    // Both directions: either image may be the cropped one.
+    best_overlap(a, b).max(best_overlap(b, a))
 }
 
 /// Pack an LSB-first bit payload into GRID row masks (bit x of row y =
 /// tile y*GRID+x — the same mapping `unpack_grid` produced, kept in u64s so
 /// overlap windows compare with XOR + popcount). Reads `BITS/8` bytes like
 /// the old unpacking (extra bytes ignored, short payloads panic).
-fn payload_rows(data: &[u8]) -> [u64; GRID] {
+/// `pub(crate)`: the `Blockhash` matrix kernel decodes through it.
+pub(crate) fn payload_rows(data: &[u8]) -> [u64; GRID] {
     let mut r = [0u64; GRID];
     for i in 0..BITS / 8 {
         // 8 consecutive tile bits per byte; all land in row i/4 at (i%4)*8

@@ -118,6 +118,22 @@ pub struct ImageRecord {
     pub created_at: String,
 }
 
+/// Lightweight `images` projection for the scan/analysis paths that never
+/// read the five hash-hex columns, `file_hash`, `extracted_from` or
+/// `created_at`. Carries every field those paths consume — `file_size`,
+/// `width` and `height` are echoed by the report JSON, the rest drive
+/// status filters, feature loads and the id/filename/path outputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageMeta {
+    pub id: i64,
+    pub filename: String,
+    pub file_path: String,
+    pub feature_status: String,
+    pub file_size: Option<i64>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisRunRecord {
     pub id: i64,
@@ -248,6 +264,21 @@ impl Store {
         Ok(rows)
     }
 
+    /// Existence probe only — `get_project` costs a LEFT JOIN + COUNT over
+    /// the project's image index; handlers that never read the row fields
+    /// pay O(1) instead of O(#images) per request.
+    pub fn ensure_project(&self, id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let found = conn
+            .prepare_cached("SELECT 1 FROM projects WHERE id = ?1")?
+            .query_row(params![id], |r| r.get::<_, i64>(0))
+            .optional()?;
+        if found.is_none() {
+            anyhow::bail!("项目不存在: {id}");
+        }
+        Ok(())
+    }
+
     /// Delete project row (CASCADE removes images/runs/features);
     /// caller removes files. Errors when the project does not exist.
     pub fn delete_project(&self, id: i64) -> anyhow::Result<Vec<ImageRecord>> {
@@ -266,20 +297,48 @@ impl Store {
 
     pub fn insert_image(&self, rec: &NewImage) -> anyhow::Result<ImageRecord> {
         let conn = self.conn.lock().unwrap();
-        conn.prepare_cached(
-            "INSERT INTO images(project_id, filename, file_path, file_hash,
-                phash, dhash, ahash, whash, colorhash, extracted_from,
-                file_size, width, height, feature_status)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending')",
-        )?
-        .execute(params![
-            rec.project_id, rec.filename, rec.file_path, rec.file_hash,
-            rec.phash, rec.dhash, rec.ahash, rec.whash, rec.colorhash,
-            rec.extracted_from, rec.file_size, rec.width, rec.height,
-        ])?;
-        let id = conn.last_insert_rowid();
-        drop(conn);
-        self.get_image(id)
+        // RETURNING reads back only the DB-generated columns — every other
+        // field is exactly what was bound above, so no 16-column re-select.
+        let (id, created_at, feature_status) = conn
+            .prepare_cached(
+                "INSERT INTO images(project_id, filename, file_path, file_hash,
+                    phash, dhash, ahash, whash, colorhash, extracted_from,
+                    file_size, width, height, feature_status)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending')
+                 RETURNING id, created_at, feature_status",
+            )?
+            .query_row(
+                params![
+                    rec.project_id, rec.filename, rec.file_path, rec.file_hash,
+                    rec.phash, rec.dhash, rec.ahash, rec.whash, rec.colorhash,
+                    rec.extracted_from, rec.file_size, rec.width, rec.height,
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+        Ok(ImageRecord {
+            id,
+            project_id: rec.project_id,
+            filename: rec.filename.clone(),
+            file_path: rec.file_path.clone(),
+            file_hash: rec.file_hash.clone(),
+            phash: rec.phash.clone(),
+            dhash: rec.dhash.clone(),
+            ahash: rec.ahash.clone(),
+            whash: rec.whash.clone(),
+            colorhash: rec.colorhash.clone(),
+            extracted_from: rec.extracted_from.clone(),
+            file_size: rec.file_size,
+            width: rec.width,
+            height: rec.height,
+            feature_status,
+            created_at,
+        })
     }
 
     pub fn get_image(&self, id: i64) -> anyhow::Result<ImageRecord> {
@@ -297,6 +356,45 @@ impl Store {
             "WHERE i.project_id = ?1 ORDER BY i.id LIMIT ?2 OFFSET ?3",
             params![project_id, limit, skip],
         )
+    }
+
+    /// `list_images` minus the hash-hex/`file_hash`/`extracted_from`/
+    /// `created_at` columns — the analysis endpoints consume only this
+    /// projection, so they skip decoding those strings on every row.
+    /// Same `ORDER BY id` as `list_images` so positional callers see the
+    /// identical sequence.
+    pub fn list_image_meta(&self, project_id: i64) -> anyhow::Result<Vec<ImageMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn
+            .prepare_cached(
+                "SELECT id, filename, file_path, feature_status,
+                        file_size, width, height
+                 FROM images WHERE project_id = ?1 ORDER BY id",
+            )?
+            .query_map(params![project_id], |r| {
+                Ok(ImageMeta {
+                    id: r.get(0)?,
+                    filename: r.get(1)?,
+                    file_path: r.get(2)?,
+                    feature_status: r.get(3)?,
+                    file_size: r.get(4)?,
+                    width: r.get(5)?,
+                    height: r.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `file_path` only — for handlers that resolve a row id to its blob
+    /// key and never touch the other 15 columns.
+    pub fn get_image_path(&self, id: i64) -> anyhow::Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let path = conn
+            .prepare_cached("SELECT file_path FROM images WHERE id = ?1")?
+            .query_row(params![id], |r| r.get(0))
+            .optional()?;
+        path.with_context(|| format!("图像不存在: {id}"))
     }
 
     fn row_to_image(
@@ -757,6 +855,42 @@ mod tests {
         assert_eq!(s.get_project(p.id).unwrap().image_count, 2);
         assert_eq!(s.list_projects(0, 10).unwrap()[0].image_count, 2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_meta_and_image_path() {
+        let dir = tmp_dir("meta");
+        let s = Store::open(&dir).unwrap();
+        let p = s.create_project("t", None).unwrap();
+        let a = s.insert_image(&img(p.id, "a.jpg")).unwrap();
+        let b = s.insert_image(&img(p.id, "b.jpg")).unwrap();
+        s.set_feature_status(a.id, "ready").unwrap();
+
+        // Same ORDER BY id sequence as list_images, only fewer columns.
+        let meta = s.list_image_meta(p.id).unwrap();
+        let full = s.list_images(p.id, 0, i64::MAX).unwrap();
+        assert_eq!(
+            meta.iter().map(|m| m.id).collect::<Vec<_>>(),
+            full.iter().map(|r| r.id).collect::<Vec<_>>()
+        );
+        assert_eq!(meta.len(), 2);
+        assert_eq!(meta[0].filename, "a.jpg");
+        assert_eq!(meta[0].file_path, "u/a.jpg");
+        assert_eq!(meta[0].feature_status, "ready");
+        assert_eq!(meta[1].feature_status, "pending");
+        assert!(meta[0].file_size.is_none() && meta[0].width.is_none() && meta[0].height.is_none());
+
+        assert_eq!(s.get_image_path(a.id).unwrap(), "u/a.jpg");
+        assert_eq!(s.get_image_path(b.id).unwrap(), "u/b.jpg");
+        assert!(s.get_image_path(999_999).is_err());
+
+        // insert_image still returns the full row including DB defaults.
+        assert_eq!(a.feature_status, "pending");
+        assert!(!a.created_at.is_empty());
+
+        let empty = s.create_project("e", None).unwrap();
+        assert!(s.list_image_meta(empty.id).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

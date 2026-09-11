@@ -14,6 +14,7 @@ use crate::descriptors::orb;
 use crate::{hashes, image_io, metrics, GrayImage, RgbImage};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub mod blockhash;
 pub mod colorlayout;
@@ -40,9 +41,10 @@ pub enum FeatureKind {
 /// Typed matrix kernel used by [`similarity_matrix`]: each stored blob is
 /// decoded once per (image, variant) into a [`Decoded`] and pair-scoring runs
 /// on the decoded forms — `score(decode(a), decode(b))` must equal
-/// `similarity(a, b)`. An extractor opts in via
-/// [`FeatureExtractor::matrix_kernel`]; custom layouts (blockhash,
-/// sliceprofile) stay on the per-pair byte path.
+/// `similarity(a, b)`. Every registered extractor opts in via
+/// [`FeatureExtractor::matrix_kernel`]; the custom layouts decode to their
+/// own forms (`blockhash` → `[u64; 32]` tile-row masks, `sliceprofile` →
+/// its `Profile` + hoisted means).
 #[derive(Debug, Clone, Copy)]
 pub enum MatrixKernel {
     /// u64-LE bit signature → `hashes::hash_similarity`.
@@ -55,6 +57,43 @@ pub enum MatrixKernel {
     ExpDist,
     /// Raw u8 vector → cosine over integer-upcast values (`gray_flat`).
     U8Cosine,
+    /// 128-byte blockhash tile grid → row masks → best-overlap Hamming.
+    Blockhash,
+    /// 128-byte slice profile → `Profile` + means → transform/correlation.
+    SliceProfile,
+}
+
+/// Shared per-variant intermediates handed to [`FeatureExtractor::compute_ctx`].
+/// Extractors that would otherwise repeat the same sub-computation (phash and
+/// whash both start from a 32×32 grayscale downscale) take it from here, so
+/// one variant pays for it once. Everything is lazy — extractors that don't
+/// need an intermediate never trigger it — and every accessor returns exactly
+/// what the corresponding `image_io`/`hashes` call produces.
+pub struct VariantCtx<'a> {
+    /// The variant's grayscale raster.
+    pub gray: &'a GrayImage,
+    /// The variant's RGB raster.
+    pub rgb: &'a RgbImage,
+    small32: OnceLock<GrayImage>,
+}
+
+impl<'a> VariantCtx<'a> {
+    fn new(gray: &'a GrayImage, rgb: &'a RgbImage) -> Self {
+        Self {
+            gray,
+            rgb,
+            small32: OnceLock::new(),
+        }
+    }
+
+    /// The shared 32×32 grayscale downscale — identical to
+    /// `image_io::resize_gray_exact(gray, 32, 32)`, built on first use.
+    /// `phash` and `whash` are defined as `_small(resize32(gray))`, so they
+    /// consume this instead of resizing privately.
+    pub fn small32(&self) -> &GrayImage {
+        self.small32
+            .get_or_init(|| image_io::resize_gray_exact(self.gray, 32, 32))
+    }
 }
 
 /// Pluggable feature extractor: computes and compares one stored feature.
@@ -66,6 +105,12 @@ pub trait FeatureExtractor: Sync {
     fn kind(&self) -> FeatureKind;
     /// Encoded feature bytes for one decoded variant image.
     fn compute(&self, gray: &GrayImage, rgb: &RgbImage) -> Vec<u8>;
+    /// `compute` with shared per-variant intermediates available; the
+    /// default delegates to `compute(ctx.gray, ctx.rgb)`. Overrides must
+    /// return byte-identical payloads to `compute`.
+    fn compute_ctx(&self, ctx: &VariantCtx<'_>) -> Vec<u8> {
+        self.compute(ctx.gray, ctx.rgb)
+    }
     /// Logical dimensionality of an encoded payload (for storage metadata).
     fn dims(&self, data: &[u8]) -> usize;
     /// Similarity in `[0,1]` between two payloads of this feature.
@@ -118,8 +163,10 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let mut dot = 0f64;
     let mut na = 0f64;
     let mut nb = 0f64;
-    for i in 0..n {
-        let (x, y) = (a[i] as f64, b[i] as f64);
+    // zip over the n-slices: same forward accumulation order, no per-element
+    // bounds checks.
+    for (&x, &y) in a[..n].iter().zip(&b[..n]) {
+        let (x, y) = (x as f64, y as f64);
         dot += x * y;
         na += x * x;
         nb += y * y;
@@ -141,8 +188,8 @@ fn cosine_u8(a: &[u8], b: &[u8]) -> f64 {
     let mut dot = 0f64;
     let mut na = 0f64;
     let mut nb = 0f64;
-    for i in 0..n {
-        let (x, y) = (a[i] as f64, b[i] as f64);
+    for (&x, &y) in a[..n].iter().zip(&b[..n]) {
+        let (x, y) = (x as f64, y as f64);
         dot += x * y;
         na += x * x;
         nb += y * y;
@@ -160,6 +207,11 @@ struct HashExtractor {
     feature: &'static str,
     algos: &'static [&'static str],
     hash: fn(&GrayImage, &RgbImage) -> u64,
+    /// When set, `compute_ctx` evaluates the hash on the variant's shared
+    /// 32×32 downscale instead — valid because `phash`/`whash` are defined
+    /// as `*_small(resize_gray_exact(gray, 32, 32))`, so the bit output is
+    /// identical while the resize happens once per variant, not per hash.
+    small32_hash: Option<fn(&GrayImage) -> u64>,
     /// `colorhash` bins are a pixel-multiset histogram — permutation-invariant,
     /// so all orientation variants hash identically.
     rot_inv: bool,
@@ -177,6 +229,12 @@ impl FeatureExtractor for HashExtractor {
     }
     fn compute(&self, gray: &GrayImage, rgb: &RgbImage) -> Vec<u8> {
         pack_bits((self.hash)(gray, rgb))
+    }
+    fn compute_ctx(&self, ctx: &VariantCtx<'_>) -> Vec<u8> {
+        match self.small32_hash {
+            Some(h32) => pack_bits(h32(ctx.small32())),
+            None => self.compute(ctx.gray, ctx.rgb),
+        }
     }
     fn dims(&self, _data: &[u8]) -> usize {
         64
@@ -281,11 +339,41 @@ impl FeatureExtractor for OrbPooledExtractor {
 
 /// All registered extractors, in canonical order.
 pub const EXTRACTORS: &[&dyn FeatureExtractor] = &[
-    &HashExtractor { feature: "phash_bits", algos: &["phash"], hash: |g, _| hashes::phash(g), rot_inv: false },
-    &HashExtractor { feature: "dhash_bits", algos: &["dhash"], hash: |g, _| hashes::dhash(g), rot_inv: false },
-    &HashExtractor { feature: "ahash_bits", algos: &["ahash"], hash: |g, _| hashes::ahash(g), rot_inv: false },
-    &HashExtractor { feature: "whash_bits", algos: &["whash"], hash: |g, _| hashes::whash(g), rot_inv: false },
-    &HashExtractor { feature: "colorhash_bits", algos: &["colorhash"], hash: |_, r| hashes::colorhash(r), rot_inv: true },
+    &HashExtractor {
+        feature: "phash_bits",
+        algos: &["phash"],
+        hash: |g, _| hashes::phash(g),
+        small32_hash: Some(hashes::phash_small),
+        rot_inv: false,
+    },
+    &HashExtractor {
+        feature: "dhash_bits",
+        algos: &["dhash"],
+        hash: |g, _| hashes::dhash(g),
+        small32_hash: None,
+        rot_inv: false,
+    },
+    &HashExtractor {
+        feature: "ahash_bits",
+        algos: &["ahash"],
+        hash: |g, _| hashes::ahash(g),
+        small32_hash: None,
+        rot_inv: false,
+    },
+    &HashExtractor {
+        feature: "whash_bits",
+        algos: &["whash"],
+        hash: |g, _| hashes::whash(g),
+        small32_hash: Some(hashes::whash_small),
+        rot_inv: false,
+    },
+    &HashExtractor {
+        feature: "colorhash_bits",
+        algos: &["colorhash"],
+        hash: |_, r| hashes::colorhash(r),
+        small32_hash: None,
+        rot_inv: true,
+    },
     &HsvHistogramExtractor,
     &GrayFlatExtractor,
     &OrbPooledExtractor,
@@ -353,16 +441,27 @@ type VariantRow = (u8, String, Vec<u8>, usize);
 /// rows keep registry order. `include_invariant` gates rotation-invariant
 /// extractors — they produce byte-identical output on every variant, so
 /// `compute_all_variants` computes them only on variant 0.
+///
+/// Note on shared HSV: `colorhash` (hashes.rs) bins pixels in f64
+/// (`(h/360)*16`, `s*4`, weight `s*v`) while `histogram_hsv`
+/// (metrics::hsv_histogram) bins in f32 (`(h/180)*50`, `s*60`, weight 1).
+/// Sharing one per-pixel (h,s,v) would force one side through a precision
+/// conversion (f64↔f32 double-rounding changes bin indices and stored
+/// bits), so the two conversions can't be merged under the bit-identical
+/// constraint — only the trivially cheap pixel iteration would be shared.
 fn variant_features(
     gray: &GrayImage,
     rgb: &RgbImage,
     include_invariant: bool,
 ) -> Vec<(String, Vec<u8>, usize)> {
+    // One ctx per variant: extractors share its lazy intermediates (the
+    // phash/whash 32×32 downscale) across the parallel fan-out.
+    let ctx = VariantCtx::new(gray, rgb);
     EXTRACTORS
         .par_iter()
         .filter(move |e| include_invariant || !e.rotation_invariant())
         .map(|e| {
-            let bytes = e.compute(gray, rgb);
+            let bytes = e.compute_ctx(&ctx);
             let dims = e.dims(&bytes);
             (e.feature_name().to_string(), bytes, dims)
         })
@@ -390,20 +489,22 @@ pub fn compute_variant_features(gray: &GrayImage, rgb: &RgbImage) -> Vec<(String
 /// tolerate missing variant rows: the matrix path for invariant features
 /// compares only variant 0 anyway, and variant iteration is driven by the
 /// keys present in each image's feature map.
-pub fn compute_all_variants(
-    img: &image::DynamicImage,
-) -> Vec<(u8, String, Vec<u8>, usize)> {
+pub fn compute_all_variants(img: &image::DynamicImage) -> Vec<(u8, String, Vec<u8>, usize)> {
     let small = image_io::resize_max_side(img, MAX_SIDE);
-    let rgb_vars = image_io::orientation_variants(&small);
-    // Gray variants of the single to_gray — pixel-identical to
-    // `to_gray(orientation_variants(&small)[i])` since luma commutes with
-    // exact permutations (same argument as compare.rs).
+    // `to_rgb`/`to_gray` are per-pixel maps — they commute with the dihedral
+    // permutations, so a single conversion feeds a pure pixel-triple shuffle
+    // for the other 7 variants. Byte-identical to the old
+    // `to_rgb(orientation_variants(&small)[i])` /
+    // `to_gray(orientation_variants(&small)[i])` pair (proved on real
+    // Rgb8/Rgba8/Luma8 inputs by
+    // `image_io::tests::rgb_variants_match_dynamicimage_path`), while
+    // skipping 8 DynamicImage clones and 7 redundant to_rgb8 conversions.
+    let rgb_vars = image_io::rgb_orientation_variants(&image_io::to_rgb(&small));
     let gray_vars = image_io::gray_orientation_variants(&image_io::to_gray(&small));
     let per_variant: Vec<Vec<VariantRow>> = (0..rgb_vars.len())
         .into_par_iter()
         .map(|vi| {
-            let r = image_io::to_rgb(&rgb_vars[vi]);
-            variant_features(&gray_vars[vi], &r, vi == 0)
+            variant_features(&gray_vars[vi], &rgb_vars[vi], vi == 0)
                 .into_iter()
                 .map(|(name, bytes, dims)| (vi as u8, name, bytes, dims))
                 .collect()
@@ -422,32 +523,39 @@ enum Decoded<'a> {
     Bits(u64),
     F32(Vec<f32>),
     U8(&'a [u8]),
+    /// `blockhash` payload unpacked to its 32 tile-row bitmasks.
+    Blockhash(Box<[u64; 32]>),
+    /// `sliceprofile` payload decoded to its `Profile` (+ means), or the raw
+    /// bytes when malformed so the cosine fallback is reproduced exactly.
+    SliceProfile(sliceprofile::MatrixDecoded<'a>),
 }
 
 impl MatrixKernel {
     fn decode<'a>(self, b: &'a [u8]) -> Decoded<'a> {
         match self {
             Self::Bits => Decoded::Bits(unpack_bits(b)),
-            Self::Cosine | Self::CenteredCosine | Self::ExpDist => {
-                Decoded::F32(unpack_f32(b))
-            }
+            Self::Cosine | Self::CenteredCosine | Self::ExpDist => Decoded::F32(unpack_f32(b)),
             Self::U8Cosine => Decoded::U8(b),
+            Self::Blockhash => Decoded::Blockhash(Box::new(blockhash::payload_rows(b))),
+            Self::SliceProfile => Decoded::SliceProfile(sliceprofile::decode_for_matrix(b)),
         }
     }
 
     fn score(self, a: &Decoded<'_>, b: &Decoded<'_>) -> f64 {
         match (self, a, b) {
-            (Self::Bits, &Decoded::Bits(x), &Decoded::Bits(y)) => {
-                hashes::hash_similarity(x, y)
-            }
+            (Self::Bits, &Decoded::Bits(x), &Decoded::Bits(y)) => hashes::hash_similarity(x, y),
             (Self::Cosine, Decoded::F32(x), Decoded::F32(y)) => cosine(x, y),
             (Self::CenteredCosine, Decoded::F32(x), Decoded::F32(y)) => {
                 orbscale::centered_cosine(x, y)
             }
-            (Self::ExpDist, Decoded::F32(x), Decoded::F32(y)) => {
-                hu::log_moment_similarity(x, y)
-            }
+            (Self::ExpDist, Decoded::F32(x), Decoded::F32(y)) => hu::log_moment_similarity(x, y),
             (Self::U8Cosine, Decoded::U8(x), Decoded::U8(y)) => cosine_u8(x, y),
+            (Self::Blockhash, Decoded::Blockhash(x), Decoded::Blockhash(y)) => {
+                blockhash::rows_similarity(x, y)
+            }
+            (Self::SliceProfile, Decoded::SliceProfile(x), Decoded::SliceProfile(y)) => {
+                sliceprofile::similarity_decoded(x, y)
+            }
             _ => 0.0,
         }
     }
@@ -513,13 +621,18 @@ fn pair_matrix(n: usize, score: &(dyn Fn(usize, usize) -> f64 + Sync)) -> Vec<Ve
     m
 }
 
+/// All 8 variant indices — the rotation-aware cross-product domain.
+const ALL_VARIANTS: [u8; NUM_VARIANTS as usize] = [0, 1, 2, 3, 4, 5, 6, 7];
+/// Variant 0 only — the non-rotation-aware domain.
+const BASE_VARIANT: [u8; 1] = [0];
+
 /// The variant list a comparison scans: all 8 for the rotation-aware
 /// cross-product, just variant 0 otherwise.
-fn compared_variants(rotation_invariant: bool) -> Vec<u8> {
+fn compared_variants(rotation_invariant: bool) -> &'static [u8] {
     if rotation_invariant {
-        (0..NUM_VARIANTS).collect()
+        &ALL_VARIANTS
     } else {
-        vec![0]
+        &BASE_VARIANT
     }
 }
 
@@ -532,29 +645,69 @@ pub fn generic_similarity_matrix(
     sim: &(dyn Fn(&[u8], &[u8]) -> f64 + Sync),
 ) -> Vec<Vec<f64>> {
     let variants = compared_variants(rotation_invariant);
+    // Position-aligned view of `vectors` — pair scoring then indexes a Vec
+    // slot per side instead of two `HashMap<i64>` probes per pair.
+    let maps: Vec<Option<&HashMap<u8, Vec<u8>>>> =
+        ids.iter().map(|id| vectors.get(id)).collect();
     pair_matrix(
         ids.len(),
-        &|i, j| match (vectors.get(&ids[i]), vectors.get(&ids[j])) {
-            (Some(ma), Some(mb)) => variant_max(ma, mb, &variants, |a, b| sim(a, b)),
+        &|i, j| match (maps[i], maps[j]) {
+            (Some(ma), Some(mb)) => variant_max(ma, mb, variants, |a, b| sim(a, b)),
             _ => 0.0,
         },
     )
 }
 
-/// Decode each stored blob once per (image, variant) — the decoded maps the
-/// matrix and pair-stream paths then score without per-pair unpacking.
-fn decoded_map<'a>(
+/// Variant-indexed array of decoded payloads for one image — only the
+/// compared variants are decoded (a rotation-blind run never reads slots
+/// 1..8), and the inner pair loop indexes arrays instead of probing maps.
+type VariantDecoded<'a> = [Option<Decoded<'a>>; NUM_VARIANTS as usize];
+
+/// Decode each stored blob once per (image, compared variant), position-
+/// aligned to `ids` — pair scoring then indexes `Vec` slots instead of
+/// probing `HashMap`s for both the id and the variant.
+fn decoded_rows<'a>(
     vectors: &'a FeatureMap,
     ids: &[i64],
     kernel: MatrixKernel,
-) -> HashMap<i64, HashMap<u8, Decoded<'a>>> {
+    variants: &[u8],
+) -> Vec<Option<VariantDecoded<'a>>> {
     ids.iter()
-        .filter_map(|&id| {
-            vectors
-                .get(&id)
-                .map(|m| (id, m.iter().map(|(&v, b)| (v, kernel.decode(b))).collect()))
+        .map(|&id| {
+            vectors.get(&id).map(|m| {
+                let mut arr: VariantDecoded<'_> = std::array::from_fn(|_| None);
+                for &v in variants {
+                    if let Some(b) = m.get(&v) {
+                        arr[v as usize] = Some(kernel.decode(b));
+                    }
+                }
+                arr
+            })
         })
         .collect()
+}
+
+/// `variant_max` over pre-decoded per-variant arrays — direct indexing
+/// instead of per-pair HashMap probes. `variants` is always a subset of
+/// `0..NUM_VARIANTS` (see `compared_variants`), so indexing is in-range.
+fn variant_max_decoded(
+    ma: &VariantDecoded<'_>,
+    mb: &VariantDecoded<'_>,
+    variants: &[u8],
+    kernel: MatrixKernel,
+) -> f64 {
+    let mut mx = 0.0f64;
+    'outer: for &v in variants {
+        for &w in variants {
+            if let (Some(a), Some(b)) = (ma[v as usize].as_ref(), mb[w as usize].as_ref()) {
+                mx = mx.max(kernel.score(a, b));
+                if mx >= 0.9999 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    mx
 }
 
 /// N×N matrix on a [`MatrixKernel`]: decode each stored blob once per
@@ -566,12 +719,12 @@ fn decoded_similarity_matrix(
     rotation_invariant: bool,
     kernel: MatrixKernel,
 ) -> Vec<Vec<f64>> {
-    let decoded = decoded_map(vectors, ids, kernel);
     let variants = compared_variants(rotation_invariant);
+    let decoded = decoded_rows(vectors, ids, kernel, variants);
     pair_matrix(
         ids.len(),
-        &|i, j| match (decoded.get(&ids[i]), decoded.get(&ids[j])) {
-            (Some(ma), Some(mb)) => variant_max(ma, mb, &variants, |a, b| kernel.score(a, b)),
+        &|i, j| match (&decoded[i], &decoded[j]) {
+            (Some(ma), Some(mb)) => variant_max_decoded(ma, mb, variants, kernel),
             _ => 0.0,
         },
     )
@@ -581,8 +734,9 @@ fn decoded_similarity_matrix(
 /// The registry picks the extractor; extractors whose feature is already
 /// orientation-invariant (histogram/colorhash/hu) collapse the variant
 /// cross-product to variant 0 — identical payloads make every (v, w) score
-/// equal. Typed kernels decode each blob once; custom layouts fall back to
-/// the generic per-pair byte path.
+/// equal. Every registered extractor has a typed kernel, so each blob is
+/// decoded once per (image, compared variant); the generic per-pair byte
+/// path remains for unknown/custom callers of `generic_similarity_matrix`.
 pub fn similarity_matrix(
     vectors: &FeatureMap,
     ids: &[i64],
@@ -623,28 +777,30 @@ pub fn similarity_pairs_above(
             let variants = compared_variants(rotation_invariant && !ext.rotation_invariant());
             match ext.matrix_kernel() {
                 Some(k) => {
-                    let decoded = decoded_map(vectors, ids, k);
+                    let decoded = decoded_rows(vectors, ids, k, variants);
                     pair_select(
                         ids.len(),
-                        &|i, j| match (decoded.get(&ids[i]), decoded.get(&ids[j])) {
+                        &|i, j| match (&decoded[i], &decoded[j]) {
+                            (Some(ma), Some(mb)) => variant_max_decoded(ma, mb, variants, k),
+                            _ => 0.0,
+                        },
+                        &keep,
+                    )
+                }
+                None => {
+                    let maps: Vec<Option<&HashMap<u8, Vec<u8>>>> =
+                        ids.iter().map(|id| vectors.get(id)).collect();
+                    pair_select(
+                        ids.len(),
+                        &|i, j| match (maps[i], maps[j]) {
                             (Some(ma), Some(mb)) => {
-                                variant_max(ma, mb, &variants, |a, b| k.score(a, b))
+                                variant_max(ma, mb, variants, |a, b| ext.similarity(a, b))
                             }
                             _ => 0.0,
                         },
                         &keep,
                     )
                 }
-                None => pair_select(
-                    ids.len(),
-                    &|i, j| match (vectors.get(&ids[i]), vectors.get(&ids[j])) {
-                        (Some(ma), Some(mb)) => {
-                            variant_max(ma, mb, &variants, |a, b| ext.similarity(a, b))
-                        }
-                        _ => 0.0,
-                    },
-                    &keep,
-                ),
             }
         }
         // unknown algorithm mirrors the matrix path's 0.0-filled off-diagonal
@@ -681,8 +837,9 @@ mod tests {
     }
 
     /// `similarity_pairs_above` must equal the ≥-threshold upper-triangle
-    /// cells of `similarity_matrix` — kernel path (phash) and the generic
-    /// byte path (blockhash, no matrix kernel) alike.
+    /// cells of `similarity_matrix` — across the simple kernels (phash →
+    /// Bits, histogram → Cosine) and the custom-layout kernels (blockhash →
+    /// tile-row masks, sliceprofile → Profile).
     #[test]
     fn pairs_above_matches_matrix_cells() {
         let ids = [10i64, 11, 12, 13];
@@ -690,6 +847,7 @@ mod tests {
         for (algo, dims) in [
             ("phash", 8usize),
             ("blockhash", 128),
+            ("sliceprofile", 128),
             ("histogram", 216 * 4),
         ] {
             for rot_inv in [false, true] {
@@ -757,6 +915,105 @@ mod tests {
                 "{}",
                 ext.feature_name()
             );
+        }
+    }
+
+    /// Every `MatrixKernel`'s decode-once scoring must produce the identical
+    /// matrix the generic per-pair `ext.similarity` byte path produces —
+    /// `similarity_matrix` (which dispatches to the kernel) is compared
+    /// against `generic_similarity_matrix` driven by the extractor's own
+    /// `similarity`, covering every kernel incl. blockhash/sliceprofile.
+    #[test]
+    fn kernels_match_generic_byte_path() {
+        let ids = [20i64, 21, 22, 23, 24];
+        let variants: Vec<u8> = (0..NUM_VARIANTS).collect();
+        // (algo, payload bytes) — dims chosen so each kernel decodes fully.
+        for (algo, dims) in [
+            ("phash", 8usize),      // Bits
+            ("edgehash", 8),        // Bits
+            ("histogram", 216 * 4), // Cosine
+            ("orbscale", 32 * 4),   // CenteredCosine
+            ("hu", 7 * 4),          // ExpDist
+            ("ssim", 256),          // U8Cosine (gray_flat bytes)
+            ("blockhash", 128),     // Blockhash rows
+            ("sliceprofile", 128),  // SliceProfile struct
+            ("sliceprofile", 100),  // malformed → cosine fallback arm
+        ] {
+            let ext = extractor_for_algo(algo).unwrap();
+            assert!(
+                ext.matrix_kernel().is_some(),
+                "{algo} should have a matrix kernel"
+            );
+            for rot_inv in [false, true] {
+                let map = map_with(&ids, &variants, dims);
+                let got = similarity_matrix(&map, &ids, algo, rot_inv);
+                let effective = rot_inv && !ext.rotation_invariant();
+                let want =
+                    generic_similarity_matrix(&map, &ids, effective, &|a, b| ext.similarity(a, b));
+                assert_eq!(got, want, "algo={algo} rot_inv={rot_inv}");
+            }
+        }
+    }
+
+    /// `compute_ctx` must return byte-identical payloads to `compute` for
+    /// every extractor — this is what lets `variant_features` share the
+    /// phash/whash 32×32 downscale through `VariantCtx`.
+    #[test]
+    fn compute_ctx_matches_compute() {
+        let rgb_data: Vec<u8> = (0..(48 * 40 * 3))
+            .map(|i| ((i * 37 + i / 3 * 11) % 256) as u8)
+            .collect();
+        let rgb = RgbImage::new(48, 40, rgb_data);
+        let gray = image_io::to_gray(&image::DynamicImage::ImageRgb8(
+            image::ImageBuffer::from_raw(48, 40, rgb.data.clone()).unwrap(),
+        ));
+        let ctx = VariantCtx::new(&gray, &rgb);
+        for ext in EXTRACTORS {
+            assert_eq!(
+                ext.compute(&gray, &rgb),
+                ext.compute_ctx(&ctx),
+                "{}",
+                ext.feature_name()
+            );
+        }
+    }
+
+    /// End-to-end byte-identity for the variant pipeline: every stored row
+    /// of `compute_all_variants` must equal the pre-optimization path —
+    /// per-variant `to_gray`/`to_rgb` over `orientation_variants`
+    /// DynamicImages — exercised on an Rgba8 source so `to_rgb` really
+    /// converts (not just permutes).
+    #[test]
+    fn compute_all_variants_byte_identical_to_reference() {
+        let mut px = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::new(90, 70);
+        for (x, y, p) in px.enumerate_pixels_mut() {
+            *p = image::Rgba([
+                (x * 3 % 256) as u8,
+                (y * 5 % 256) as u8,
+                ((x ^ y) % 256) as u8,
+                255,
+            ]);
+        }
+        let img = image::DynamicImage::ImageRgba8(px);
+        let rows = compute_all_variants(&img);
+        // reference: the old DynamicImage-variant path
+        let small = image_io::resize_max_side(&img, MAX_SIDE);
+        let mut expected: Vec<VariantRow> = Vec::new();
+        for (vi, dv) in image_io::orientation_variants(&small).iter().enumerate() {
+            let g = image_io::to_gray(dv);
+            let r = image_io::to_rgb(dv);
+            for (name, bytes, dims) in variant_features(&g, &r, vi == 0) {
+                expected.push((vi as u8, name, bytes, dims));
+            }
+        }
+        assert_eq!(rows.len(), expected.len());
+        for (got, want) in rows.iter().zip(&expected) {
+            assert_eq!(
+                (got.0, &got.1, got.3),
+                (want.0, &want.1, want.3),
+                "row meta"
+            );
+            assert_eq!(got.2, want.2, "v{} {}", got.0, got.1);
         }
     }
 }

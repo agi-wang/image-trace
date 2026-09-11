@@ -64,6 +64,20 @@ fn main() {
     // ---- corpus ----
     let imgs: Vec<RgbImage> = (0..n_img).map(|s| make_photo(w, h, s as u8)).collect();
     let pngs: Vec<Vec<u8>> = imgs.iter().map(png_bytes).collect();
+
+    // `--emit-corpus <dir>`: write the corpus PNGs and exit — used by
+    // scripts/perf_e2e.sh to feed the server a deterministic workload.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--emit-corpus") {
+        let dir = args.get(pos + 1).expect("--emit-corpus <dir>");
+        std::fs::create_dir_all(dir).unwrap();
+        for (i, b) in pngs.iter().enumerate() {
+            std::fs::write(format!("{dir}/img_{i:03}.png"), b).unwrap();
+        }
+        println!("wrote {} images to {dir}", pngs.len());
+        return;
+    }
+
     let grays: Vec<_> = pngs
         .iter()
         .map(|b| {

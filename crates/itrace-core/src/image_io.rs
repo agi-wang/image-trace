@@ -186,6 +186,79 @@ pub fn gray_orientation_variants(gray: &GrayImage) -> Vec<GrayImage> {
     ]
 }
 
+/// Variants for an RGB buffer — the 3-byte-per-pixel sibling of
+/// [`gray_orientation_variants`]: identical transforms applied to pixel
+/// triples. `to_rgb` is a per-pixel conversion, so it commutes with the
+/// dihedral permutations and the result is byte-identical to
+/// `to_rgb(orientation_variants(&img)[i])` — for any `DynamicImage` color
+/// type — while skipping the per-variant DynamicImage clones/conversions.
+pub fn rgb_orientation_variants(rgb: &RgbImage) -> Vec<RgbImage> {
+    let (w, h) = (rgb.width, rgb.height);
+    let (wu, hu) = (w as usize, h as usize);
+    // Degenerate 0-sized buffer — every variant is empty (rotated variants
+    // swap dims). Mirrors the gray path's guard.
+    if wu == 0 || hu == 0 {
+        let rot = || RgbImage::new(h, w, Vec::new());
+        return vec![
+            rgb.clone(),
+            rot(),
+            rgb.clone(),
+            rot(),
+            rgb.clone(),
+            rot(),
+            rgb.clone(),
+            rot(),
+        ];
+    }
+    // out(x,y) = rgb[src(x,y)] — same source mapping as the gray `mapped`,
+    // copying whole 3-byte pixels. Used only for the strided
+    // (transpose-class) transforms.
+    fn mapped(rgb: &RgbImage, nw: u32, nh: u32, src: impl Fn(u32, u32) -> (u32, u32)) -> RgbImage {
+        let (nwu, w) = (nw as usize, rgb.width as usize);
+        let mut data = vec![0u8; nwu * nh as usize * 3];
+        // Iterate by destination row — kills the per-pixel dst multiply and
+        // its bounds check; each dst pixel copies the src triple.
+        for (y, dst_row) in data.chunks_exact_mut(nwu * 3).enumerate() {
+            let y = y as u32;
+            for (x, px) in dst_row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let (sx, sy) = src(x as u32, y);
+                let s = (sy as usize * w + sx as usize) * 3;
+                px.copy_from_slice(&rgb.data[s..s + 3]);
+            }
+        }
+        RgbImage::new(nw, nh, data)
+    }
+    // flip_horizontal: dst(x,y) = src(w-1-x,y) — per-row pixel reversal.
+    let mut flip_data = rgb.data.clone();
+    for row in flip_data.chunks_exact_mut(wu * 3) {
+        row.as_chunks_mut::<3>().0.reverse();
+    }
+    // rot180 = full-buffer pixel-order reversal:
+    // dst(y*w+x) = src(w*h-1-(y*w+x)) on triples.
+    let mut rot180_data = rgb.data.clone();
+    rot180_data.as_chunks_mut::<3>().0.reverse();
+    // flip+rot180 = flip_vertical: dst row y = src row h-1-y — memcpy rows.
+    let mut flipv_data = vec![0u8; wu * hu * 3];
+    for (y, dst_row) in flipv_data.chunks_exact_mut(wu * 3).enumerate() {
+        let sy = (hu - 1 - y) * wu * 3;
+        dst_row.copy_from_slice(&rgb.data[sy..sy + wu * 3]);
+    }
+    vec![
+        rgb.clone(),
+        // rot90 cw: new(x,y) = old(y, w-1-x)
+        mapped(rgb, h, w, |x, y| (y, h - 1 - x)),
+        RgbImage::new(w, h, rot180_data),
+        mapped(rgb, h, w, |x, y| (w - 1 - y, x)),
+        RgbImage::new(w, h, flip_data),
+        // flip + rot90: rotate90(flip(img)) → new(x,y) = old(w-1-y, h-1-x)
+        mapped(rgb, h, w, |x, y| (w - 1 - y, h - 1 - x)),
+        // flip + rot180 = flip_vertical
+        RgbImage::new(w, h, flipv_data),
+        // flip + rot270 → transpose: new(x,y) = old(y,x)
+        mapped(rgb, h, w, |x, y| (y, x)),
+    ]
+}
+
 /// Encode an RGB buffer as JPEG bytes.
 pub fn encode_jpeg(img: &RgbImage, quality: u8) -> anyhow::Result<Vec<u8>> {
     let buf: ImageBuffer<image::Rgb<u8>, &[u8]> =
@@ -201,4 +274,97 @@ pub fn encode_jpeg(img: &RgbImage, quality: u8) -> anyhow::Result<Vec<u8>> {
 pub fn save_jpeg(img: &RgbImage, path: &std::path::Path, quality: u8) -> anyhow::Result<()> {
     std::fs::write(path, encode_jpeg(img, quality)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic textured photo: gradient + pseudo-random blobs — the
+    /// same generator style the pipeline tests use (no fixtures).
+    fn photo_rgb(w: u32, h: u32, seed: u8) -> DynamicImage {
+        let mut img = image::RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let r = ((x * 255) / w) as u8;
+                let g = ((y * 255) / h) as u8;
+                let b = ((x ^ y) as u8).wrapping_add(seed);
+                img.put_pixel(x, y, image::Rgb([r, g, b]));
+            }
+        }
+        let mut k = seed as u32 + 1;
+        for _ in 0..40 {
+            k = k.wrapping_mul(1103515245).wrapping_add(12345);
+            let cx = (k >> 8) % w.max(1);
+            k = k.wrapping_mul(1103515245).wrapping_add(12345);
+            let cy = (k >> 8) % h.max(1);
+            let rad = 3 + (k >> 4) % 12;
+            for dy in -(rad as i32)..=rad as i32 {
+                for dx in -(rad as i32)..=rad as i32 {
+                    if dx * dx + dy * dy <= (rad * rad) as i32 {
+                        let px = (cx as i32 + dx).clamp(0, w as i32 - 1) as u32;
+                        let py = (cy as i32 + dy).clamp(0, h as i32 - 1) as u32;
+                        img.put_pixel(px, py, image::Rgb([(k >> 16) as u8, 200, (k >> 3) as u8]));
+                    }
+                }
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    /// `rgb_orientation_variants` must be byte-identical to the reference
+    /// path `to_rgb(orientation_variants(img)[i])` it replaces — checked on
+    /// Rgb8 (permutation only), Rgba8 and Luma8 (conversion + permutation)
+    /// sources, at odd sizes that stress the transpose mappings.
+    #[test]
+    fn rgb_variants_match_dynamicimage_path() {
+        let rgba = {
+            let mut buf = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::new(53, 37);
+            for (x, y, p) in buf.enumerate_pixels_mut() {
+                *p = image::Rgba([
+                    (x * 5 % 256) as u8,
+                    (y * 7 % 256) as u8,
+                    ((x * y) % 256) as u8,
+                    128 + (x % 64) as u8,
+                ]);
+            }
+            DynamicImage::ImageRgba8(buf)
+        };
+        let luma = {
+            let mut buf = image::ImageBuffer::<Luma<u8>, Vec<u8>>::new(61, 41);
+            for (x, y, p) in buf.enumerate_pixels_mut() {
+                *p = Luma([((x * 3 + y * 11) % 256) as u8]);
+            }
+            DynamicImage::ImageLuma8(buf)
+        };
+        for img in [photo_rgb(97, 61, 3), rgba, luma] {
+            let rgb0 = to_rgb(&img);
+            let fast = rgb_orientation_variants(&rgb0);
+            let reference = orientation_variants(&img);
+            assert_eq!(fast.len(), reference.len());
+            for i in 0..reference.len() {
+                let want = to_rgb(&reference[i]);
+                assert_eq!(fast[i].width, want.width, "variant {i} width");
+                assert_eq!(fast[i].height, want.height, "variant {i} height");
+                assert_eq!(fast[i].data, want.data, "variant {i} payload");
+            }
+        }
+    }
+
+    /// Degenerate/1-px buffers: every transform is still well-formed.
+    #[test]
+    fn rgb_variants_edge_sizes() {
+        for (w, h) in [(1u32, 1u32), (2, 1), (1, 3), (4, 2)] {
+            let data: Vec<u8> = (0..(w * h * 3) as u8).map(|v| v.wrapping_mul(37)).collect();
+            let rgb = RgbImage::new(w, h, data);
+            let vars = rgb_orientation_variants(&rgb);
+            assert_eq!(vars.len(), 8);
+            for (i, v) in vars.iter().enumerate() {
+                let (ew, eh) = if i % 2 == 0 { (w, h) } else { (h, w) };
+                assert_eq!((v.width, v.height), (ew, eh), "variant {i} dims {w}x{h}");
+            }
+            // identity + flips on these sizes are self-checking: variant 0 = src
+            assert_eq!(vars[0].data, rgb.data);
+        }
+    }
 }

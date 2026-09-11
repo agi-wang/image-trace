@@ -12,7 +12,7 @@ use itrace_core::descriptors;
 use itrace_core::features;
 use itrace_core::{documents, hashes, image_io, index, slice};
 use itrace_core::{GrayImage, RgbImage, HASH_GATE_ALGOS, SMART_ALGOS};
-use itrace_store::{ImageRecord, NewImage, NewRun, Project, Store};
+use itrace_store::{ImageMeta, ImageRecord, NewImage, NewRun, Project, Store};
 
 use crate::{enqueue_precompute_decoded, unique_key, ApiError, ApiResult, AppState};
 
@@ -202,9 +202,10 @@ pub fn invalidate_image(state: &AppState, image_id: i64) {
 /// because undecodable images are dropped. Builds run in parallel; the
 /// per-image Option collect keeps `kept` order deterministic regardless of
 /// rayon scheduling.
-fn load_prepared(
+fn load_prepared<T: Sync>(
     state: &AppState,
-    images: &[ImageRecord],
+    images: &[T],
+    id_path: impl Fn(&T) -> (i64, &str) + Sync,
     algo: &str,
     rot_inv: bool,
 ) -> (Vec<usize>, Vec<Arc<Prepared>>) {
@@ -215,11 +216,12 @@ fn load_prepared(
         .par_iter()
         .enumerate()
         .map(|(i, img)| {
-            let key: PreparedKey = (img.id, rot_inv, desc_key.clone());
+            let (id, path) = id_path(img);
+            let key: PreparedKey = (id, rot_inv, desc_key.clone());
             if let Some(p) = state.prepared_cache.lock().unwrap().get(&key) {
                 return Some((i, p));
             }
-            let bytes = store.read_file(&img.file_path).ok()?;
+            let bytes = store.read_file(path).ok()?;
             let p = Arc::new(Prepared::from_bytes(&bytes, &desc_algos, rot_inv).ok()?);
             state.prepared_cache.lock().unwrap().insert(key, Arc::clone(&p));
             Some((i, p))
@@ -339,7 +341,8 @@ pub fn run_compare(
         return Ok(result);
     }
 
-    let (kept, prepared) = load_prepared(state, images, algo, rot_inv);
+    let (kept, prepared) =
+        load_prepared(state, images, |i| (i.id, i.file_path.as_str()), algo, rot_inv);
     let matrix = arc_pairwise_matrix(&prepared, algo, rot_inv);
     let (groups, ungrouped) = compare::cluster(&matrix, threshold);
 
@@ -392,7 +395,7 @@ fn image_json(img: &ImageRecord) -> Value {
 
 pub fn run_smart_compare(
     state: &AppState,
-    images: &[ImageRecord],
+    images: &[ImageMeta],
     threshold: f64,
     min_agree: usize,
 ) -> anyhow::Result<Value> {
@@ -446,7 +449,6 @@ pub fn run_smart_compare(
 
     // gate: enough votes AND at least one hash-algorithm hit
     let mut confirmed = Vec::new();
-    let mut confirmed_map: HashMap<(usize, usize), Vec<String>> = HashMap::new();
     for ((i, j), hits) in &pair_hits {
         if hits.len() < min_agree {
             continue;
@@ -455,7 +457,6 @@ pub fn run_smart_compare(
             continue;
         }
         confirmed.push((*i, *j));
-        confirmed_map.insert((*i, *j), hits.iter().map(|(a, _)| a.clone()).collect());
     }
 
     let t = t0.elapsed().as_secs_f64();
@@ -474,13 +475,15 @@ pub fn run_smart_compare(
                 let key = (members[i].min(members[j]), members[i].max(members[j]));
                 if let Some(hits) = pair_hits.get(&key) {
                     for (a, s) in hits {
-                        algos.insert(a.clone());
+                        // &str set — dedups without cloning; same sorted
+                        // order as the old String set.
+                        algos.insert(a.as_str());
                         best = best.max(*s);
                     }
                 }
             }
         }
-        let matched: Vec<String> = algos.into_iter().collect();
+        let matched: Vec<String> = algos.into_iter().map(|s| s.to_string()).collect();
         dup_groups.push(json!({
             "images": members.iter().map(|&m| json!({
                 "id": images[m].id, "filename": images[m].filename,
@@ -520,7 +523,7 @@ pub fn run_smart_compare(
 /// Gate hashes (phash/dhash/whash) act as independent recall voters.
 pub fn run_dedup_scan(
     state: &AppState,
-    images: &[ImageRecord],
+    images: &[ImageMeta],
     radius: u32,
     threshold: f64,
     min_votes: u32,
@@ -537,7 +540,7 @@ pub fn run_dedup_scan(
 
     // candidate recall: MIH over all 8-variant keys of each gate hash —
     // equivalent coverage to variant-max comparison, sub-linear per image
-    let ready: Vec<&ImageRecord> = images
+    let ready: Vec<&ImageMeta> = images
         .iter()
         .filter(|i| i.feature_status == "ready")
         .collect();
@@ -584,16 +587,12 @@ pub fn run_dedup_scan(
     // Cross-variant max scored directly on the u64 keys unpacked into
     // `entries` above — the gate features are all Bits-kind, so
     // hash_similarity(a, b) is exactly ext.similarity(blob_a, blob_b)
-    // without re-touching the blobs. Verified scores are cached: the group
-    // pass below re-scores pairs already confirmed here.
+    // without re-touching the blobs. `score_of` is pure in (image_id,
+    // image_id), so the candidates below are scored in parallel and the
+    // group pass reuses those values through `score_cache`.
     let entry_pos: HashMap<i64, usize> =
         entries.iter().enumerate().map(|(p, e)| (e.image_id, p)).collect();
-    let mut score_cache: HashMap<(i64, i64), f64> = HashMap::new();
-    let mut score_pair = |ia: i64, ib: i64| -> f64 {
-        let key = (ia.min(ib), ia.max(ib));
-        if let Some(&s) = score_cache.get(&key) {
-            return s;
-        }
+    let score_of = |ia: i64, ib: i64| -> f64 {
         let mut best = 0.0f64;
         if let (Some(&ea), Some(&eb)) = (entry_pos.get(&ia), entry_pos.get(&ib)) {
             for (ka, kb) in entries[ea].variant_keys.iter().zip(&entries[eb].variant_keys) {
@@ -604,22 +603,43 @@ pub fn run_dedup_scan(
                 }
             }
         }
-        score_cache.insert(key, best);
         best
     };
 
+    // Verify every candidate pair in parallel — identical scores and
+    // confirmed order to the old sequential filter (`pairs` is sorted).
+    // The sequential collect then seeds the cache the group pass consults
+    // for intra-component pairs, exactly as the lazy filter did.
+    let scores: Vec<f64> = pairs
+        .par_iter()
+        .map(|&(i, j)| score_of(entries[i as usize].image_id, entries[j as usize].image_id))
+        .collect();
+    let mut score_cache: HashMap<(i64, i64), f64> = HashMap::with_capacity(pairs.len());
     // position of each image_id inside `ready`
     let pos: HashMap<i64, usize> =
         ready.iter().enumerate().map(|(p, i)| (i.id, p)).collect();
     let confirmed: Vec<(usize, usize)> = pairs
         .iter()
-        .filter(|&&(i, j)| {
-            score_pair(entries[i as usize].image_id, entries[j as usize].image_id) >= threshold
-        })
-        .filter_map(|&(i, j)| {
-            Some((*pos.get(&entries[i as usize].image_id)?, *pos.get(&entries[j as usize].image_id)?))
+        .zip(&scores)
+        .filter_map(|(&(i, j), &s)| {
+            let (ia, ib) = (entries[i as usize].image_id, entries[j as usize].image_id);
+            score_cache.insert((ia.min(ib), ia.max(ib)), s);
+            if s >= threshold {
+                Some((*pos.get(&ia)?, *pos.get(&ib)?))
+            } else {
+                None
+            }
         })
         .collect();
+    let mut score_pair = |ia: i64, ib: i64| -> f64 {
+        let key = (ia.min(ib), ia.max(ib));
+        if let Some(&s) = score_cache.get(&key) {
+            return s;
+        }
+        let s = score_of(ia, ib);
+        score_cache.insert(key, s);
+        s
+    };
 
     let groups_idx = compare::components_from_pairs(ready.len(), &confirmed);
     let mut dup_groups = Vec::new();
@@ -677,7 +697,7 @@ struct MatrixResult {
 
 fn compute_matrix(
     state: &AppState,
-    images: &[ImageRecord],
+    images: &[ImageMeta],
     algo: &str,
     rot_inv: bool,
 ) -> anyhow::Result<MatrixResult> {
@@ -698,7 +718,8 @@ fn compute_matrix(
 
     // fallback: precise path on decoded images; kept[] maps matrix indexes
     // back to `images` (undecodable files are dropped)
-    let (kept, prepared) = load_prepared(state, images, algo, rot_inv);
+    let (kept, prepared) =
+        load_prepared(state, images, |i| (i.id, i.file_path.as_str()), algo, rot_inv);
     let m = arc_pairwise_matrix(&prepared, algo, rot_inv);
     let names = kept.iter().map(|&k| images[k].filename.clone()).collect();
     let image_ids = kept.iter().map(|&k| images[k].id).collect();
@@ -707,7 +728,7 @@ fn compute_matrix(
 
 pub fn pairwise_matrix(
     state: &AppState,
-    images: &[ImageRecord],
+    images: &[ImageMeta],
     algo: &str,
     rot_inv: bool,
 ) -> anyhow::Result<Value> {
@@ -723,7 +744,7 @@ pub fn pairwise_matrix(
 pub fn build_report(
     state: &AppState,
     project: &Project,
-    images: &[ImageRecord],
+    images: &[ImageMeta],
     algo: &str,
     threshold: f64,
     rot_inv: bool,
@@ -804,8 +825,8 @@ fn chrono_now() -> String {
 
 // ---------- match data / visualize / slices ----------
 
-fn load_gray(store: &Store, img: &ImageRecord) -> anyhow::Result<GrayImage> {
-    let bytes = store.read_file(&img.file_path).context("图像文件不存在")?;
+fn load_gray(store: &Store, file_path: &str) -> anyhow::Result<GrayImage> {
+    let bytes = store.read_file(file_path).context("图像文件不存在")?;
     let decoded = image_io::decode(&bytes)?;
     let small = image_io::resize_max_side(&decoded, 1024);
     Ok(image_io::to_gray(&small))
@@ -813,30 +834,39 @@ fn load_gray(store: &Store, img: &ImageRecord) -> anyhow::Result<GrayImage> {
 
 /// `load_gray` behind the small shared cache — the match/slice endpoints
 /// re-decode the same few blobs on every call.
-fn load_gray_cached(state: &AppState, img: &ImageRecord) -> anyhow::Result<Arc<GrayImage>> {
-    if let Some(g) = state.gray_cache.lock().unwrap().get(&img.id) {
+fn load_gray_cached(
+    state: &AppState,
+    image_id: i64,
+    file_path: &str,
+) -> anyhow::Result<Arc<GrayImage>> {
+    if let Some(g) = state.gray_cache.lock().unwrap().get(&image_id) {
         return Ok(Arc::clone(g));
     }
-    let g = Arc::new(load_gray(&state.store, img)?);
+    let g = Arc::new(load_gray(&state.store, file_path)?);
     let mut cache = state.gray_cache.lock().unwrap();
     if cache.len() >= 64 {
         if let Some(&k) = cache.keys().next() {
             cache.remove(&k);
         }
     }
-    cache.insert(img.id, Arc::clone(&g));
+    cache.insert(image_id, Arc::clone(&g));
     Ok(g)
 }
 
 pub fn match_data(
     state: &AppState,
-    ia: &ImageRecord,
-    ib: &ImageRecord,
+    a_id: i64,
+    a_path: &str,
+    b_id: i64,
+    b_path: &str,
     algo: &str,
 ) -> ApiResult<Value> {
     let ext = descriptors::extractor_for(algo)
         .ok_or_else(|| ApiError::bad(format!("算法 {algo} 在此构建中不可用")))?;
-    let (ga, gb) = rayon::join(|| load_gray_cached(state, ia), || load_gray_cached(state, ib));
+    let (ga, gb) = rayon::join(
+        || load_gray_cached(state, a_id, a_path),
+        || load_gray_cached(state, b_id, b_path),
+    );
     let ga = ga.map_err(|e| ApiError::not_found(e.to_string()))?;
     let gb = gb.map_err(|e| ApiError::not_found(e.to_string()))?;
     let da = ext.detect(&ga, 500);
@@ -885,25 +915,25 @@ pub fn match_data(
 /// Read + decode + resize one image, returning its gray and rgb buffers.
 fn decode_side(
     store: &Store,
-    img: &ImageRecord,
+    file_path: &str,
     max_side: u32,
 ) -> ApiResult<(GrayImage, RgbImage)> {
     let bytes =
-        store.read_file(&img.file_path).map_err(|_| ApiError::not_found("图像文件不存在"))?;
+        store.read_file(file_path).map_err(|_| ApiError::not_found("图像文件不存在"))?;
     let im = image_io::resize_max_side(&image_io::decode(&bytes)?, max_side);
     Ok((image_io::to_gray(&im), image_io::to_rgb(&im)))
 }
 
 pub fn visualize(
     state: &AppState,
-    ia: &ImageRecord,
-    ib: &ImageRecord,
+    a_path: &str,
+    b_path: &str,
     algo: &str,
 ) -> ApiResult<Value> {
     let store = &state.store;
     let ext = descriptors::extractor_for(algo)
         .ok_or_else(|| ApiError::bad(format!("算法 {algo} 在此构建中不可用")))?;
-    let (a, b) = rayon::join(|| decode_side(store, ia, 640), || decode_side(store, ib, 640));
+    let (a, b) = rayon::join(|| decode_side(store, a_path, 640), || decode_side(store, b_path, 640));
     let (ga, ra) = a?;
     let (gb, rb) = b?;
     let da = ext.detect(&ga, 500);
@@ -929,12 +959,17 @@ fn uuid_short() -> String {
 
 pub fn slice_match(
     state: &AppState,
-    ia: &ImageRecord,
-    ib: &ImageRecord,
+    a_id: i64,
+    a_path: &str,
+    b_id: i64,
+    b_path: &str,
     rows: u32,
     cols: u32,
 ) -> anyhow::Result<slice::SliceMatchResult> {
-    let (ga, gb) = rayon::join(|| load_gray_cached(state, ia), || load_gray_cached(state, ib));
+    let (ga, gb) = rayon::join(
+        || load_gray_cached(state, a_id, a_path),
+        || load_gray_cached(state, b_id, b_path),
+    );
     let (ga, gb) = (ga?, gb?);
     Ok(slice::slice_match(&ga, &gb, rows, cols, 0.7))
 }

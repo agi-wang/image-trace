@@ -417,7 +417,7 @@ async fn list_images(
 ) -> ApiResult<Json<Vec<ImageRecord>>> {
     let (skip, limit) = (q.skip, q.limit.min(500));
     blocking(move || {
-        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        s.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
         Ok(Json(s.store.list_images(id, skip, limit)?))
     })
     .await
@@ -448,10 +448,12 @@ async fn get_thumbnail(
 ) -> ApiResult<impl IntoResponse> {
     let size = q.size.clamp(16, 2048);
     let bytes = blocking(move || {
-        let rec = s.store.get_image(id).map_err(|_| ApiError::not_found("图像不存在"))?;
+        // Only the blob key is needed — a 1-column lookup, not a full row.
+        let file_path =
+            s.store.get_image_path(id).map_err(|_| ApiError::not_found("图像不存在"))?;
         let thumb_key = format!("thumbnails/{id}_{size}.jpg");
         if !s.store.file_exists(&thumb_key) {
-            let img = core::image_io::decode(&s.store.read_file(&rec.file_path)?)?;
+            let img = core::image_io::decode(&s.store.read_file(&file_path)?)?;
             let th = core::image_io::resize_max_side(&img, size);
             let rgb = core::image_io::to_rgb(&th);
             s.store.write_file(&thumb_key, &core::image_io::encode_jpeg(&rgb, 85)?)?;
@@ -486,7 +488,7 @@ async fn upload(
     let data = data.ok_or_else(|| ApiError::bad("缺少文件内容"))?;
 
     blocking(move || {
-        s.store.get_project(project_id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        s.store.ensure_project(project_id).map_err(|_| ApiError::not_found("项目不存在"))?;
         service::handle_upload(&s, project_id, &filename, data)
     })
     .await
@@ -498,15 +500,17 @@ async fn feature_status(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
     blocking(move || {
-        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-        let images = s.store.list_images(id, 0, i64::MAX)?;
+        s.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_image_meta(id)?;
+        // count `ready` in the same pass that builds the items array
+        let mut ready = 0usize;
         let items: Vec<serde_json::Value> = images
             .iter()
             .map(|i| {
+                ready += usize::from(i.feature_status == "ready");
                 serde_json::json!({"id": i.id, "filename": i.filename, "status": i.feature_status})
             })
             .collect();
-        let ready = items.iter().filter(|i| i["status"] == "ready").count();
         Ok(Json(serde_json::json!({
             "project_id": id, "total": items.len(), "ready": ready,
             "all_ready": ready == items.len() && !items.is_empty(), "images": items
@@ -521,8 +525,8 @@ async fn recompute_features(
 ) -> ApiResult<Json<serde_json::Value>> {
     let st = s.clone();
     let pending = blocking(move || {
-        st.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-        let images = st.store.list_images(id, 0, i64::MAX)?;
+        st.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = st.store.list_image_meta(id)?;
         // file_exists is a syscall per image — run the pending filter in
         // parallel; the Option collect preserves list order (and thus the
         // enqueue order) identically to the old sequential filter.
@@ -559,7 +563,9 @@ async fn compare(
     }
     let (threshold, rot) = (body.threshold, body.rotation_invariant);
     blocking(move || {
-        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        s.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        // Full rows, not list_image_meta: the response embeds each image's
+        // complete record JSON (groups[].images[] / unique_images[]).
         let images = s.store.list_images(id, 0, i64::MAX)?;
         Ok(Json(service::run_compare(&s, &images, &algo, threshold, rot)?))
     })
@@ -577,8 +583,8 @@ async fn smart_compare(
     });
     let (threshold, min_agree) = (body.threshold, body.min_agree);
     blocking(move || {
-        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-        let images = s.store.list_images(id, 0, i64::MAX)?;
+        s.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_image_meta(id)?;
         Ok(Json(service::run_smart_compare(&s, &images, threshold, min_agree)?))
     })
     .await
@@ -596,8 +602,8 @@ async fn dedup(
     });
     let (radius, threshold, min_votes) = (body.radius, body.threshold, body.min_votes);
     blocking(move || {
-        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-        let images = s.store.list_images(id, 0, i64::MAX)?;
+        s.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_image_meta(id)?;
         Ok(Json(service::run_dedup_scan(&s, &images, radius, threshold, min_votes)?))
     })
     .await
@@ -611,8 +617,8 @@ async fn matrix(
     validate_algorithm(&q.algorithm)?;
     let (algo, rot) = (q.algorithm, q.rotation_invariant);
     blocking(move || {
-        s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-        let images = s.store.list_images(id, 0, i64::MAX)?;
+        s.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        let images = s.store.list_image_meta(id)?;
         Ok(Json(service::pairwise_matrix(&s, &images, &algo, rot)?))
     })
     .await
@@ -627,7 +633,7 @@ async fn report(
     let (algo, threshold, rot) = (q.algorithm, q.threshold, q.rotation_invariant);
     blocking(move || {
         let project = s.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
-        let images = s.store.list_images(id, 0, i64::MAX)?;
+        let images = s.store.list_image_meta(id)?;
         Ok(Json(service::build_report(&s, &project, &images, &algo, threshold, rot)?))
     })
     .await
@@ -638,7 +644,7 @@ async fn list_runs(
     Query(q): Query<RunsQuery>,
 ) -> ApiResult<Json<Vec<itrace_store::AnalysisRunRecord>>> {
     blocking(move || {
-        s.store.get_project(q.project_id).map_err(|_| ApiError::not_found("项目不存在"))?;
+        s.store.ensure_project(q.project_id).map_err(|_| ApiError::not_found("项目不存在"))?;
         Ok(Json(s.store.list_runs(q.project_id, q.skip, q.limit.min(500))?))
     })
     .await
@@ -667,9 +673,9 @@ async fn match_pairs(
     }
     let (a, b) = (body.image_a_id, body.image_b_id);
     blocking(move || {
-        let ia = s.store.get_image(a).map_err(|_| ApiError::not_found("图像不存在"))?;
-        let ib = s.store.get_image(b).map_err(|_| ApiError::not_found("图像不存在"))?;
-        service::match_data(&s, &ia, &ib, &algo)
+        let pa = s.store.get_image_path(a).map_err(|_| ApiError::not_found("图像不存在"))?;
+        let pb = s.store.get_image_path(b).map_err(|_| ApiError::not_found("图像不存在"))?;
+        service::match_data(&s, a, &pa, b, &pb, &algo)
     })
     .await
     .map(Json)
@@ -685,9 +691,9 @@ async fn visualize_match(
     }
     let (a, b) = (body.image_a_id, body.image_b_id);
     blocking(move || {
-        let ia = s.store.get_image(a).map_err(|_| ApiError::not_found("图像不存在"))?;
-        let ib = s.store.get_image(b).map_err(|_| ApiError::not_found("图像不存在"))?;
-        service::visualize(&s, &ia, &ib, &algo)
+        let pa = s.store.get_image_path(a).map_err(|_| ApiError::not_found("图像不存在"))?;
+        let pb = s.store.get_image_path(b).map_err(|_| ApiError::not_found("图像不存在"))?;
+        service::visualize(&s, &pa, &pb, &algo)
     })
     .await
     .map(Json)
@@ -701,9 +707,9 @@ async fn slice_match(
     let rows = body.rows.clamp(1, 8);
     let cols = body.cols.clamp(1, 8);
     blocking(move || {
-        let ia = s.store.get_image(a).map_err(|_| ApiError::not_found("图像不存在"))?;
-        let ib = s.store.get_image(b).map_err(|_| ApiError::not_found("图像不存在"))?;
-        Ok(Json(service::slice_match(&s, &ia, &ib, rows, cols)?))
+        let pa = s.store.get_image_path(a).map_err(|_| ApiError::not_found("图像不存在"))?;
+        let pb = s.store.get_image_path(b).map_err(|_| ApiError::not_found("图像不存在"))?;
+        Ok(Json(service::slice_match(&s, a, &pa, b, &pb, rows, cols)?))
     })
     .await
 }

@@ -49,6 +49,10 @@ impl FeatureExtractor for EdgeHashExtractor {
     fn similarity(&self, a: &[u8], b: &[u8]) -> f64 {
         hashes::hash_similarity(unpack_bits(a), unpack_bits(b))
     }
+    fn matrix_kernel(&self) -> Option<super::MatrixKernel> {
+        // u64 payload + hash_similarity — exactly the Bits kernel.
+        Some(super::MatrixKernel::Bits)
+    }
 }
 
 /// 64-bit edge-orientation signature of a grayscale image.

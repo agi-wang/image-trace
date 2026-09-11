@@ -209,6 +209,77 @@ fn decode(data: &[u8]) -> Option<Profile> {
     })
 }
 
+/// A successfully decoded payload plus its hoisted signal means — boxed so
+/// the `MatrixDecoded` stored per (image, variant) stays small.
+struct Full {
+    p: Profile,
+    m: Means,
+}
+
+/// Stored payload decoded once for the matrix kernel. `raw` is kept so the
+/// malformed-length fallback compares the exact same bytes `similarity`
+/// would; `full` holds the `Profile` + its means when decoding succeeds.
+pub(crate) struct MatrixDecoded<'a> {
+    raw: &'a [u8],
+    full: Option<Box<Full>>,
+}
+
+/// Decode once per (image, variant) — the `SliceProfile` matrix kernel then
+/// scores with [`similarity_decoded`], skipping the per-pair byte decode and
+/// the fixed side's `profile_means` pass.
+pub(crate) fn decode_for_matrix(data: &[u8]) -> MatrixDecoded<'_> {
+    MatrixDecoded {
+        raw: data,
+        full: decode(data).map(|p| {
+            let m = profile_means(&p);
+            Box::new(Full { p, m })
+        }),
+    }
+}
+
+/// Scoring core shared by `similarity` and the matrix kernel: `a` is fixed
+/// (profile + means hoisted), `b` is walked through all 8
+/// (swap, rev_r, rev_c) transforms in the original nested-loop order with
+/// the same early-exit at a perfect score.
+fn profile_pair_score(pa: &Profile, ma: &Means, pb: &Profile) -> f64 {
+    let mut best = 0.0f64;
+    for swap in [false, true] {
+        for rev_r in [false, true] {
+            for rev_c in [false, true] {
+                let tb = transform(pb, swap, rev_r, rev_c);
+                let mb = profile_means(&tb);
+                best = best.max(profile_cosine(pa, ma, &tb, &mb));
+                if !swap {
+                    // Axis swap is already covered by slice_score's
+                    // horizontal/vertical symmetry — only scan the
+                    // four reversal transforms.
+                    best = best.max(slice_score(pa, ma, &tb, &mb));
+                    best = best.max(slice_score(&tb, &mb, pa, ma));
+                }
+                if best >= 1.0 {
+                    // every term is clamped ≤ 1 — the max can't move
+                    return 1.0;
+                }
+            }
+        }
+    }
+    best.clamp(0.0, 1.0)
+}
+
+/// `similarity` on pre-decoded payloads — the identical value the raw-byte
+/// path computes, including the cosine fallback when either payload has a
+/// non-`4*BINS` length.
+pub(crate) fn similarity_decoded(a: &MatrixDecoded<'_>, b: &MatrixDecoded<'_>) -> f64 {
+    match (&a.full, &b.full) {
+        (Some(fa), Some(fb)) => profile_pair_score(&fa.p, &fa.m, &fb.p),
+        _ => {
+            let fa: Vec<f32> = a.raw.iter().map(|&v| v as f32).collect();
+            let fb: Vec<f32> = b.raw.iter().map(|&v| v as f32).collect();
+            super::cosine(&fa, &fb)
+        }
+    }
+}
+
 /// Slice-boundary profile extractor.
 pub struct SliceProfileExtractor;
 
@@ -302,37 +373,11 @@ impl FeatureExtractor for SliceProfileExtractor {
     }
 
     fn similarity(&self, a: &[u8], b: &[u8]) -> f64 {
-        let (pa, pb) = match (decode(a), decode(b)) {
-            (Some(pa), Some(pb)) => (pa, pb),
-            _ => {
-                let fa: Vec<f32> = a.iter().map(|&v| v as f32).collect();
-                let fb: Vec<f32> = b.iter().map(|&v| v as f32).collect();
-                return super::cosine(&fa, &fb);
-            }
-        };
-        let ma = profile_means(&pa);
-        let mut best = 0.0f64;
-        for swap in [false, true] {
-            for rev_r in [false, true] {
-                for rev_c in [false, true] {
-                    let tb = transform(&pb, swap, rev_r, rev_c);
-                    let mb = profile_means(&tb);
-                    best = best.max(profile_cosine(&pa, &ma, &tb, &mb));
-                    if !swap {
-                        // Axis swap is already covered by slice_score's
-                        // horizontal/vertical symmetry — only scan the
-                        // four reversal transforms.
-                        best = best.max(slice_score(&pa, &ma, &tb, &mb));
-                        best = best.max(slice_score(&tb, &mb, &pa, &ma));
-                    }
-                    if best >= 1.0 {
-                        // every term is clamped ≤ 1 — the max can't move
-                        return 1.0;
-                    }
-                }
-            }
-        }
-        best.clamp(0.0, 1.0)
+        // One decode path shared with the matrix kernel — identical scores.
+        similarity_decoded(&decode_for_matrix(a), &decode_for_matrix(b))
+    }
+    fn matrix_kernel(&self) -> Option<super::MatrixKernel> {
+        Some(super::MatrixKernel::SliceProfile)
     }
 }
 
