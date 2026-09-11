@@ -170,7 +170,9 @@ fn decode_flate_image(img: &lopdf::xobject::PdfImage) -> Option<Vec<u8>> {
                 return None;
             }
             inflated[..w * h * 4]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|c| {
                     let (cy, m, y, k) = (
                         c[0] as f32 / 255.0,
