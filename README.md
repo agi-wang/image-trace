@@ -1,63 +1,89 @@
-# Image Trace
+# Image Trace RS
 
-轻量的图像比对与文档图片提取工具，支持本地桌面体验和简单的 API 调用。
+`agi-wang/image-trace` 的 Rust 重写版：从底层重新设计的图像比对 / 查重引擎。
 
-## 你可以用它做什么
-- 从 PDF / DOCX / PPTX / 图片中提取图片素材
-- 去重与相似分组，找出重复或近似图片
-- 桌面端直接操作，也可以通过 API 集成到现有流程
+- **纯 Rust**，无 OpenCV 依赖：感知哈希、SSIM、HSV 直方图、模板 NCC、自研 ORB（FAST-9 + Harris 排序 + 质心方向 + 旋转 BRIEF-256）。
+- **变换鲁棒识别**：8 个二面体方向变体（4 旋转 × 镜像）特征预计算 + 网格切片模板匹配 + 多尺度关键点金字塔 —— 旋转 / 裁剪 / 切片重组后仍可识别。
+- **智能查重**：10 算法 → 阈值命中 → `min_agree` 投票 + 哈希门控 → Union-Find 连通分量分组。
+- **文档提取**：DOCX/PPTX（zip media）、PDF 内嵌图（DCTDecode/FlateDecode）。
+- **SQLite + WAL**：特征向量以 BLOB 存储（8 变体 × 特征），`pair_cache` 相似度缓存、`analysis_runs` 审计。
+- **可插拔存储**：文件负载走 `BlobStore` 抽象 —— 本地 `fs`（默认）或 MinIO/S3（`object_store`），元数据恒在 SQLite。
+- **模块化特征提取**：`FeatureExtractor` 注册表，每特征自含编码器与相似度度量；新特征（如 DINOv2）只需加一个注册项。
 
-## 快速开始
+## 架构
 
-### 下载已编译版本（最快）
-1) 前往 Releases：<https://github.com/zots0127/image-trace/releases/latest>  
-2) 选择你的平台包并解压/安装：  
-   - macOS（Apple/Intel）：`ImageTrace-mac-*.dmg` 或 `.zip`  
-   - Windows：`ImageTrace-win-*.exe`  
-   - Linux：`Image.Trace-*.AppImage`  
-   - 后端二进制同时内置 **PyInstaller** 与 **Nuitka** 版本，应用会优先使用 Nuitka（如存在）。  
-3) 首次运行若遇到安全拦截，按下方“常见问题（macOS）”处理 Gatekeeper 或在 Windows 选择“仍要运行”。  
-4) 启动后按界面提示创建项目、上传文件并开始比对。
+```
+crates/
+  itrace-core    图像 IO / 哈希 / 像素指标 / 描述子 / 切片匹配 / 文档提取 / 分组
+  itrace-store   SQLite 持久层 + BlobStore 文件后端（fs | s3）
+  itrace-server  axum HTTP API（/v1，详见 docs/openapi.yaml）
+  itrace-cli     离线 CLI（add / compare / smart / report / slice）
+docs/
+  openapi.yaml       OpenAPI 3.1 规范
+  ARCHITECTURE.md    架构与算法分层说明
+```
 
-### 桌面应用（推荐，内置后端）
-1) 安装 Node.js 18+ 与 npm。  
-2) `cd desktop && npm install`  
-3) `npm run dev` 启动 Electron。开发态会优先复用本机 `127.0.0.1:8000`，若未启动则自动拉起内置后端。  
-4) 在界面中：创建项目 → 上传文件/图片 → 点击“开始比对”。
+## 构建
 
-### 仅跑后端 API
-1) `cd backend_simplified`  
-2) 准备 Python 3.10+，创建虚拟环境：`python -m venv venv && source venv/bin/activate`（Windows 使用 `venv\Scripts\activate`）  
-3) 安装依赖：`pip install -r requirements.txt`  
-4) 运行：`uvicorn app.main:app --host 127.0.0.1 --port 8000`  
-5) 打开 `http://127.0.0.1:8000/docs` 试调接口。
+```bash
+cargo build --release --workspace
+# 可选 AKAZE（akaze crate，纯 Rust 非线性尺度空间）
+cargo build --release --features akaze -p itrace-server
+```
 
-### Web 前端（可选，指向本地后端）
-1) `cd ui && npm install`  
-2) 如需自定义后端地址，设置环境变量 `VITE_API_BASE`（默认 `http://127.0.0.1:8000`）。  
-3) `npm run dev`，浏览器访问提示的本地端口。
+## 运行
 
-## 使用流程
-1) 创建项目（桌面端界面，或 `POST /projects`）。  
-2) 上传文档/图片（桌面端拖拽，或 `POST /upload` 携带 `project_id` 与文件）。  
-3) 执行比对（桌面端“开始比对”，或 `POST /compare/{project_id}`）。  
-4) 查看分组结果（桌面端展示，或 `GET /results/{project_id}`）。  
-5) 需要时删除或重新上传文件，重复步骤 2-4。
+```bash
+# HTTP 服务（默认 0.0.0.0:8000，fs 存储）
+DATA_DIR=data PORT=8000 ./target/release/itrace-server
 
-## 目录速览
-- `backend_simplified/`：FastAPI 后端（本地数据存储在 `data/`）。
-- `desktop/`：Electron 桌面端，包含内置后端的启动与打包脚本。
-- `ui/`：可选的 Web 前端（Vite + React）。
+# MinIO/S3 存储：先起对象存储（docker-compose 自带 minio + 建桶 itrace）
+docker compose up -d minio init-bucket
+ITRACE_STORAGE=s3 S3_ENDPOINT=http://localhost:9000 \
+S3_BUCKET=itrace S3_ACCESS_KEY=minioadmin S3_SECRET_KEY=minioadmin \
+DATA_DIR=data PORT=8000 ./target/release/itrace-server
 
-## 常见问题（macOS）
-- Gatekeeper 拦截或提示“已损坏”：在 Finder 右键选择“打开”并确认，或在“系统设置 -> 隐私与安全性”允许；仍有隔离时可执行 `xattr -r -d com.apple.quarantine "<App 路径>"`。  
-- 无法启动：确认无端口占用；必要时为可执行文件添加权限 `chmod +x "<App 路径>/Contents/MacOS/Image Trace"`。  
-- 后端未响应：确认 127.0.0.1:8000 可访问，或在桌面端菜单/设置中重新启动后端。
+# CLI
+itrace create "项目A"
+itrace add 1 photo.jpg report.docx
+itrace compare 1 --algorithm phash --threshold 0.85 --rotation-invariant
+itrace smart 1 --threshold 0.92 --min-agree 3
+itrace report 1
+itrace slice 1 4 --rows 2 --cols 2
+```
 
-## 计划
-- 多语言界面与文档支持（进行中，欢迎需求反馈）。  
-- 更简化的安装包与自动更新。  
-- 更多格式支持与批量导出能力。
+## API 速览（详见 docs/openapi.yaml）
 
-## 许可证
-MIT License
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | /v1/health | 健康检查 |
+| GET | /v1/system/info | 算法清单与引擎能力 |
+| CRUD | /v1/projects[/{id}] | 项目 |
+| GET | /v1/projects/{id}/images | 图片列表 |
+| POST | /v1/upload | multipart 上传（图片或 docx/pptx/pdf，自动提取+预计算） |
+| GET | /v1/projects/{id}/feature-status | 特征就绪状态 |
+| POST | /v1/projects/{id}/compare | 单算法比对（rotation_invariant 可选） |
+| POST | /v1/projects/{id}/smart-compare | 多算法投票智能查重 |
+| POST | /v1/projects/{id}/dedup | 索引查重（MIH 召回，亿级规模） |
+| GET | /v1/projects/{id}/matrix | 相似度矩阵 |
+| GET | /v1/projects/{id}/report | 查重报告 |
+| POST | /v1/match/pairs | 两图关键点匹配明细 |
+| POST | /v1/match/visualize | 生成关键点连线可视化图 |
+| POST | /v1/match/slices | 网格切片/子图检测 |
+| GET | /v1/analysis-runs?project_id= | 分析历史 |
+
+## 算法分层
+
+1. **感知哈希层**（ahash/dhash/phash/whash/colorhash）：O(1) 汉明距离，方向变体覆盖旋转/翻转。
+2. **像素指标层**：SSIM（亮度/对比度鲁棒）、HSV 直方图（几何无关）、模板 NCC（子图定位）。
+3. **局部特征层**：纯 Rust ORB——8 级金字塔 FAST-9 检测、Harris 排序、质心方向分配、256bit 旋转 BRIEF、BFMatcher crossCheck / Lowe ratio。
+4. **变换鲁棒层**（新增）：切片网格 × 4 旋转模板匹配（`is_slice_of_a`）、全方向变体指纹库、`contains` 子图判定。
+5. **扩展特征层**：edgehash（方向梯度哈希）、blockhash（分块抗裁剪）、colorlayout（MPEG-7 色彩布局）、hu（矩不变量）、orbscale（多尺度 ORB）、sliceprofile（切片边界剖面）—— 全部接入智能查重投票与 dedup 索引。
+
+深度嵌入（DINOv2 via ONNX）预留为 feature 插槽。
+
+## 测试
+
+```bash
+cargo test --workspace   # 13 项端到端算法测试（合成图像 + 旋转/切片验证）
+```
