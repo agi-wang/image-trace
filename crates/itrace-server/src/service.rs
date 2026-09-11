@@ -523,10 +523,12 @@ pub fn run_smart_compare(
 /// Gate hashes (phash/dhash/whash) act as independent recall voters.
 pub fn run_dedup_scan(
     state: &AppState,
+    project_id: i64,
     images: &[ImageMeta],
     radius: u32,
     threshold: f64,
     min_votes: u32,
+    shard_bits: u32,
 ) -> anyhow::Result<Value> {
     let store = &state.store;
     let n = images.len();
@@ -581,7 +583,19 @@ pub fn run_dedup_scan(
         .collect();
 
     let t0 = std::time::Instant::now();
-    let pairs = index::dedup_candidates(&entries, radius, min_votes);
+    // Sharded MIH recall (shard_bits=0 ≡ monolithic). When
+    // ITRACE_MIH_INDEX_DIR is set, load-or-build a project-scoped
+    // persistent gate index (stable image_id owners); otherwise rebuild
+    // in memory each scan (identical to prior behaviour).
+    let index_dir = index::resolve_mih_index_dir()
+        .map(|base| index::project_mih_index_path(&base, project_id));
+    let (pairs, index_loaded) = index::dedup_candidates_sharded_cached(
+        &entries,
+        radius,
+        min_votes,
+        shard_bits,
+        index_dir.as_deref(),
+    )?;
     let naive = (n as u64) * (n as u64 - 1) / 2;
 
     // Cross-variant max scored directly on the u64 keys unpacked into
@@ -678,6 +692,7 @@ pub fn run_dedup_scan(
         "duplicate_groups": dup_groups,
         "unique_count": n - dup_n,
         "scan_seconds": (t * 1000.0).round() / 1000.0,
+        "index_loaded": index_loaded,
         "summary": format!(
             "索引扫描 {} 张图片：召回候选 {} 对（全量需 {} 对），确认 {} 组共 {} 张",
             entries.len(), pairs.len(), naive, dup_groups.len(), dup_n)

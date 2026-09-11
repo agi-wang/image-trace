@@ -161,6 +161,9 @@ struct DedupRequest {
     /// Gate hashes that must flag a pair for it to be verified.
     #[serde(default = "default_dedup_votes")]
     min_votes: u32,
+    /// Optional MIH shard bit-width (0..=16). Omitted => env ITRACE_MIH_SHARD_BITS or 8.
+    #[serde(default)]
+    shard_bits: Option<u32>,
 }
 fn default_dedup_radius() -> u32 {
     10
@@ -599,12 +602,14 @@ async fn dedup(
         radius: default_dedup_radius(),
         threshold: default_threshold(),
         min_votes: default_dedup_votes(),
+        shard_bits: None,
     });
     let (radius, threshold, min_votes) = (body.radius, body.threshold, body.min_votes);
+    let shard_bits = itrace_core::index::resolve_shard_bits(body.shard_bits);
     blocking(move || {
         s.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
         let images = s.store.list_image_meta(id)?;
-        Ok(Json(service::run_dedup_scan(&s, &images, radius, threshold, min_votes)?))
+        Ok(Json(service::run_dedup_scan(&s, id, &images, radius, threshold, min_votes, shard_bits)?))
     })
     .await
 }

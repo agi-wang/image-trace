@@ -11,7 +11,8 @@ use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 
 use itrace_core::compare::{self, Prepared};
-use itrace_core::{documents, hashes, image_io, features};
+use itrace_core::{documents, hashes, image_io, features, index};
+use itrace_core::HASH_GATE_ALGOS;
 use itrace_store::{NewImage, Store};
 
 #[derive(Parser)]
@@ -54,6 +55,21 @@ enum Cmd {
         threshold: f64,
         #[arg(long, default_value = "3")]
         min_agree: usize,
+    },
+    /// 索引查重（MIH 候选召回 + 门控哈希复核；对齐 server /dedup 默认）
+    Dedup {
+        project_id: i64,
+        /// Hamming radius for MIH recall (server default 10)
+        #[arg(long, default_value = "10")]
+        radius: u32,
+        #[arg(long, default_value = "0.85")]
+        threshold: f64,
+        /// Distinct gate algorithms that must flag a pair (server default 2)
+        #[arg(long, default_value = "2")]
+        min_votes: u32,
+        /// MIH shard bits (0..=16). Default: env ITRACE_MIH_SHARD_BITS or 8.
+        #[arg(long)]
+        shard_bits: Option<u32>,
     },
     /// 重复图片报告
     Report {
@@ -202,6 +218,9 @@ fn main() -> anyhow::Result<()> {
             }
             println!("scan: {:.2}s, {} dup groups", t0.elapsed().as_secs_f64(), shown);
         }
+        Cmd::Dedup { project_id, radius, threshold, min_votes, shard_bits } => {
+            run_cli_dedup(&store, project_id, radius, threshold, min_votes, shard_bits)?;
+        }
         Cmd::Report { project_id, algorithm, threshold } => {
             let images = store.list_image_meta(project_id)?;
             let desc_algos = compare::desc_algos_for(&algorithm);
@@ -229,6 +248,147 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
     }
+    Ok(())
+}
+
+
+/// CLI path mirroring server `run_dedup_scan`: load gate-hash variant keys
+/// from the store, MIH recall via `dedup_confirmed`, print groups like smart.
+fn run_cli_dedup(
+    store: &Store,
+    project_id: i64,
+    radius: u32,
+    threshold: f64,
+    min_votes: u32,
+    shard_bits_opt: Option<u32>,
+) -> anyhow::Result<()> {
+    let shard_bits = index::resolve_shard_bits(shard_bits_opt);
+    let images = store.list_image_meta(project_id)?;
+    let n = images.len();
+    if n < 2 {
+        println!("图片不足");
+        return Ok(());
+    }
+    let ready: Vec<&itrace_store::ImageMeta> = images
+        .iter()
+        .filter(|i| i.feature_status == "ready")
+        .collect();
+    if ready.len() < 2 {
+        eprintln!("特征尚未就绪，先运行 `itrace precompute {project_id}`");
+        return Ok(());
+    }
+    let ids: Vec<i64> = ready.iter().map(|i| i.id).collect();
+    let variants: Vec<u8> = (0..features::NUM_VARIANTS).collect();
+    let mut feat_names: Vec<&'static str> = Vec::new();
+    let gate_feats: Vec<usize> = HASH_GATE_ALGOS
+        .iter()
+        .filter_map(|a| {
+            features::algo_to_feature(a).map(|f| {
+                match feat_names.iter().position(|&x| x == f) {
+                    Some(i) => i,
+                    None => {
+                        feat_names.push(f);
+                        feat_names.len() - 1
+                    }
+                }
+            })
+        })
+        .collect();
+    let maps = store.load_feature_maps(&ids, &feat_names, &variants)?;
+    let entries: Vec<index::DedupKeys> = ready
+        .iter()
+        .filter_map(|img| {
+            let variant_keys: Vec<Vec<u64>> = gate_feats
+                .iter()
+                .map(|&fi| {
+                    variants
+                        .iter()
+                        .filter_map(|v| maps[fi].get(&img.id).and_then(|vm| vm.get(v)))
+                        .map(|b| features::unpack_bits(b))
+                        .collect()
+                })
+                .collect();
+            if variant_keys.iter().all(|k| k.len() == variants.len()) {
+                Some(index::DedupKeys {
+                    image_id: img.id,
+                    variant_keys,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    if entries.len() < 2 {
+        println!("可索引图片不足（需要完整 gate 特征）");
+        return Ok(());
+    }
+
+    let t0 = std::time::Instant::now();
+    let index_dir = index::resolve_mih_index_dir()
+        .map(|base| index::project_mih_index_path(&base, project_id));
+    let (cand_n, confirmed, index_loaded) = index::dedup_confirmed_cached(
+        &entries,
+        radius,
+        threshold,
+        min_votes,
+        shard_bits,
+        index_dir.as_deref(),
+    )?;
+    let pos: std::collections::HashMap<i64, usize> =
+        ready.iter().enumerate().map(|(p, r)| (r.id, p)).collect();
+    let pairs: Vec<(usize, usize)> = confirmed
+        .iter()
+        .filter_map(|&(i, j, _)| {
+            let ia = entries[i].image_id;
+            let ib = entries[j].image_id;
+            let pi = *pos.get(&ia)?;
+            let pj = *pos.get(&ib)?;
+            Some((pi.min(pj), pi.max(pj)))
+        })
+        .collect();
+    // Build score lookup for group confidence
+    let mut score_cache: std::collections::HashMap<(i64, i64), f64> =
+        std::collections::HashMap::new();
+    for &(i, j, s) in &confirmed {
+        let ia = entries[i].image_id;
+        let ib = entries[j].image_id;
+        score_cache.insert((ia.min(ib), ia.max(ib)), s);
+    }
+    let groups = compare::components_from_pairs(ready.len(), &pairs);
+    let mut shown = 0;
+    let mut grouped = 0usize;
+    for members in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        shown += 1;
+        grouped += members.len();
+        let mut best = 0.0f64;
+        for a in 0..members.len() {
+            for b in (a + 1)..members.len() {
+                let ia = ready[members[a]].id;
+                let ib = ready[members[b]].id;
+                if let Some(&s) = score_cache.get(&(ia.min(ib), ia.max(ib))) {
+                    best = best.max(s);
+                }
+            }
+        }
+        println!("duplicate group {shown} (confidence {best:.4}):");
+        for &m in &members {
+            println!("  - {} ({})", ready[m].filename, ready[m].id);
+        }
+    }
+    let naive = (n as u64) * (n as u64 - 1) / 2;
+    println!(
+        "indexed {}, candidates {} (naive {}), {} dup groups / {} images, scan {:.3}s, index_loaded={}",
+        entries.len(),
+        cand_n,
+        naive,
+        shown,
+        grouped,
+        t0.elapsed().as_secs_f64(),
+        index_loaded
+    );
     Ok(())
 }
 

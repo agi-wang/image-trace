@@ -18,6 +18,48 @@
 //! per 100M-image index — shard by project or key-prefix beyond that.
 //! `canonical_rot64` remains as a single-key fast path for exact
 //! rotation/flip duplicates of ahash-style equivariant hashes.
+//!
+//! # Sharding (`ShardedMihIndex`)
+//!
+//! Keys are routed to one of `2^shard_bits` shards by the **high**
+//! `shard_bits` of the u64 key (`key >> (64 - shard_bits)`). Queries probe
+//! every shard whose prefix is within Hamming distance `radius` of the
+//! query prefix — necessary for exact recall vs a monolithic `MihIndex`
+//! (a near-duplicate may differ in a high bit). Prefer `shard_bits` in
+//! `0..=16` (1 … 65 536 shards).
+//!
+//! # On-disk layout (`save_dir` / `load_dir`)
+//!
+//! ```text
+//! <dir>/
+//!   meta.json          {"magic":"ITMIH1","version":1,"shard_bits":N,"key_count":K}
+//!   shards/
+//!     0000.bin         …  NNNN.bin   (zero-padded 4-digit shard id)
+//! ```
+//!
+//! Each `NNNN.bin` is little-endian compact:
+//! `u64 n`, then `n × u64` keys, then `n × u32` owners. Bucket tables are
+//! rebuilt on load (simplest correct approach).
+//!
+//! # Persistent project gate index (`ITRACE_MIH_INDEX_DIR`)
+//!
+//! When the env var is set, CLI/server dedup load-or-build a project-scoped
+//! bundle under `{ITRACE_MIH_INDEX_DIR}/project_{id}/`:
+//!
+//! ```text
+//! project_{id}/
+//!   meta.json          {"magic":"ITMIHP1","version":1,"shard_bits":N,
+//!                       "gate_algo_count":M,"image_count":K}
+//!   image_ids.bin      K × i64 LE — owner slot → image_id (sorted ascending)
+//!   indexes/
+//!     0/ … M-1/        each a ShardedMihIndex (`ITMIH1`) for one gate algo
+//! ```
+//!
+//! Owners are dense `u32` slots into `image_ids.bin` (NOT ephemeral enumerate
+//! indices). On load we require exact match of `shard_bits`, `gate_algo_count`,
+//! and the sorted image_id set vs current ready entries; any mismatch rebuilds
+//! and overwrites. Feature-blob changes for an unchanged image set are not
+//! detected — delete the project dir to force a rebuild.
 
 use std::collections::HashMap;
 
@@ -145,7 +187,7 @@ impl MihIndex {
     /// Owner ids of all stored keys within hamming `radius` of `key`,
     /// appended to `out` (sorted + deduped in place). Reusing one buffer
     /// across queries avoids an allocation per lookup.
-    fn query_into(&self, key: u64, radius: u32, out: &mut Vec<u32>) {
+    pub fn query_into(&self, key: u64, radius: u32, out: &mut Vec<u32>) {
         out.clear();
         for (t, table) in self.tables.iter().enumerate() {
             let sub = ((key >> (t * 8)) & 0xff) as usize;
@@ -178,6 +220,198 @@ impl MihIndex {
         let hits = self.query(key, radius);
         self.insert(key, owner);
         hits
+    }
+}
+
+/// Route `key` to a shard id using the high `shard_bits` of the key.
+///
+/// Bit choice: `shard = key >> (64 - shard_bits)` when `shard_bits > 0`,
+/// else shard `0`. High bits keep low-order MIH substrings (the ones MIH
+/// tables hash on most naturally for nearby keys) co-located more often
+/// than low-bit routing, and give a stable total order for multi-node
+/// ownership by shard id.
+#[inline]
+pub fn shard_id_for(key: u64, shard_bits: u32) -> usize {
+    if shard_bits == 0 {
+        0
+    } else {
+        (key >> (64 - shard_bits)) as usize
+    }
+}
+
+/// Multi-shard wrapper over [`MihIndex`]. See module docs for routing and
+/// on-disk layout.
+pub struct ShardedMihIndex {
+    shard_bits: u32,
+    shards: Vec<MihIndex>,
+}
+
+impl ShardedMihIndex {
+    /// Create an empty index with `2^shard_bits` shards (`shard_bits == 0` → 1).
+    /// Panics if `shard_bits > 16`.
+    pub fn new(shard_bits: u32) -> Self {
+        assert!(
+            shard_bits <= 16,
+            "shard_bits {shard_bits} exceeds sensible max 16"
+        );
+        let n = 1usize << shard_bits;
+        Self {
+            shard_bits,
+            shards: (0..n).map(|_| MihIndex::new()).collect(),
+        }
+    }
+
+    pub fn shard_bits(&self) -> u32 {
+        self.shard_bits
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    fn shard_of(&self, key: u64) -> usize {
+        shard_id_for(key, self.shard_bits)
+    }
+
+    pub fn insert(&mut self, key: u64, owner: u32) {
+        let sid = self.shard_of(key);
+        self.shards[sid].insert(key, owner);
+    }
+
+    /// Owner ids within Hamming `radius`, merged across all shards whose
+    /// prefix is reachable under that radius.
+    pub fn query_into(&self, key: u64, radius: u32, out: &mut Vec<u32>) {
+        out.clear();
+        let mut scratch = Vec::new();
+        if self.shard_bits == 0 {
+            self.shards[0].query_into(key, radius, out);
+            return;
+        }
+        let prefix = self.shard_of(key) as u64;
+        // Prefix Hamming distance is a lower bound on full-key distance, so
+        // only shards with popcount(sid ^ prefix) ≤ radius can contribute.
+        for (sid, shard) in self.shards.iter().enumerate() {
+            if ((sid as u64) ^ prefix).count_ones() <= radius {
+                shard.query_into(key, radius, &mut scratch);
+                out.extend_from_slice(&scratch);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    pub fn query(&self, key: u64, radius: u32) -> Vec<u32> {
+        let mut owners = Vec::new();
+        self.query_into(key, radius, &mut owners);
+        owners
+    }
+
+    pub fn insert_query(&mut self, key: u64, owner: u32, radius: u32) -> Vec<u32> {
+        let hits = self.query(key, radius);
+        self.insert(key, owner);
+        hits
+    }
+
+    /// Persist to `path/` (`meta.json` + `shards/NNNN.bin`). See module docs.
+    pub fn save_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        std::fs::create_dir_all(path)?;
+        let shards_dir = path.join("shards");
+        std::fs::create_dir_all(&shards_dir)?;
+        let meta = serde_json::json!({
+            "magic": "ITMIH1",
+            "version": 1,
+            "shard_bits": self.shard_bits,
+            "key_count": self.len(),
+        });
+        std::fs::write(
+            path.join("meta.json"),
+            serde_json::to_vec_pretty(&meta).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+            })?,
+        )?;
+        for (i, shard) in self.shards.iter().enumerate() {
+            let fname = format!("{i:04}.bin");
+            let mut f = std::fs::File::create(shards_dir.join(fname))?;
+            let n = shard.keys.len() as u64;
+            f.write_all(&n.to_le_bytes())?;
+            for &k in &shard.keys {
+                f.write_all(&k.to_le_bytes())?;
+            }
+            for &o in &shard.owners {
+                f.write_all(&o.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a directory written by [`save_dir`]. Rebuilds MIH tables from
+    /// the compact key/owner arrays.
+    pub fn load_dir(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let meta_bytes = std::fs::read(path.join("meta.json"))?;
+        let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let magic = meta.get("magic").and_then(|v| v.as_str()).unwrap_or("");
+        if magic != "ITMIH1" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("bad mih magic: {magic}"),
+            ));
+        }
+        let version = meta.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+        if version != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported mih version: {version}"),
+            ));
+        }
+        let shard_bits = meta
+            .get("shard_bits")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing shard_bits")
+            })? as u32;
+        if shard_bits > 16 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("shard_bits {shard_bits} > 16"),
+            ));
+        }
+        let mut idx = Self::new(shard_bits);
+        let shards_dir = path.join("shards");
+        for sid in 0..idx.shard_count() {
+            let fname = format!("{sid:04}.bin");
+            let mut f = std::fs::File::open(shards_dir.join(fname))?;
+            let mut nbuf = [0u8; 8];
+            f.read_exact(&mut nbuf)?;
+            let n = u64::from_le_bytes(nbuf) as usize;
+            let mut key_buf = [0u8; 8];
+            let mut owner_buf = [0u8; 4];
+            let mut keys = Vec::with_capacity(n);
+            for _ in 0..n {
+                f.read_exact(&mut key_buf)?;
+                keys.push(u64::from_le_bytes(key_buf));
+            }
+            let mut owners = Vec::with_capacity(n);
+            for _ in 0..n {
+                f.read_exact(&mut owner_buf)?;
+                owners.push(u32::from_le_bytes(owner_buf));
+            }
+            for (&k, &o) in keys.iter().zip(&owners) {
+                idx.shards[sid].insert(k, o);
+            }
+        }
+        Ok(idx)
     }
 }
 
@@ -216,6 +450,333 @@ pub struct DedupKeys {
     pub image_id: i64,
     pub variant_keys: Vec<Vec<u64>>,
 }
+
+
+/// Resolve MIH shard bit-width for sharded dedup.
+///
+/// Precedence: `override_bits` if `Some`, else env `ITRACE_MIH_SHARD_BITS`,
+/// else default `8`. Clamped to `0..=16` (`0` = single shard / monolithic).
+pub fn resolve_shard_bits(override_bits: Option<u32>) -> u32 {
+    let raw = override_bits.or_else(|| {
+        std::env::var("ITRACE_MIH_SHARD_BITS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+    });
+    raw.unwrap_or(8).min(16)
+}
+
+/// Base directory for persisted project MIH bundles (`ITRACE_MIH_INDEX_DIR`).
+/// Empty / unset → `None` (in-memory rebuild each scan).
+pub fn resolve_mih_index_dir() -> Option<std::path::PathBuf> {
+    let v = std::env::var_os("ITRACE_MIH_INDEX_DIR")?;
+    if v.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(v))
+}
+
+/// `{base}/project_{id}` — project-scoped gate-index bundle root.
+pub fn project_mih_index_path(base: &std::path::Path, project_id: i64) -> std::path::PathBuf {
+    base.join(format!("project_{project_id}"))
+}
+
+const PROJECT_MIH_MAGIC: &str = "ITMIHP1";
+const PROJECT_MIH_VERSION: u64 = 1;
+
+/// Sorted image_ids (owner slots) and per-entry owner ids for `entries`.
+fn owner_plan(entries: &[DedupKeys]) -> (Vec<i64>, Vec<u32>) {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_unstable_by_key(|&i| entries[i].image_id);
+    let image_ids: Vec<i64> = order.iter().map(|&i| entries[i].image_id).collect();
+    let mut owner_for_entry = vec![0u32; entries.len()];
+    for (owner, &ei) in order.iter().enumerate() {
+        owner_for_entry[ei] = owner as u32;
+    }
+    (image_ids, owner_for_entry)
+}
+
+fn write_image_ids_bin(path: &std::path::Path, image_ids: &[i64]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    for &id in image_ids {
+        f.write_all(&id.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_image_ids_bin(path: &std::path::Path, expected: usize) -> std::io::Result<Vec<i64>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut out = Vec::with_capacity(expected);
+    let mut buf = [0u8; 8];
+    loop {
+        match f.read(&mut buf)? {
+            0 => break,
+            8 => out.push(i64::from_le_bytes(buf)),
+            n => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("image_ids.bin truncated ({n} trailing bytes)"),
+                ));
+            }
+        }
+    }
+    if expected > 0 && out.len() != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "image_ids.bin len {} != meta image_count {expected}",
+                out.len()
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+fn image_id_sets_equal(persisted: &[i64], entries: &[DedupKeys]) -> bool {
+    if persisted.len() != entries.len() {
+        return false;
+    }
+    let mut a: Vec<i64> = persisted.to_vec();
+    let mut b: Vec<i64> = entries.iter().map(|e| e.image_id).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
+}
+
+fn build_sharded_indexes(
+    entries: &[DedupKeys],
+    shard_bits: u32,
+    owner_for_entry: &[u32],
+) -> Vec<ShardedMihIndex> {
+    let m = entries[0].variant_keys.len();
+    (0..m)
+        .into_par_iter()
+        .map(|a| {
+            let mut idx = ShardedMihIndex::new(shard_bits);
+            let mut uniq: Vec<u64> = Vec::new();
+            for (i, e) in entries.iter().enumerate() {
+                uniq.clear();
+                uniq.extend_from_slice(&e.variant_keys[a]);
+                uniq.sort_unstable();
+                uniq.dedup();
+                let owner = owner_for_entry[i];
+                for &key in &uniq {
+                    idx.insert(key, owner);
+                }
+            }
+            idx
+        })
+        .collect()
+}
+
+/// Save a project gate-index bundle (see module docs). Overwrites `dir`.
+pub fn save_project_gate_index(
+    dir: &std::path::Path,
+    indexes: &[ShardedMihIndex],
+    image_ids: &[i64],
+    shard_bits: u32,
+) -> std::io::Result<()> {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    let key_count: usize = indexes.iter().map(|i| i.len()).sum();
+    let meta = serde_json::json!({
+        "magic": PROJECT_MIH_MAGIC,
+        "version": PROJECT_MIH_VERSION,
+        "shard_bits": shard_bits,
+        "gate_algo_count": indexes.len(),
+        "image_count": image_ids.len(),
+        "key_count": key_count,
+    });
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_vec_pretty(&meta).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?,
+    )?;
+    write_image_ids_bin(&dir.join("image_ids.bin"), image_ids)?;
+    let indexes_dir = dir.join("indexes");
+    std::fs::create_dir_all(&indexes_dir)?;
+    for (a, idx) in indexes.iter().enumerate() {
+        idx.save_dir(&indexes_dir.join(a.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Try to load a project bundle compatible with `entries` / `shard_bits`.
+/// Returns `None` when missing or invalidated (caller should rebuild).
+pub fn try_load_project_gate_index(
+    dir: &std::path::Path,
+    entries: &[DedupKeys],
+    shard_bits: u32,
+) -> std::io::Result<Option<(Vec<ShardedMihIndex>, Vec<i64>)>> {
+    if entries.is_empty() || entries[0].variant_keys.is_empty() {
+        return Ok(None);
+    }
+    let meta_path = dir.join("meta.json");
+    if !meta_path.is_file() {
+        return Ok(None);
+    }
+    let meta_bytes = std::fs::read(&meta_path)?;
+    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let magic = meta.get("magic").and_then(|v| v.as_str()).unwrap_or("");
+    if magic != PROJECT_MIH_MAGIC {
+        return Ok(None);
+    }
+    let version = meta.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+    if version != PROJECT_MIH_VERSION {
+        return Ok(None);
+    }
+    let stored_bits = meta
+        .get("shard_bits")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::MAX) as u32;
+    if stored_bits != shard_bits {
+        return Ok(None);
+    }
+    let gate_algo_count = meta
+        .get("gate_algo_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let m = entries[0].variant_keys.len();
+    if gate_algo_count != m {
+        return Ok(None);
+    }
+    let image_count = meta
+        .get("image_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let image_ids = match read_image_ids_bin(&dir.join("image_ids.bin"), image_count) {
+        Ok(ids) => ids,
+        Err(_) => return Ok(None),
+    };
+    if !image_id_sets_equal(&image_ids, entries) {
+        return Ok(None);
+    }
+    let indexes_dir = dir.join("indexes");
+    let mut indexes = Vec::with_capacity(m);
+    for a in 0..m {
+        let path = indexes_dir.join(a.to_string());
+        if !path.is_dir() {
+            return Ok(None);
+        }
+        let idx = match ShardedMihIndex::load_dir(&path) {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
+        if idx.shard_bits() != shard_bits {
+            return Ok(None);
+        }
+        indexes.push(idx);
+    }
+    Ok(Some((indexes, image_ids)))
+}
+
+/// Load a compatible project index or build+save one. `index_loaded` is true
+/// when an existing on-disk bundle was used (no rebuild).
+pub fn load_or_build_project_gate_index(
+    dir: &std::path::Path,
+    entries: &[DedupKeys],
+    shard_bits: u32,
+) -> std::io::Result<(Vec<ShardedMihIndex>, Vec<i64>, bool)> {
+    if let Some((indexes, image_ids)) = try_load_project_gate_index(dir, entries, shard_bits)? {
+        return Ok((indexes, image_ids, true));
+    }
+    let (image_ids, owner_for_entry) = owner_plan(entries);
+    let indexes = build_sharded_indexes(entries, shard_bits, &owner_for_entry);
+    save_project_gate_index(dir, &indexes, &image_ids, shard_bits)?;
+    Ok((indexes, image_ids, false))
+}
+
+/// Query pre-built per-algo indexes. Owners in the indexes are dense slots
+/// into `image_ids`; returned pairs are **entry indices** into `entries`.
+pub fn dedup_candidates_with_indexes(
+    entries: &[DedupKeys],
+    indexes: &[ShardedMihIndex],
+    image_ids: &[i64],
+    radius: u32,
+    min_votes: u32,
+) -> Vec<(u32, u32)> {
+    if entries.is_empty() || indexes.is_empty() {
+        return Vec::new();
+    }
+    // owner slot → entry index in the caller's `entries` slice
+    let id_to_entry: HashMap<i64, u32> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.image_id, i as u32))
+        .collect();
+    let entry_of_owner: Vec<Option<u32>> = image_ids
+        .iter()
+        .map(|id| id_to_entry.get(id).copied())
+        .collect();
+
+    let mut out: Vec<(u32, u32)> = entries
+        .par_iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            let i = i as u32;
+            let mut hit = VoteMap::default();
+            let mut uniq: Vec<u64> = Vec::new();
+            let mut hits: Vec<u32> = Vec::new();
+            for (a, idx) in indexes.iter().enumerate() {
+                uniq.clear();
+                uniq.extend_from_slice(&e.variant_keys[a]);
+                uniq.sort_unstable();
+                uniq.dedup();
+                for &key in &uniq {
+                    idx.query_into(key, radius, &mut hits);
+                    for &owner in &hits {
+                        if let Some(Some(j)) = entry_of_owner.get(owner as usize) {
+                            if *j != i {
+                                *hit.entry(*j).or_insert(0) |= 1 << a;
+                            }
+                        }
+                    }
+                }
+            }
+            hit.into_iter()
+                .filter(|(_, mask)| mask.count_ones() >= min_votes)
+                .map(|(j, _)| (j.min(i), j.max(i)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Like [`dedup_candidates_sharded`], but when `project_index_dir` is `Some`
+/// loads or builds a persistent project gate-index bundle there.
+///
+/// Returns `(pairs, index_loaded)` where `index_loaded` is true iff an
+/// existing on-disk index was reused. When `project_index_dir` is `None`,
+/// behaviour matches [`dedup_candidates_sharded`] and `index_loaded` is false.
+pub fn dedup_candidates_sharded_cached(
+    entries: &[DedupKeys],
+    radius: u32,
+    min_votes: u32,
+    shard_bits: u32,
+    project_index_dir: Option<&std::path::Path>,
+) -> std::io::Result<(Vec<(u32, u32)>, bool)> {
+    let Some(dir) = project_index_dir else {
+        return Ok((
+            dedup_candidates_sharded(entries, radius, min_votes, shard_bits),
+            false,
+        ));
+    };
+    if entries.is_empty() || entries[0].variant_keys.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let (indexes, image_ids, loaded) =
+        load_or_build_project_gate_index(dir, entries, shard_bits)?;
+    let pairs = dedup_candidates_with_indexes(entries, &indexes, &image_ids, radius, min_votes);
+    Ok((pairs, loaded))
+}
+
 
 /// Emit candidate image-index pairs flagged within `radius` bits by at
 /// least `min_votes` DISTINCT gate algorithms (one vote per algorithm,
@@ -284,6 +845,135 @@ pub fn dedup_candidates(entries: &[DedupKeys], radius: u32, min_votes: u32) -> V
     out
 }
 
+/// Same contract as [`dedup_candidates`] but each per-algo index is a
+/// [`ShardedMihIndex`]. Server `/dedup` and CLI `dedup` use this path
+/// (via `resolve_shard_bits` / `dedup_confirmed`).
+pub fn dedup_candidates_sharded(
+    entries: &[DedupKeys],
+    radius: u32,
+    min_votes: u32,
+    shard_bits: u32,
+) -> Vec<(u32, u32)> {
+    if entries.is_empty() || entries[0].variant_keys.is_empty() {
+        return Vec::new();
+    }
+    let m = entries[0].variant_keys.len();
+    let indexes: Vec<ShardedMihIndex> = (0..m)
+        .into_par_iter()
+        .map(|a| {
+            let mut idx = ShardedMihIndex::new(shard_bits);
+            let mut uniq: Vec<u64> = Vec::new();
+            for (i, e) in entries.iter().enumerate() {
+                uniq.clear();
+                uniq.extend_from_slice(&e.variant_keys[a]);
+                uniq.sort_unstable();
+                uniq.dedup();
+                for &key in &uniq {
+                    idx.insert(key, i as u32);
+                }
+            }
+            idx
+        })
+        .collect();
+    let mut out: Vec<(u32, u32)> = entries
+        .par_iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            let i = i as u32;
+            let mut hit = VoteMap::default();
+            let mut uniq: Vec<u64> = Vec::new();
+            let mut hits: Vec<u32> = Vec::new();
+            for (a, idx) in indexes.iter().enumerate() {
+                uniq.clear();
+                uniq.extend_from_slice(&e.variant_keys[a]);
+                uniq.sort_unstable();
+                uniq.dedup();
+                for &key in &uniq {
+                    idx.query_into(key, radius, &mut hits);
+                    for &j in &hits {
+                        if j != i {
+                            *hit.entry(j).or_insert(0) |= 1 << a;
+                        }
+                    }
+                }
+            }
+            hit.into_iter()
+                .filter(|(_, mask)| mask.count_ones() >= min_votes)
+                .map(|(j, _)| (j.min(i), j.max(i)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn confirm_pairs(
+    entries: &[DedupKeys],
+    pairs: &[(u32, u32)],
+    threshold: f64,
+) -> Vec<(usize, usize, f64)> {
+    let score_of = |ea: usize, eb: usize| -> f64 {
+        let mut best = 0.0f64;
+        for (ka, kb) in entries[ea].variant_keys.iter().zip(&entries[eb].variant_keys) {
+            for &a in ka {
+                for &b in kb {
+                    best = best.max(crate::hashes::hash_similarity(a, b));
+                }
+            }
+        }
+        best
+    };
+    let mut confirmed: Vec<(usize, usize, f64)> = pairs
+        .par_iter()
+        .filter_map(|&(i, j)| {
+            let (i, j) = (i as usize, j as usize);
+            let s = score_of(i, j);
+            if s >= threshold {
+                Some((i, j, s))
+            } else {
+                None
+            }
+        })
+        .collect();
+    confirmed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    confirmed
+}
+
+/// MIH candidate recall then cross-variant max score verification.
+/// Returns `(candidate_pair_count, confirmed)` where each confirmed entry is
+/// `(entry_i, entry_j, score)` with `i < j` indexing into `entries`.
+///
+/// Uses [`dedup_candidates_sharded`] with `shard_bits` (`0` = one shard).
+pub fn dedup_confirmed(
+    entries: &[DedupKeys],
+    radius: u32,
+    threshold: f64,
+    min_votes: u32,
+    shard_bits: u32,
+) -> (usize, Vec<(usize, usize, f64)>) {
+    let pairs = dedup_candidates_sharded(entries, radius, min_votes, shard_bits);
+    let confirmed = confirm_pairs(entries, &pairs, threshold);
+    (pairs.len(), confirmed)
+}
+
+/// Like [`dedup_confirmed`] with optional persistent project index directory.
+/// Third return value is `index_loaded` (see [`dedup_candidates_sharded_cached`]).
+pub fn dedup_confirmed_cached(
+    entries: &[DedupKeys],
+    radius: u32,
+    threshold: f64,
+    min_votes: u32,
+    shard_bits: u32,
+    project_index_dir: Option<&std::path::Path>,
+) -> std::io::Result<(usize, Vec<(usize, usize, f64)>, bool)> {
+    let (pairs, loaded) =
+        dedup_candidates_sharded_cached(entries, radius, min_votes, shard_bits, project_index_dir)?;
+    let confirmed = confirm_pairs(entries, &pairs, threshold);
+    Ok((pairs.len(), confirmed, loaded))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +1028,255 @@ mod tests {
                 assert_eq!(s(h), xform8x8(h, *f), "transform mismatch at {h:#x}");
             }
         }
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn shard_routing_stable_high_bits() {
+        assert_eq!(shard_id_for(0, 0), 0);
+        assert_eq!(shard_id_for(u64::MAX, 0), 0);
+        // top 8 bits = 0xAB → shard 0xAB
+        let key = 0xAB00_0000_0000_0001u64;
+        assert_eq!(shard_id_for(key, 8), 0xAB);
+        assert_eq!(shard_id_for(key, 4), 0xA);
+        // flipping only low bits keeps the same shard
+        assert_eq!(shard_id_for(key ^ 0xFFFF, 8), 0xAB);
+        // flipping a high bit moves shard
+        assert_eq!(shard_id_for(key ^ (1u64 << 63), 8), 0xAB ^ 0x80);
+    }
+
+    #[test]
+    fn sharded_query_parity_with_monolithic() {
+        let mut rng = 0xC0FFEE_u64;
+        let n = 2_000usize;
+        let mut keys = Vec::with_capacity(n);
+        let mut owners = Vec::with_capacity(n);
+        for i in 0..n {
+            keys.push(xorshift(&mut rng));
+            owners.push((i % 500) as u32);
+        }
+        let mut mono = MihIndex::new();
+        let mut sharded = ShardedMihIndex::new(6); // 64 shards
+        for (&k, &o) in keys.iter().zip(&owners) {
+            mono.insert(k, o);
+            sharded.insert(k, o);
+        }
+        assert_eq!(mono.len(), sharded.len());
+        assert_eq!(sharded.shard_count(), 64);
+        // Probe a mix of stored keys and fresh random queries.
+        let mut probes = keys.clone();
+        for _ in 0..200 {
+            probes.push(xorshift(&mut rng));
+        }
+        for &radius in &[0u32, 7, 15] {
+            for &q in &probes {
+                let a = mono.query(q, radius);
+                let b = sharded.query(q, radius);
+                assert_eq!(
+                    a, b,
+                    "owner set mismatch radius={radius} query={q:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sharded_save_load_roundtrip() {
+        let mut rng = 0xDEAD_BEEF_u64;
+        let mut idx = ShardedMihIndex::new(4);
+        let mut keys = Vec::new();
+        for i in 0..800u32 {
+            let k = xorshift(&mut rng);
+            keys.push(k);
+            idx.insert(k, i);
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "itrace-mih-roundtrip-{}-{}",
+            std::process::id(),
+            xorshift(&mut rng)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        idx.save_dir(&dir).expect("save");
+        let loaded = ShardedMihIndex::load_dir(&dir).expect("load");
+        assert_eq!(loaded.shard_bits(), 4);
+        assert_eq!(loaded.len(), idx.len());
+        assert_eq!(loaded.shard_count(), idx.shard_count());
+        for &radius in &[0u32, 7, 15] {
+            for &q in keys.iter().step_by(7) {
+                assert_eq!(
+                    idx.query(q, radius),
+                    loaded.query(q, radius),
+                    "roundtrip mismatch radius={radius}"
+                );
+            }
+            // fresh queries too
+            for _ in 0..30 {
+                let q = xorshift(&mut rng);
+                assert_eq!(idx.query(q, radius), loaded.query(q, radius));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dedup_candidates_sharded_parity() {
+        let mut rng = 0x1234_5678_9ABCu64;
+        let mut entries = Vec::new();
+        for id in 0..40i64 {
+            let mut variant_keys = Vec::new();
+            for _algo in 0..3 {
+                let base = xorshift(&mut rng);
+                // 8 near-duplicate variant keys
+                let keys: Vec<u64> = (0..8)
+                    .map(|v| base ^ ((v as u64) * 0x11))
+                    .collect();
+                variant_keys.push(keys);
+            }
+            entries.push(DedupKeys {
+                image_id: id,
+                variant_keys,
+            });
+        }
+        // Inject a near-dup of entry 0 into entry 1 under two algos.
+        for a in 0..2 {
+            entries[1].variant_keys[a] = entries[0].variant_keys[a]
+                .iter()
+                .map(|&k| k ^ 0x3)
+                .collect();
+        }
+        let a = dedup_candidates(&entries, 7, 2);
+        let b = dedup_candidates_sharded(&entries, 7, 2, 5);
+        assert_eq!(a, b);
+        let (_n, conf0) = dedup_confirmed(&entries, 7, 0.5, 2, 0);
+        let (_n, conf5) = dedup_confirmed(&entries, 7, 0.5, 2, 5);
+        assert_eq!(conf0, conf5);
+    }
+
+    #[test]
+    fn resolve_shard_bits_clamps_and_defaults() {
+        // Clear may race in parallel tests; only assert clamp/override path.
+        assert_eq!(resolve_shard_bits(Some(0)), 0);
+        assert_eq!(resolve_shard_bits(Some(8)), 8);
+        assert_eq!(resolve_shard_bits(Some(16)), 16);
+        assert_eq!(resolve_shard_bits(Some(99)), 16);
+        // Default when no override and env unset-or-ignored by override: covered
+        // by Some(_) paths; bare default is 8.
+        let d = resolve_shard_bits(None);
+        assert!(d <= 16, "resolved shard_bits {d} out of range");
+    }
+
+    fn sample_entries(n: i64) -> Vec<DedupKeys> {
+        let mut rng = 0xA5A5_5A5A_u64;
+        let mut entries = Vec::new();
+        for id in 0..n {
+            let mut variant_keys = Vec::new();
+            for _algo in 0..3 {
+                let base = xorshift(&mut rng);
+                let keys: Vec<u64> = (0..8).map(|v| base ^ ((v as u64) * 0x11)).collect();
+                variant_keys.push(keys);
+            }
+            entries.push(DedupKeys {
+                image_id: id + 100, // non-dense ids
+                variant_keys,
+            });
+        }
+        // near-dup of 0 into 1 under two algos (when we have ≥2 entries)
+        if entries.len() >= 2 {
+            for a in 0..2 {
+                entries[1].variant_keys[a] = entries[0].variant_keys[a]
+                    .iter()
+                    .map(|&k| k ^ 0x3)
+                    .collect();
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn project_gate_index_save_load_same_candidates() {
+        let entries = sample_entries(30);
+        let shard_bits = 4u32;
+        let dir = std::env::temp_dir().join(format!(
+            "itrace-mih-proj-{}-{}",
+            std::process::id(),
+            0x1111
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let expected = dedup_candidates_sharded(&entries, 7, 2, shard_bits);
+
+        let (pairs1, loaded1) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+                .expect("build");
+        assert!(!loaded1, "first call should build");
+        assert_eq!(pairs1, expected);
+        assert!(dir.join("meta.json").is_file());
+        assert!(dir.join("image_ids.bin").is_file());
+        assert!(dir.join("indexes/0").is_dir());
+
+        let (pairs2, loaded2) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+                .expect("load");
+        assert!(loaded2, "second call should load");
+        assert_eq!(pairs2, expected);
+        assert_eq!(pairs2, pairs1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_gate_index_invalidates_on_image_set_change() {
+        let mut entries = sample_entries(20);
+        let shard_bits = 3u32;
+        let dir = std::env::temp_dir().join(format!(
+            "itrace-mih-inval-{}-{}",
+            std::process::id(),
+            0x2222
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (_, loaded) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+                .expect("build");
+        assert!(!loaded);
+
+        // Add an image → set mismatch → rebuild (index_loaded=false)
+        let mut extra = sample_entries(1);
+        extra[0].image_id = 9999;
+        entries.push(extra.remove(0));
+        let (pairs_new, loaded_rebuild) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+                .expect("rebuild");
+        assert!(!loaded_rebuild, "changed image set must invalidate");
+        let expected = dedup_candidates_sharded(&entries, 7, 2, shard_bits);
+        assert_eq!(pairs_new, expected);
+
+        // Same set again → load
+        let (_, loaded_ok) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+                .expect("reload");
+        assert!(loaded_ok);
+
+        // shard_bits change → invalidate
+        let (_, loaded_bits) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits + 1, Some(&dir))
+                .expect("bits");
+        assert!(!loaded_bits, "shard_bits mismatch must invalidate");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_mih_index_path_layout() {
+        let p = project_mih_index_path(std::path::Path::new("/tmp/mih"), 42);
+        assert_eq!(p, std::path::PathBuf::from("/tmp/mih/project_42"));
     }
 }
