@@ -31,6 +31,16 @@ cargo build --release --workspace
 cargo build --release --features akaze -p itrace-server
 ```
 
+## 发布
+
+推送 `v*` 标签触发 `release` 工作流：构建 `itrace-server` + `itrace-cli`
+（linux x86_64/arm64 静态 musl、macOS arm64/x86_64、Windows x86_64），
+冒烟测试后打包 tar.gz/zip 并上传 GitHub Release（含 SHA256SUMS）。
+
+```bash
+git tag v3.0.0 && git push origin v3.0.0
+```
+
 ## 运行
 
 ```bash

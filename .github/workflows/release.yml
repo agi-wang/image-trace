@@ -1,0 +1,144 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { name: linux-arm64,    os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { name: macos-arm64,    os: macos-latest,     target: aarch64-apple-darwin }
+          - { name: macos-x86_64,   os: macos-13,         target: x86_64-apple-darwin }
+          - { name: windows-x86_64, os: windows-latest,   target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install musl toolchain (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p itrace-server -p itrace-cli
+
+      - name: Smoke test (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release
+          "$BIN/itrace-cli" --version
+          DATA_DIR=/tmp/itrace-smoke PORT=8991 "$BIN/itrace-server" &
+          SRV=$!
+          ok=0
+          for i in $(seq 1 30); do
+            curl -sf localhost:8991/v1/health >/dev/null && { ok=1; break; } || sleep 1
+          done
+          kill $SRV 2>/dev/null || true
+          [ "$ok" -eq 1 ]
+
+      - name: Smoke test (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $BIN = "target/${{ matrix.target }}/release"
+          & "$BIN/itrace-cli.exe" --version
+          $env:DATA_DIR = Join-Path $env:TEMP "itrace-smoke"
+          $env:PORT = "8991"
+          $srvExe = (Resolve-Path "$BIN/itrace-server.exe").Path
+          $srv = Start-Process -PassThru -FilePath $srvExe -WindowStyle Hidden
+          $ok = $false
+          foreach ($i in 1..30) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8991/v1/health" -TimeoutSec 2 | Out-Null
+              $ok = $true; break
+            } catch { Start-Sleep 1 }
+          }
+          Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw "itrace-server health check failed" }
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)-dev"
+          fi
+          PKG="itrace-${VER}-${{ matrix.name }}"
+          mkdir -p "stage/$PKG" out
+          cp target/${{ matrix.target }}/release/itrace-server "stage/$PKG/"
+          cp target/${{ matrix.target }}/release/itrace-cli "stage/$PKG/"
+          cp LICENSE README.md "stage/$PKG/"
+          strip "stage/$PKG/itrace-server" "stage/$PKG/itrace-cli" || true
+          tar -C stage -czf "out/$PKG.tar.gz" "$PKG"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $VER = $env:GITHUB_REF_NAME.TrimStart('v')
+          } else {
+            $VER = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value + '-dev'
+          }
+          $PKG = "itrace-$VER-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path "stage/$PKG", "out" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/itrace-server.exe", "target/${{ matrix.target }}/release/itrace-cli.exe" "stage/$PKG/"
+          Copy-Item LICENSE, README.md "stage/$PKG/"
+          Compress-Archive -Path "stage/$PKG" -DestinationPath "out/$PKG.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: itrace-${{ matrix.name }}
+          retention-days: 1
+          path: out/
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: itrace-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum itrace-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          make_latest: true
+          generate_release_notes: true
