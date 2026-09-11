@@ -52,7 +52,7 @@ jobs:
           SRV=$!
           ok=0
           for i in $(seq 1 30); do
-            curl -sf localhost:8991/v1/health >/dev/null && { ok=1; break; } || sleep 1
+            curl -sf http://127.0.0.1:8991/v1/health >/dev/null && { ok=1; break; } || sleep 1
           done
           kill $SRV 2>/dev/null || true
           [ "$ok" -eq 1 ]
@@ -66,16 +66,24 @@ jobs:
           $env:DATA_DIR = Join-Path $env:TEMP "itrace-smoke"
           $env:PORT = "8991"
           $srvExe = (Resolve-Path "$BIN/itrace-server.exe").Path
-          $srv = Start-Process -PassThru -FilePath $srvExe -WindowStyle Hidden
+          $srvOut = Join-Path $env:TEMP "itrace-server.out.log"
+          $srvErr = Join-Path $env:TEMP "itrace-server.err.log"
+          $srv = Start-Process -PassThru -FilePath $srvExe -RedirectStandardOutput $srvOut -RedirectStandardError $srvErr
           $ok = $false
           foreach ($i in 1..30) {
+            if ($srv.HasExited) { break }
             try {
-              Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8991/v1/health" -TimeoutSec 2 | Out-Null
+              Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8991/v1/health" -TimeoutSec 2 | Out-Null
               $ok = $true; break
             } catch { Start-Sleep 1 }
           }
           Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
-          if (-not $ok) { throw "itrace-server health check failed" }
+          if (-not $ok) {
+            if ($srv.HasExited) { "server exited early: code $($srv.ExitCode)" }
+            if (Test-Path $srvOut) { Get-Content $srvOut }
+            if (Test-Path $srvErr) { Get-Content $srvErr }
+            throw "itrace-server health check failed"
+          }
 
       - name: Package (unix)
         if: runner.os != 'Windows'
