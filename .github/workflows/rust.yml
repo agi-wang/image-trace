@@ -1,6 +1,7 @@
 name: rust
 
 on:
+  workflow_dispatch:
   push:
     paths-ignore: ["legacy/**"]
   pull_request:
