@@ -15,6 +15,13 @@ use crate::{hashes, image_io, metrics, GrayImage, RgbImage};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+pub mod blockhash;
+pub mod colorlayout;
+pub mod edgehash;
+pub mod hu;
+pub mod orbscale;
+pub mod sliceprofile;
+
 pub const NUM_VARIANTS: u8 = 8;
 pub const GRAY_FLAT_SIZE: u32 = 128;
 
@@ -54,15 +61,15 @@ pub fn unpack_bits(b: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-fn pack_f32(v: &[f32]) -> Vec<u8> {
+pub(crate) fn pack_f32(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-fn unpack_f32(b: &[u8]) -> Vec<f32> {
+pub(crate) fn unpack_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f64 {
     let n = a.len().min(b.len());
     if n == 0 {
         return 0.0;
@@ -198,6 +205,12 @@ pub const EXTRACTORS: &[&dyn FeatureExtractor] = &[
     &HsvHistogramExtractor,
     &GrayFlatExtractor,
     &OrbPooledExtractor,
+    &blockhash::BlockhashExtractor,
+    &colorlayout::ColorLayoutExtractor,
+    &edgehash::EdgeHashExtractor,
+    &hu::HuExtractor,
+    &orbscale::OrbScaleExtractor,
+    &sliceprofile::SliceProfileExtractor,
 ];
 
 /// Extractor serving a stored feature name.
@@ -231,7 +244,7 @@ pub struct FeatureVector {
 }
 
 /// Mean-pool a descriptor set into one f32 vector of desc_len dims.
-fn pool_descriptors(descs: &crate::descriptors::DescriptorSet) -> Vec<f32> {
+pub(crate) fn pool_descriptors(descs: &crate::descriptors::DescriptorSet) -> Vec<f32> {
     let n = descs.len();
     if n == 0 {
         return vec![0.0; descs.desc_len];

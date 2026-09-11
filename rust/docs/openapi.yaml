@@ -9,7 +9,10 @@ info:
     - 项目 / 图片 / 文档管理
     - 上传图片或 PDF、DOCX、PPTX 文档并自动提取其中的图片
     - 多算法相似度比对：感知哈希（phash/dhash/ahash/whash/colorhash）、
-      像素级（ssim/histogram/template）、局部特征描述子（orb/akaze/sift）
+      像素级（ssim/histogram/template）、局部特征描述子（orb/akaze/sift）、
+      扩展特征（edgehash 方向梯度哈希 / blockhash 分块抗裁剪哈希 /
+      colorlayout MPEG-7 色彩布局 / hu 矩不变量 / orbscale 多尺度 ORB /
+      sliceprofile 切片边界剖面）
     - 智能查重：多算法投票 + 并查集聚类，识别旋转/翻转/裁剪/切片重组后的副本
     - 相似度矩阵、特征匹配详情、可视化与重复图片报告
 
@@ -631,6 +634,12 @@ components:
         - orb
         - akaze
         - sift
+        - edgehash
+        - blockhash
+        - colorlayout
+        - hu
+        - orbscale
+        - sliceprofile
         - auto
 
     Project:

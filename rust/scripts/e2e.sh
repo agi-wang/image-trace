@@ -22,14 +22,19 @@ img.resize((128, 128)).save(f'{d}/a_half.jpg', 'JPEG')
 Image.new('RGB', (256, 256), (200, 30, 40)).save(f'{d}/b.jpg', 'JPEG')
 PY
 
-curl -sf -X POST "$BASE/projects" -H 'Content-Type: application/json' -d '{"name":"e2e"}' >/dev/null
+PID=$(curl -sf -X POST "$BASE/projects" -H 'Content-Type: application/json' -d '{"name":"e2e"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+A_ID=""; H_ID=""
 for f in a a_rot90 a_half b; do
-  curl -sf -X POST "$BASE/upload" -F "project_id=1" -F "file=@$IMG/$f.jpg" >/dev/null
+  RID=$(curl -sf -X POST "$BASE/upload" -F "project_id=$PID" -F "file=@$IMG/$f.jpg" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin)["processed_images"][0]["id"])')
+  [ "$f" = a ] && A_ID=$RID
+  [ "$f" = a_half ] && H_ID=$RID
 done
 
 ready=""
 for _ in $(seq 1 60); do
-  ready=$(curl -s "$BASE/projects/1/feature-status" \
+  ready=$(curl -s "$BASE/projects/$PID/feature-status" \
     | python3 -c "import sys,json
 try: print(json.load(sys.stdin)['all_ready'])
 except Exception: print(False)")
@@ -39,7 +44,7 @@ done
 [ "$ready" = "True" ] || { echo "feature precompute timed out"; exit 1; }
 
 # rotation-invariant compare must group a with its rotated copy, not with b
-curl -sf -X POST "$BASE/projects/1/compare" -H 'Content-Type: application/json' \
+curl -sf -X POST "$BASE/projects/$PID/compare" -H 'Content-Type: application/json' \
   -d '{"algorithm":"phash","threshold":0.8,"rotation_invariant":true}' > /tmp/itrace-e2e-cmp.json
 python3 - /tmp/itrace-e2e-cmp.json <<'PY'
 import json, sys
@@ -52,6 +57,7 @@ PY
 
 # slice/sub-image detection: a_half (resize) should not break; slice via REST pair match
 curl -sf -X POST "$BASE/match/slices" -H 'Content-Type: application/json' \
-  -d '{"image_a_id":1,"image_b_id":3,"rows":2,"cols":2}' | python3 -c "import sys,json;print('slice coverage:',json.load(sys.stdin)['coverage'])"
+  -d "{\"image_a_id\":$A_ID,\"image_b_id\":$H_ID,\"rows\":2,\"cols\":2}" \
+  | python3 -c "import sys,json;print('slice coverage:',json.load(sys.stdin)['coverage'])"
 
 echo "e2e PASSED"

@@ -28,20 +28,28 @@ pub const FUSION_ALGOS: &[&str] = &["auto"];
 
 pub const SMART_ALGOS: &[&str] = &[
     "phash", "dhash", "ahash", "whash", "ssim", "histogram", "orb",
+    "edgehash", "blockhash", "colorlayout", "hu", "orbscale", "sliceprofile",
 ];
 
 /// Algorithms that must contribute at least one vote for a confirmed duplicate
 /// pair in smart-compare (cheap and robust gate). ahash/colorhash are excluded:
 /// 64-bit ahash collides on ~half of unrelated real photos at 0.85, and
 /// colorhash's coarse bins similarly over-fire.
-pub const HASH_GATE_ALGOS: &[&str] = &["phash", "dhash", "whash"];
+pub const HASH_GATE_ALGOS: &[&str] = &["phash", "dhash", "whash", "edgehash"];
 
+/// All comparison algorithm names: every registered extractor's algos,
+/// plus descriptor algos handled by the precise path even when no extractor
+/// registers them (akaze/sift are optional-feature descriptors), plus fusion.
 pub fn all_algorithms() -> Vec<&'static str> {
-    let mut v = Vec::new();
-    v.extend(HASH_ALGOS);
-    v.extend(PIXEL_ALGOS);
-    v.extend(DESCRIPTOR_ALGOS);
-    v.extend(FUSION_ALGOS);
+    let mut v: Vec<&'static str> = Vec::new();
+    for e in features::EXTRACTORS {
+        v.extend_from_slice(e.algorithms());
+    }
+    for &a in DESCRIPTOR_ALGOS.iter().chain(FUSION_ALGOS) {
+        if !v.contains(&a) {
+            v.push(a);
+        }
+    }
     v
 }
 

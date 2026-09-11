@@ -66,13 +66,22 @@ crates/
 - `akaze`：`akaze` crate（可选 feature）
 - `sift`：预留 `DescriptorExtractor` trait；可接 `opencv` feature 或 ONNX 模型
 
+**Tier 3.5 — 扩展特征**（均由 `FeatureExtractor` 插件提供，`features/` 子模块）
+- `edgehash`：Sobel 方向梯度直方图 64bit —— 亮度/色彩变换鲁棒（dedup 门控算法之一）
+- `blockhash`：32×32 分块中值哈希 1024bit + 位移/缩放 best-overlap —— 抗裁剪
+- `colorlayout`：8×8 YCbCr DCT 低频 24 维 f32 —— 色彩布局
+- `hu`：Otsu 二值化 + 7 个 log-Hu 矩不变量 —— 旋转/缩放/翻转内建不变
+- `orbscale`：3 层高斯金字塔 ORB 均值池化 32 维 —— 强缩放鲁棒
+- `sliceprofile`：行/列强度+梯度剖面 128B + 连续窗互相关 —— 切片重组检测
+
 **Tier 4 — 变换鲁棒层（新设计，原版没有）**
 - 方向变体：8 个方向（4 旋转 × 翻转态）对哈希/描述子取 max —— 识别旋转/翻转
 - 切片检测 `slice_match`：B 切 R×C 网格 → 每片在 A 上滑窗 NCC + 灰度哈希 → 覆盖率判断 B 是否为 A 的切片重组或局部放大 —— 识别切片/裁剪/拼接
 - 多尺度：比对时对灰度金字塔下采样重试 —— 识别缩放 + 局部截取的混合变换
 
 **智能查重 `smart-compare`**
-- 每对图片跑全部可用算法 → 超阈值记一票 → `min_agree` 票 + 至少一票来自哈希门控 → 并查集连通分组 → confidence = 该组最大得分
+- 每对图片跑 `SMART_ALGOS`（13 种：基础 7 + 扩展 6）→ 超阈值记一票 → `min_agree` 票 + 至少一票来自哈希门控 → 并查集连通分组 → confidence = 该组最大得分
+- 注册表内但无内存精确路径的算法，由 `run_compare` 走特征库矩阵路径（`similarity_matrix` + 变体-max），未预计算的图记为 unique
 
 ## 特征预计算管线
 

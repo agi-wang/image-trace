@@ -78,6 +78,7 @@ itrace slice 1 4 --rows 2 --cols 2
 2. **像素指标层**：SSIM（亮度/对比度鲁棒）、HSV 直方图（几何无关）、模板 NCC（子图定位）。
 3. **局部特征层**：纯 Rust ORB——8 级金字塔 FAST-9 检测、Harris 排序、质心方向分配、256bit 旋转 BRIEF、BFMatcher crossCheck / Lowe ratio。
 4. **变换鲁棒层**（新增）：切片网格 × 4 旋转模板匹配（`is_slice_of_a`）、全方向变体指纹库、`contains` 子图判定。
+5. **扩展特征层**：edgehash（方向梯度哈希）、blockhash（分块抗裁剪）、colorlayout（MPEG-7 色彩布局）、hu（矩不变量）、orbscale（多尺度 ORB）、sliceprofile（切片边界剖面）—— 全部接入智能查重投票与 dedup 索引。
 
 深度嵌入（DINOv2 via ONNX）预留为 feature 插槽。
 

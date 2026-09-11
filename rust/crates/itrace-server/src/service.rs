@@ -150,6 +150,67 @@ pub fn run_compare(
             "groups": [], "unique_images": [], "run_id": null
         }));
     }
+
+    // Registered feature algos that have no precise-path implementation
+    // (base_score only covers HASH_ALGOS/PIXEL_ALGOS/DESCRIPTOR_ALGOS/auto)
+    // are served from stored feature vectors.
+    let precise = itrace_core::HASH_ALGOS.contains(&algo)
+        || itrace_core::PIXEL_ALGOS.contains(&algo)
+        || itrace_core::DESCRIPTOR_ALGOS.contains(&algo)
+        || algo == "auto";
+    if !precise {
+        let Some(feat) = features::algo_to_feature(algo) else {
+            anyhow::bail!("unsupported algorithm: {algo}");
+        };
+        let ids: Vec<i64> = images.iter().map(|i| i.id).collect();
+        let variants: Vec<u8> =
+            if rot_inv { (0..features::NUM_VARIANTS).collect() } else { vec![0] };
+        let map = store.load_feature_map(&ids, feat, &variants)?;
+        anyhow::ensure!(
+            !map.is_empty(),
+            "该算法特征尚未预计算（先调用 feature precompute）"
+        );
+        let matrix = features::similarity_matrix(&map, &ids, algo, rot_inv);
+        let (groups, ungrouped) = compare::cluster(&matrix, threshold);
+        let mut group_json = Vec::new();
+        for members in &groups {
+            let mut sum = 0.0;
+            let mut cnt = 0;
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    sum += matrix[members[i]][members[j]];
+                    cnt += 1;
+                }
+            }
+            let avg = if cnt > 0 { sum / cnt as f64 } else { 1.0 };
+            group_json.push(json!({
+                "group_id": group_json.len() + 1,
+                "similarity_score": (avg * 10000.0).round() / 10000.0,
+                "images": members.iter().map(|&m| image_json(&images[m])).collect::<Vec<_>>(),
+            }));
+        }
+        let unique: Vec<Value> =
+            ungrouped.iter().map(|&i| image_json(&images[i])).collect();
+        let mut result = json!({
+            "project_id": images[0].project_id,
+            "total_images": images.len(),
+            "groups": group_json,
+            "unique_images": unique,
+            "run_id": null
+        });
+        let run_id = store.insert_run(&NewRun {
+            project_id: images[0].project_id,
+            algorithm: algo.to_string(),
+            threshold,
+            total_images: images.len() as i64,
+            groups_count: groups.len() as i64,
+            unique_count: ungrouped.len() as i64,
+            summary: Some(result.to_string()),
+        })?;
+        result["run_id"] = json!(run_id);
+        return Ok(result);
+    }
+
     let (kept, prepared) = load_prepared(store, images, algo, rot_inv);
     let (groups, ungrouped, matrix) = compare::analyze(&prepared, algo, threshold, rot_inv);
 
