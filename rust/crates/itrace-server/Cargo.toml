@@ -1,0 +1,23 @@
+[package]
+name = "itrace-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP API server for Image Trace (axum)"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+itrace-core = { path = "../itrace-core" }
+itrace-store = { path = "../itrace-store" }
+rayon.workspace = true
+image.workspace = true
+
+[features]
+akaze = ["itrace-core/akaze"]

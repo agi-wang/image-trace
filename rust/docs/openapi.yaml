@@ -1,0 +1,974 @@
+openapi: 3.1.0
+info:
+  title: Image Trace RS API
+  version: 3.0.0
+  description: |
+    图像比对与文档图片提取服务（Rust 重写版）。
+
+    核心能力：
+    - 项目 / 图片 / 文档管理
+    - 上传图片或 PDF、DOCX、PPTX 文档并自动提取其中的图片
+    - 多算法相似度比对：感知哈希（phash/dhash/ahash/whash/colorhash）、
+      像素级（ssim/histogram/template）、局部特征描述子（orb/akaze/sift）、
+      扩展特征（edgehash 方向梯度哈希 / blockhash 分块抗裁剪哈希 /
+      colorlayout MPEG-7 色彩布局 / hu 矩不变量 / orbscale 多尺度 ORB /
+      sliceprofile 切片边界剖面）
+    - 智能查重：多算法投票 + 并查集聚类，识别旋转/翻转/裁剪/切片重组后的副本
+    - 相似度矩阵、特征匹配详情、可视化与重复图片报告
+
+    约定：
+    - 所有路径以 `/v1` 为前缀
+    - 时间均为 RFC 3339 / ISO 8601 UTC 字符串
+    - 相似度得分均为 [0, 1] 浮点数，1 表示完全相同
+    - 文件相关字段 `file_path` 为相对数据目录的路径，可通过 `/v1/files/{path}` 下载
+servers:
+  - url: http://127.0.0.1:8000
+    description: 本地默认实例
+tags:
+  - name: system
+  - name: projects
+  - name: images
+  - name: upload
+  - name: analysis
+  - name: files
+
+paths:
+  /v1/health:
+    get:
+      tags: [system]
+      summary: 健康检查
+      operationId: healthCheck
+      responses:
+        '200':
+          description: 服务正常
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /v1/system/info:
+    get:
+      tags: [system]
+      summary: 引擎与可用算法信息
+      operationId: systemInfo
+      responses:
+        '200':
+          description: 引擎信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemInfo'
+
+  /v1/projects:
+    get:
+      tags: [projects]
+      summary: 项目列表
+      operationId: listProjects
+      parameters:
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 项目列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Project'
+    post:
+      tags: [projects]
+      summary: 创建项目
+      operationId: createProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCreate'
+      responses:
+        '201':
+          description: 项目已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+
+  /v1/projects/{projectId}:
+    get:
+      tags: [projects]
+      summary: 获取项目详情
+      operationId: getProject
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: 项目详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [projects]
+      summary: 删除项目（连同图片与分析记录）
+      operationId: deleteProject
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/projects/{projectId}/images:
+    get:
+      tags: [images]
+      summary: 项目内图片列表
+      operationId: listProjectImages
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 图片列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Image'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/images/{imageId}:
+    delete:
+      tags: [images]
+      summary: 删除图片（清理缓存与特征）
+      operationId: deleteImage
+      parameters:
+        - $ref: '#/components/parameters/ImageId'
+      responses:
+        '200':
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/images/{imageId}/thumbnail:
+    get:
+      tags: [images]
+      summary: 获取图片缩略图
+      operationId: getThumbnail
+      parameters:
+        - $ref: '#/components/parameters/ImageId'
+        - name: size
+          in: query
+          schema: { type: integer, default: 400, minimum: 16, maximum: 2048 }
+      responses:
+        '200':
+          description: JPEG 缩略图
+          content:
+            image/jpeg: {}
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/upload:
+    post:
+      tags: [upload]
+      summary: 上传文件（图片或文档）
+      description: |
+        multipart 上传。图片直接入库并触发特征预计算；
+        PDF/DOCX/PPTX 文档自动抽取内嵌图片，抽取出的每张图同样入库并预计算。
+      operationId: uploadFile
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [project_id, file]
+              properties:
+                project_id: { type: integer }
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: 处理结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          description: 文档解析失败
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /v1/projects/{projectId}/feature-status:
+    get:
+      tags: [analysis]
+      summary: 特征预计算进度
+      operationId: featureStatus
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: 特征状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FeatureStatus'
+
+  /v1/projects/{projectId}/features/recompute:
+    post:
+      tags: [analysis]
+      summary: 重新触发未完成图片的特征预计算
+      operationId: recomputeFeatures
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      responses:
+        '200':
+          description: 已触发数量
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecomputeResult'
+
+  /v1/projects/{projectId}/compare:
+    post:
+      tags: [analysis]
+      summary: 执行单算法相似度比对
+      description: |
+        对项目内全部图片两两比对，按阈值进行并查集聚类，返回相似分组与独立图片。
+        `rotation_invariant=true` 时会对每张图生成 8 个方向变体（4 旋转 × 2 翻转）取最高分。
+      operationId: compareProject
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompareRequest'
+      responses:
+        '200':
+          description: 比对结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComparisonResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/projects/{projectId}/smart-compare:
+    post:
+      tags: [analysis]
+      summary: 智能查重（多算法投票）
+      description: |
+        使用全部可用算法并行计算 N×N 相似度矩阵，对超过阈值的图片对累计投票；
+        票数 ≥ `min_agree` 且至少命中一种哈希算法时才确认为重复对，
+        最后通过并查集生成重复分组。对旋转/翻转/轻微裁剪鲁棒。
+      operationId: smartCompare
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SmartCompareRequest'
+      responses:
+        '200':
+          description: 智能查重结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SmartCompareResult'
+
+  /v1/projects/{projectId}/dedup:
+    post:
+      tags: [analysis]
+      summary: 索引查重（大规模，10^8 量级）
+      description: |
+        不做 N×N 全比对：把每张图 8 个方向变体的门控哈希（phash/dhash/whash）
+        键放进多索引哈希（MIH，64bit → 8×8bit 子串倒排），流式召回
+        `min_votes` 个算法在 `radius` 汉明距内命中的候选对，
+        再对候选做交叉变体精确验证并并查集分组。
+        复杂度近似 O(N)，单索引约 40B/图/算法。
+      operationId: dedupScan
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                radius:
+                  type: integer
+                  default: 10
+                  description: 召回汉明半径（64bit 哈希）
+                threshold:
+                  type: number
+                  default: 0.85
+                  description: 验证阶段的相似度阈值
+                min_votes:
+                  type: integer
+                  default: 2
+                  description: 候选对至少需几个门控算法命中
+      responses:
+        '200':
+          description: 索引查重结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_images: { type: integer }
+                  indexed_images: { type: integer }
+                  candidate_pairs:
+                    type: integer
+                    description: 召回的候选对数
+                  naive_pairs:
+                    type: integer
+                    description: 等效全比对对数 n(n-1)/2
+                  found_duplicates: { type: boolean }
+                  duplicate_groups:
+                    type: array
+                    items: { $ref: '#/components/schemas/DuplicateGroup' }
+                  unique_count: { type: integer }
+                  scan_seconds: { type: number }
+                  summary: { type: string }
+
+  /v1/projects/{projectId}/matrix:
+    get:
+      tags: [analysis]
+      summary: N×N 相似度矩阵
+      operationId: pairwiseMatrix
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - name: algorithm
+          in: query
+          schema: { $ref: '#/components/schemas/Algorithm' }
+        - name: rotation_invariant
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: 相似度矩阵
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixResult'
+
+  /v1/projects/{projectId}/report:
+    get:
+      tags: [analysis]
+      summary: 重复图片分析报告
+      operationId: projectReport
+      parameters:
+        - $ref: '#/components/parameters/ProjectId'
+        - name: algorithm
+          in: query
+          schema: { $ref: '#/components/schemas/Algorithm' }
+        - name: threshold
+          in: query
+          schema: { type: number, default: 0.85 }
+        - name: rotation_invariant
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: 完整报告
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+
+  /v1/analysis-runs:
+    get:
+      tags: [analysis]
+      summary: 分析运行历史
+      operationId: listAnalysisRuns
+      parameters:
+        - name: project_id
+          in: query
+          required: true
+          schema: { type: integer }
+        - $ref: '#/components/parameters/Skip'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 运行记录
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AnalysisRun'
+
+  /v1/analysis-runs/{runId}:
+    get:
+      tags: [analysis]
+      summary: 单次分析结果详情
+      operationId: getAnalysisRun
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: 运行详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalysisRunDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/match/pairs:
+    post:
+      tags: [analysis]
+      summary: 两图特征点匹配详情
+      description: 返回特征点坐标与匹配连线数据，用于前端可视化。
+      operationId: matchData
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image_a_id, image_b_id]
+              properties:
+                image_a_id: { type: integer }
+                image_b_id: { type: integer }
+                algorithm:
+                  allOf:
+                    - $ref: '#/components/schemas/Algorithm'
+                  description: 仅限描述子类算法（orb/akaze/sift）
+      responses:
+        '200':
+          description: 匹配数据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatchData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/match/visualize:
+    post:
+      tags: [analysis]
+      summary: 生成两图特征匹配连线图
+      operationId: visualizeMatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image_a_id, image_b_id]
+              properties:
+                image_a_id: { type: integer }
+                image_b_id: { type: integer }
+                algorithm:
+                  allOf:
+                    - $ref: '#/components/schemas/Algorithm'
+      responses:
+        '200':
+          description: 生成的可视化文件信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VisualizationResult'
+
+  /v1/match/slices:
+    post:
+      tags: [analysis]
+      summary: 切片/子图检测
+      description: |
+        将图 B 均匀切成 R×C 个切片，每个切片分别与图 A 做局部匹配。
+        用于识别「整图被切片打散」「大图嵌入小图/小图被放大嵌入」等变换。
+      operationId: sliceMatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [image_a_id, image_b_id]
+              properties:
+                image_a_id: { type: integer }
+                image_b_id: { type: integer }
+                rows: { type: integer, default: 2, minimum: 1, maximum: 8 }
+                cols: { type: integer, default: 2, minimum: 1, maximum: 8 }
+      responses:
+        '200':
+          description: 每个切片的匹配得分
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SliceMatchResult'
+
+  /v1/files/{path}:
+    get:
+      tags: [files]
+      summary: 下载数据目录内文件
+      operationId: downloadFile
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 文件内容
+          content:
+            application/octet-stream: {}
+        '403':
+          description: 路径越界
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema: { type: integer }
+    ImageId:
+      name: imageId
+      in: path
+      required: true
+      schema: { type: integer }
+    Skip:
+      name: skip
+      in: query
+      schema: { type: integer, default: 0, minimum: 0 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, default: 100, minimum: 1, maximum: 500 }
+
+  responses:
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    BadRequest:
+      description: 请求参数错误
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        detail: { type: string }
+
+    Message:
+      type: object
+      properties:
+        message: { type: string }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, example: healthy }
+        version: { type: string }
+
+    SystemInfo:
+      type: object
+      properties:
+        version: { type: string }
+        engine: { type: string, example: rust-native }
+        storage:
+          type: string
+          enum: [fs, s3]
+          description: 文件负载存储后端（ITRACE_STORAGE）
+        algorithms:
+          type: array
+          items: { $ref: '#/components/schemas/Algorithm' }
+        features:
+          type: object
+          additionalProperties: { type: boolean }
+          description: 编译期能力开关（如 deep_embedding / pdf_render）
+
+    Algorithm:
+      type: string
+      enum:
+        - phash
+        - dhash
+        - ahash
+        - whash
+        - colorhash
+        - ssim
+        - histogram
+        - template
+        - orb
+        - akaze
+        - sift
+        - edgehash
+        - blockhash
+        - colorlayout
+        - hu
+        - orbscale
+        - sliceprofile
+        - auto
+
+    Project:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        image_count: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    ProjectCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 255 }
+        description: { type: string, maxLength: 1000 }
+
+    Image:
+      type: object
+      properties:
+        id: { type: integer }
+        project_id: { type: integer }
+        filename: { type: string }
+        file_path: { type: string, description: 相对数据目录路径 }
+        file_hash: { type: string, description: 内容 BLAKE3 哈希 }
+        phash: { type: string }
+        dhash: { type: string, nullable: true }
+        ahash: { type: string, nullable: true }
+        whash: { type: string, nullable: true }
+        colorhash: { type: string, nullable: true }
+        extracted_from: { type: string, nullable: true, description: 来源文档路径 }
+        file_size: { type: integer, nullable: true }
+        width: { type: integer, nullable: true }
+        height: { type: integer, nullable: true }
+        feature_status:
+          type: string
+          enum: [pending, computing, ready]
+        created_at: { type: string, format: date-time }
+
+    UploadResult:
+      type: object
+      properties:
+        project_id: { type: integer }
+        filename: { type: string }
+        file_path: { type: string }
+        file_size: { type: integer }
+        file_type:
+          type: string
+          enum: [image, document, unknown]
+        processed_images:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              filename: { type: string }
+              file_path: { type: string }
+              type:
+                type: string
+                enum: [direct_upload, extracted_from_document]
+
+    FeatureStatus:
+      type: object
+      properties:
+        project_id: { type: integer }
+        total: { type: integer }
+        ready: { type: integer }
+        all_ready: { type: boolean }
+        images:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              filename: { type: string }
+              status: { type: string }
+
+    RecomputeResult:
+      type: object
+      properties:
+        triggered: { type: integer }
+        message: { type: string }
+
+    CompareRequest:
+      type: object
+      properties:
+        algorithm:
+          allOf:
+            - $ref: '#/components/schemas/Algorithm'
+          default: phash
+        threshold: { type: number, default: 0.85, minimum: 0, maximum: 1 }
+        rotation_invariant: { type: boolean, default: false }
+
+    SmartCompareRequest:
+      type: object
+      properties:
+        threshold: { type: number, default: 0.92, minimum: 0, maximum: 1 }
+        min_agree: { type: integer, default: 3, minimum: 1 }
+
+    SimilarGroup:
+      type: object
+      properties:
+        group_id: { type: integer }
+        similarity_score: { type: number }
+        images:
+          type: array
+          items:
+            $ref: '#/components/schemas/Image'
+
+    ComparisonResult:
+      type: object
+      properties:
+        project_id: { type: integer }
+        run_id: { type: integer, nullable: true }
+        total_images: { type: integer }
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/SimilarGroup'
+        unique_images:
+          type: array
+          items:
+            $ref: '#/components/schemas/Image'
+
+    SmartCompareResult:
+      type: object
+      properties:
+        total_images: { type: integer }
+        algorithms_used: { type: integer }
+        found_duplicates: { type: boolean }
+        duplicate_groups:
+          type: array
+          items:
+            type: object
+            properties:
+              images:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer }
+                    filename: { type: string }
+                    file_path: { type: string }
+              confidence: { type: number }
+              matched_algorithms:
+                type: array
+                items: { type: string }
+              matched_count: { type: integer }
+        unique_count: { type: integer }
+        scan_seconds: { type: number }
+        features_pending: { type: boolean }
+        summary: { type: string }
+
+    MatrixResult:
+      type: object
+      properties:
+        names:
+          type: array
+          items: { type: string }
+        image_ids:
+          type: array
+          items: { type: integer }
+        matrix:
+          type: array
+          items:
+            type: array
+            items: { type: number }
+        algorithm: { type: string }
+        engine: { type: string, example: rust-matrix }
+
+    AnalysisRun:
+      type: object
+      properties:
+        id: { type: integer }
+        project_id: { type: integer }
+        algorithm: { type: string }
+        threshold: { type: number }
+        total_images: { type: integer }
+        groups_count: { type: integer }
+        unique_count: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    AnalysisRunDetail:
+      type: object
+      properties:
+        run:
+          $ref: '#/components/schemas/AnalysisRun'
+        result:
+          $ref: '#/components/schemas/ComparisonResult'
+
+    Keypoint:
+      type: object
+      properties:
+        x: { type: number }
+        y: { type: number }
+
+    MatchPair:
+      type: object
+      properties:
+        a_idx: { type: integer }
+        b_idx: { type: integer }
+        distance: { type: number }
+
+    MatchData:
+      type: object
+      properties:
+        image_a:
+          type: object
+          properties:
+            width: { type: integer }
+            height: { type: integer }
+            keypoints:
+              type: array
+              items:
+                $ref: '#/components/schemas/Keypoint'
+        image_b:
+          type: object
+          properties:
+            width: { type: integer }
+            height: { type: integer }
+            keypoints:
+              type: array
+              items:
+                $ref: '#/components/schemas/Keypoint'
+        matches:
+          type: array
+          items:
+            $ref: '#/components/schemas/MatchPair'
+        score: { type: number }
+
+    VisualizationResult:
+      type: object
+      properties:
+        file_path: { type: string }
+        media_type: { type: string }
+
+    SliceCell:
+      type: object
+      properties:
+        row: { type: integer }
+        col: { type: integer }
+        score: { type: number, description: 该切片与图 A 的最佳匹配分 }
+        best_region:
+          type: object
+          nullable: true
+          properties:
+            x: { type: integer }
+            y: { type: integer }
+            width: { type: integer }
+            height: { type: integer }
+
+    SliceMatchResult:
+      type: object
+      properties:
+        image_a_id: { type: integer }
+        image_b_id: { type: integer }
+        rows: { type: integer }
+        cols: { type: integer }
+        cells:
+          type: array
+          items:
+            $ref: '#/components/schemas/SliceCell'
+        coverage: { type: number, description: 匹配得分超过阈值的切片占比 }
+        mean_score: { type: number }
+        is_slice_of_a:
+          type: boolean
+          description: B 整体是否大概率为 A 的切片重组/局部
+
+    Report:
+      type: object
+      properties:
+        project:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            description: { type: string, nullable: true }
+        generated_at: { type: string, format: date-time }
+        algorithm: { type: string }
+        threshold: { type: number }
+        rotation_invariant: { type: boolean }
+        images:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: integer }
+              filename: { type: string }
+              width: { type: integer, nullable: true }
+              height: { type: integer, nullable: true }
+              file_size: { type: integer, nullable: true }
+        matrix:
+          type: object
+          properties:
+            names:
+              type: array
+              items: { type: string }
+            image_ids:
+              type: array
+              items: { type: integer }
+            values:
+              type: array
+              items:
+                type: array
+                items: { type: number }
+            engine: { type: string, nullable: true }
+        groups:
+          type: array
+          items:
+            type: object
+            properties:
+              group_id: { type: integer }
+              similarity_score: { type: number }
+              images:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer }
+                    filename: { type: string }
+              pair_matches:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MatchData'
+        summary:
+          type: object
+          properties:
+            total_images: { type: integer }
+            similar_groups: { type: integer }
+            unique_images: { type: integer }
+            duplicate_rate: { type: number }

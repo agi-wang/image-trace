@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/itrace-core",
+    "crates/itrace-store",
+    "crates/itrace-server",
+    "crates/itrace-cli",
+]
+
+[workspace.package]
+version = "3.0.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+image = { version = "0.25", default-features = false, features = [
+    "jpeg", "png", "gif", "bmp", "tiff", "webp", "ico", "qoi",
+] }
+rayon = "1.10"
+blake3 = "1.5"
+rusqlite = { version = "0.32", features = ["bundled"] }
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+clap = { version = "4.5", features = ["derive"] }
+lopdf = "0.36"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
