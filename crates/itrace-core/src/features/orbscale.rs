@@ -1,11 +1,13 @@
 //! `orbscale`: multi-scale ORB feature.
 //!
-//! A 3-level Gaussian pyramid is built over the gray image and the
-//! standard ORB pipeline ([`orb::detect_orb`]) runs on every level. The
-//! union of descriptors across all levels is mean-pooled into the same
-//! 32-dim f32 signature [`super::OrbPooledExtractor`] emits — but the
-//! pooled vector now covers content at 1.0×, 0.5× and 0.25× scale, so a
-//! downscaled copy still produces a near-identical signature.
+//! A 3-level Gaussian pyramid is built over the gray image and ORB runs
+//! over it via [`orb::detect_orb_with_pyramid`] — the provided levels are
+//! used directly as ORB's detection pyramid, so no second per-level
+//! pyramid is built. The union of descriptors across all levels is
+//! mean-pooled into the same 32-dim f32 signature
+//! [`super::OrbPooledExtractor`] emits — but the pooled vector now covers
+//! content at 1.0×, 0.5× and 0.25× scale, so a downscaled copy still
+//! produces a near-identical signature.
 
 use super::{pack_f32, pool_descriptors, unpack_f32, FeatureExtractor, FeatureKind};
 use crate::descriptors::{orb, DescriptorSet};
@@ -32,36 +34,35 @@ fn gaussian_blur(gray: &GrayImage, sigma: f32) -> GrayImage {
     )
 }
 
-/// ORB descriptors pooled across the pyramid: one merged descriptor set
-/// with keypoint coordinates rescaled to the base-level frame and
-/// `level` re-tagged to the outer pyramid level. The pyramid is computed
-/// lazily level-by-level — no full-image clones: level *i*+1 is a blurred
-/// 2× downsample of level *i* (classic Burt–Adelson reduce).
-fn detect_multiscale(gray: &GrayImage) -> DescriptorSet {
-    let mut merged =
-        DescriptorSet { keypoints: Vec::new(), desc_len: 32, data: Vec::new() };
-    let mut owned: Option<GrayImage> = None;
-    for i in 0..NUM_LEVELS {
-        let level: &GrayImage = owned.as_ref().unwrap_or(gray);
-        let ds = orb::detect_orb(level, LEVEL_MAX_FEATURES);
-        let s = (1u32 << i) as f32;
-        merged.keypoints.extend(ds.keypoints.iter().map(|k| {
-            let mut k = *k;
-            k.x *= s;
-            k.y *= s;
-            k.level = i as u8;
-            k
-        }));
-        merged.data.extend_from_slice(&ds.data);
-        if i + 1 < NUM_LEVELS {
-            owned = Some(image_io::resize_gray_exact(
-                &gaussian_blur(level, PYRAMID_SIGMA),
-                (level.width / 2).max(1),
-                (level.height / 2).max(1),
-            ));
-        }
+/// Gaussian-pyramid levels *beyond* `gray` (which is level 0): level *i*+1
+/// is a blurred 2× downsample of level *i* (classic Burt–Adelson reduce).
+fn gaussian_pyramid(gray: &GrayImage) -> Vec<GrayImage> {
+    let mut levels = Vec::with_capacity((NUM_LEVELS - 1) as usize);
+    for _ in 1..NUM_LEVELS {
+        let prev: &GrayImage = levels.last().unwrap_or(gray);
+        let blurred = gaussian_blur(prev, PYRAMID_SIGMA);
+        levels.push(image_io::resize_gray_exact(
+            &blurred,
+            (prev.width / 2).max(1),
+            (prev.height / 2).max(1),
+        ));
     }
-    merged
+    levels
+}
+
+/// ORB descriptors pooled across the pyramid: the Gaussian levels are fed
+/// to [`orb::detect_orb_with_pyramid`] in one call — the provided level
+/// images serve as ORB's detection pyramid, so no second 8-level pyramid
+/// is built per level. Keypoints are tagged with the pyramid level and
+/// reported in the base-level frame (scale 2^level).
+fn detect_multiscale(gray: &GrayImage) -> DescriptorSet {
+    let extra = gaussian_pyramid(gray);
+    let pyr: Vec<(f64, &GrayImage)> = extra
+        .iter()
+        .enumerate()
+        .map(|(i, l)| ((1u32 << (i + 1)) as f64, l))
+        .collect();
+    orb::detect_orb_with_pyramid(gray, LEVEL_MAX_FEATURES, &pyr)
 }
 
 /// Multi-scale pooled ORB signature serving the `orbscale` algorithm.
@@ -132,7 +133,6 @@ pub(crate) fn centered_cosine(a: &[f32], b: &[f32]) -> f64 {
     }
     (dot / (na * nb).sqrt()).clamp(0.0, 1.0)
 }
-
 
 #[cfg(test)]
 mod tests {

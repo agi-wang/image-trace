@@ -52,7 +52,12 @@ pub fn handle_upload(
     if image_io::is_supported_image(filename) {
         let img = image_io::decode(&data)
             .map_err(|e| ApiError::unprocessable(format!("图片解码失败: {e:#}")))?;
-        let rec = insert_one_image(store, project_id, &rel, filename, None, &data, &img)?;
+        let feats = hashes::compute_image_features_decoded(
+            &img,
+            hashes::blake3_hex(&data),
+            data.len() as u64,
+        );
+        let rec = insert_one_image(store, project_id, &rel, filename, None, &feats)?;
         enqueue_precompute_decoded(state, rec.id, img);
         return Ok(json!({
             "project_id": project_id, "filename": filename, "file_path": rel,
@@ -68,12 +73,28 @@ pub fn handle_upload(
     if image_io::is_supported_document(filename) {
         let extracted = documents::extract_named(filename, &data)
             .map_err(|e| ApiError::unprocessable(format!("文档解析失败: {e:#}")))?;
+        // Decode + insert-time hashes for all extracted images in parallel;
+        // the Option collect keeps extraction order and the old
+        // skip-on-undecodable semantics. unique_key/write/insert stay
+        // sequential so keys and row ids are assigned in order.
+        let decoded: Vec<Option<(image::DynamicImage, itrace_core::ImageFeatures)>> = extracted
+            .par_iter()
+            .map(|ex| {
+                let img = image_io::decode(&ex.data).ok()?;
+                let feats = hashes::compute_image_features_decoded(
+                    &img,
+                    hashes::blake3_hex(&ex.data),
+                    ex.data.len() as u64,
+                );
+                Some((img, feats))
+            })
+            .collect();
         let mut processed = Vec::new();
-        for ex in extracted {
-            let Ok(img) = image_io::decode(&ex.data) else { continue };
+        for (ex, pair) in extracted.iter().zip(decoded) {
+            let Some((img, feats)) = pair else { continue };
             let key = unique_key(store, "extracted", &ex.filename);
             store.write_file(&key, &ex.data)?;
-            match insert_one_image(store, project_id, &key, &ex.filename, Some(&rel), &ex.data, &img) {
+            match insert_one_image(store, project_id, &key, &ex.filename, Some(&rel), &feats) {
                 Ok(rec) => {
                     enqueue_precompute_decoded(state, rec.id, img);
                     processed.push(json!({
@@ -101,19 +122,13 @@ fn insert_one_image(
     key: &str,
     filename: &str,
     extracted_from: Option<&str>,
-    raw: &[u8],
-    img: &image::DynamicImage,
+    feats: &itrace_core::ImageFeatures,
 ) -> anyhow::Result<ImageRecord> {
-    let feats = hashes::compute_image_features_decoded(
-        img,
-        hashes::blake3_hex(raw),
-        raw.len() as u64,
-    );
     store.insert_image(&NewImage {
         project_id,
         filename: filename.to_string(),
         file_path: key.to_string(),
-        file_hash: feats.file_hash,
+        file_hash: feats.file_hash.clone(),
         phash: Some(hashes::to_hex(feats.hashes.phash)),
         dhash: Some(hashes::to_hex(feats.hashes.dhash)),
         ahash: Some(hashes::to_hex(feats.hashes.ahash)),
@@ -128,35 +143,127 @@ fn insert_one_image(
 
 // ---------- compare ----------
 
-/// Decode every image once for the precise path. Returns (kept index into
-/// `images`, Prepared) pairs — callers must map result indexes through
-/// `kept` because undecodable images are dropped.
+/// Cache key for one prepared image: a `Prepared` is a pure function of
+/// (file bytes, desc_algos, rot_inv), and `images` rows are immutable with
+/// AUTOINCREMENT ids, so `(image_id, rot_inv, desc_algos.join(","))`
+/// identifies one exact build. Alg needing no descriptors (hash/pixel)
+/// share the `""` entry; `orb`/`akaze`/`sift`/`auto` get their own.
+type PreparedKey = (i64, bool, String);
+
+/// Bounded LRU over prepared images shared by every compare/matrix
+/// request. `Prepared` isn't `Clone`, so entries are shared `Arc`s and
+/// scoring goes through `arc_pairwise_matrix` below. CAP is small because
+/// one Prepared holds gray+rgb+8 variants (~1–2 MB).
+#[derive(Default)]
+pub struct PreparedCache {
+    map: HashMap<PreparedKey, (u64, Arc<Prepared>)>,
+    tick: u64,
+}
+
+impl PreparedCache {
+    const CAP: usize = 32;
+
+    pub fn get(&mut self, key: &PreparedKey) -> Option<Arc<Prepared>> {
+        let (t, p) = self.map.get_mut(key)?;
+        self.tick += 1;
+        *t = self.tick;
+        Some(Arc::clone(p))
+    }
+
+    pub fn insert(&mut self, key: PreparedKey, p: Arc<Prepared>) {
+        self.tick += 1;
+        self.map.insert(key, (self.tick, p));
+        if self.map.len() > Self::CAP {
+            let oldest =
+                self.map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                self.map.remove(&k);
+            }
+        }
+    }
+
+    /// Drop every cached build of one image (all rot_inv/desc variants).
+    /// AUTOINCREMENT ids can never alias a future image, so this is prompt
+    /// memory reclamation, not correctness — still called on every delete.
+    pub fn invalidate(&mut self, image_id: i64) {
+        self.map.retain(|k, _| k.0 != image_id);
+    }
+}
+
+/// Drop all in-process caches for a deleted image (Prepared LRU + gray).
+pub fn invalidate_image(state: &AppState, image_id: i64) {
+    state.prepared_cache.lock().unwrap().invalidate(image_id);
+    state.gray_cache.lock().unwrap().remove(&image_id);
+}
+
+/// Decode every image once for the precise path, reusing `state`'s bounded
+/// Prepared LRU across requests. Returns (kept index into `images`,
+/// Arc<Prepared>) pairs — callers must map result indexes through `kept`
+/// because undecodable images are dropped. Builds run in parallel; the
+/// per-image Option collect keeps `kept` order deterministic regardless of
+/// rayon scheduling.
 fn load_prepared(
-    store: &Store,
+    state: &AppState,
     images: &[ImageRecord],
     algo: &str,
     rot_inv: bool,
-) -> (Vec<usize>, Vec<Prepared>) {
+) -> (Vec<usize>, Vec<Arc<Prepared>>) {
     let desc_algos = compare::desc_algos_for(algo);
-    let mut kept = Vec::new();
-    let mut prepared = Vec::new();
-    images
+    let desc_key = desc_algos.join(",");
+    let store = &state.store;
+    let results: Vec<Option<(usize, Arc<Prepared>)>> = images
         .par_iter()
         .enumerate()
-        .filter_map(|(i, img)| {
+        .map(|(i, img)| {
+            let key: PreparedKey = (img.id, rot_inv, desc_key.clone());
+            if let Some(p) = state.prepared_cache.lock().unwrap().get(&key) {
+                return Some((i, p));
+            }
             let bytes = store.read_file(&img.file_path).ok()?;
-            Prepared::from_bytes(&bytes, &desc_algos, rot_inv).ok().map(|p| (i, p))
+            let p = Arc::new(Prepared::from_bytes(&bytes, &desc_algos, rot_inv).ok()?);
+            state.prepared_cache.lock().unwrap().insert(key, Arc::clone(&p));
+            Some((i, p))
         })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .for_each(|(i, p)| {
-            kept.push(i);
-            prepared.push(p);
-        });
+        .collect();
+    let mut kept = Vec::new();
+    let mut prepared = Vec::new();
+    for (i, p) in results.into_iter().flatten() {
+        kept.push(i);
+        prepared.push(p);
+    }
     (kept, prepared)
 }
 
-/// Precise per-pair analysis (with pair_cache short-circuit for hash algos).
+/// `compare::pairwise_matrix` lifted to shared `Arc<Prepared>` entries —
+/// the cache can't hand out owned `Prepared` values (not `Clone`), so the
+/// matrix loop is mirrored here with identical semantics: same
+/// `pair_score` calls, symmetric fill, unit diagonal.
+fn arc_pairwise_matrix(
+    prepared: &[Arc<Prepared>],
+    algo: &str,
+    rot_inv: bool,
+) -> Vec<Vec<f64>> {
+    let n = prepared.len();
+    let mut m = vec![vec![0f64; n]; n];
+    for (i, row) in m.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    let results: Vec<(usize, usize, f64)> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| (i + 1..n).map(move |j| (i, j)))
+        .map(|(i, j)| (i, j, compare::pair_score(algo, &prepared[i], &prepared[j], rot_inv)))
+        .collect();
+    for (i, j, s) in results {
+        m[i][j] = s;
+        m[j][i] = s;
+    }
+    m
+}
+
+/// Precise per-pair analysis over the shared Prepared cache. (The store's
+/// `pair_cache` table is deliberately unused: per-pair SQLite I/O under the
+/// single locked connection costs more than in-memory rescoring once
+/// `Prepared` is cached, and N² rows would bloat the DB.)
 pub fn run_compare(
     state: &AppState,
     images: &[ImageRecord],
@@ -232,8 +339,9 @@ pub fn run_compare(
         return Ok(result);
     }
 
-    let (kept, prepared) = load_prepared(store, images, algo, rot_inv);
-    let (groups, ungrouped, matrix) = compare::analyze(&prepared, algo, threshold, rot_inv);
+    let (kept, prepared) = load_prepared(state, images, algo, rot_inv);
+    let matrix = arc_pairwise_matrix(&prepared, algo, rot_inv);
+    let (groups, ungrouped) = compare::cluster(&matrix, threshold);
 
     // group avg similarity
     let mut group_json = Vec::new();
@@ -325,16 +433,14 @@ pub fn run_smart_compare(
         if map.is_empty() {
             continue;
         }
-        let m = features::similarity_matrix(map, &ids, algo, true);
-        for (i, row) in m.iter().enumerate() {
-            for (j, &s) in row.iter().enumerate().skip(i + 1) {
-                if s >= threshold {
-                    pair_hits
-                        .entry((i, j))
-                        .or_default()
-                        .push((algo.to_string(), (s * 10000.0).round() / 10000.0));
-                }
-            }
+        // Streaming pair hits — same decode-once kernels and variant_max
+        // scoring as similarity_matrix, without materializing N×N.
+        let pairs = features::similarity_pairs_above(map, &ids, algo, true, threshold);
+        for (i, j, s) in pairs {
+            pair_hits
+                .entry((i, j))
+                .or_default()
+                .push((algo.to_string(), (s * 10000.0).round() / 10000.0));
         }
     }
 
@@ -445,22 +551,31 @@ pub fn run_dedup_scan(
     let gate_feats: Vec<usize> = gate_feat.iter().flatten().copied().collect();
     let maps = store.load_feature_maps(&ids, &feat_names, &variants)?;
 
-    let mut entries: Vec<index::DedupKeys> = Vec::with_capacity(ready.len());
-    for img in &ready {
-        let variant_keys: Vec<Vec<u64>> = gate_feats
-            .iter()
-            .map(|&fi| {
-                variants
-                    .iter()
-                    .filter_map(|v| maps[fi].get(&img.id).and_then(|vm| vm.get(v)))
-                    .map(|b| features::unpack_bits(b))
-                    .collect()
-            })
-            .collect();
-        if variant_keys.iter().all(|k| k.len() == variants.len()) {
-            entries.push(index::DedupKeys { image_id: img.id, variant_keys });
-        }
-    }
+    // Per-image key extraction in parallel; the Option collect preserves
+    // `ready` order (and thus downstream group ordering) deterministically.
+    let entries: Vec<index::DedupKeys> = ready
+        .par_iter()
+        .map(|img| {
+            let variant_keys: Vec<Vec<u64>> = gate_feats
+                .iter()
+                .map(|&fi| {
+                    variants
+                        .iter()
+                        .filter_map(|v| maps[fi].get(&img.id).and_then(|vm| vm.get(v)))
+                        .map(|b| features::unpack_bits(b))
+                        .collect()
+                })
+                .collect();
+            if variant_keys.iter().all(|k| k.len() == variants.len()) {
+                Some(index::DedupKeys { image_id: img.id, variant_keys })
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<Option<_>>>()
+        .into_iter()
+        .flatten()
+        .collect();
 
     let t0 = std::time::Instant::now();
     let pairs = index::dedup_candidates(&entries, radius, min_votes);
@@ -583,8 +698,8 @@ fn compute_matrix(
 
     // fallback: precise path on decoded images; kept[] maps matrix indexes
     // back to `images` (undecodable files are dropped)
-    let (kept, prepared) = load_prepared(store, images, algo, rot_inv);
-    let m = compare::pairwise_matrix(&prepared, algo, rot_inv);
+    let (kept, prepared) = load_prepared(state, images, algo, rot_inv);
+    let m = arc_pairwise_matrix(&prepared, algo, rot_inv);
     let names = kept.iter().map(|&k| images[k].filename.clone()).collect();
     let image_ids = kept.iter().map(|&k| images[k].id).collect();
     Ok(MatrixResult { names, image_ids, matrix: m, engine: "precise" })

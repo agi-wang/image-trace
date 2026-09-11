@@ -3,6 +3,9 @@
 mod draw;
 mod service;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -13,6 +16,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
@@ -30,6 +34,10 @@ struct AppState {
     /// the match/slice endpoints — they re-decode the same blobs per call.
     gray_cache:
         Arc<std::sync::Mutex<std::collections::HashMap<i64, Arc<core::GrayImage>>>>,
+    /// Bounded LRU (≤32) of prepared images for the compare/matrix paths —
+    /// building `Prepared` (decode+hashes+descriptors) per request was the
+    /// dominant compare cost.
+    prepared_cache: Arc<std::sync::Mutex<service::PreparedCache>>,
 }
 
 /// Storage backend name, set once at startup for /v1/system/info.
@@ -389,6 +397,7 @@ async fn delete_project(
             }
         })?;
         for img in images {
+            service::invalidate_image(&s, img.id);
             let _ = s.store.delete_file(&img.file_path);
             if let Ok(thumbs) = s.store.blobs().list(&format!("thumbnails/{}_", img.id)) {
                 for t in thumbs {
@@ -420,6 +429,7 @@ async fn delete_image(
 ) -> ApiResult<Json<serde_json::Value>> {
     blocking(move || {
         let rec = s.store.delete_image(id).map_err(|_| ApiError::not_found("图像不存在"))?;
+        service::invalidate_image(&s, id);
         let _ = s.store.delete_file(&rec.file_path);
         if let Ok(thumbs) = s.store.blobs().list(&format!("thumbnails/{id}_")) {
             for t in thumbs {
@@ -513,9 +523,17 @@ async fn recompute_features(
     let pending = blocking(move || {
         st.store.get_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
         let images = st.store.list_images(id, 0, i64::MAX)?;
+        // file_exists is a syscall per image — run the pending filter in
+        // parallel; the Option collect preserves list order (and thus the
+        // enqueue order) identically to the old sequential filter.
         Ok(images
+            .into_par_iter()
+            .map(|i| {
+                (i.feature_status != "ready" && st.store.file_exists(&i.file_path)).then_some(i)
+            })
+            .collect::<Vec<_>>()
             .into_iter()
-            .filter(|i| i.feature_status != "ready" && st.store.file_exists(&i.file_path))
+            .flatten()
             .collect::<Vec<_>>())
     })
     .await?;
@@ -730,7 +748,11 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::open(std::path::Path::new(&data_dir))?;
     let _ = APP_STORAGE.set(store.storage_kind());
     tracing::info!("storage backend: {}", store.storage_kind());
-    let state = AppState { store: Arc::new(store), gray_cache: Default::default() };
+    let state = AppState {
+        store: Arc::new(store),
+        gray_cache: Default::default(),
+        prepared_cache: Default::default(),
+    };
 
     let app = Router::new()
         .route("/v1/health", get(health))

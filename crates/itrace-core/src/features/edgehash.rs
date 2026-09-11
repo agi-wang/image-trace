@@ -57,21 +57,24 @@ pub fn edgehash(gray: &GrayImage) -> u64 {
     let w = WORK as usize;
     let cell_px = (WORK as usize) / GRID;
 
-    // Sobel gradients → per-cell orientation histograms.
+    // Sobel gradients → per-cell orientation histograms. Row slices hoist
+    // the ±w offsets out of the per-pixel loop — same integer taps.
     let mut cells = [0f64; GRID * GRID * ORIENT];
     for y in 1..(WORK - 1) {
-        for x in 1..(WORK - 1) {
-            let i = (y as usize) * w + (x as usize);
-            let gx = small.data[i - w + 1] as i32 + 2 * small.data[i + 1] as i32
-                + small.data[i + w + 1] as i32
-                - small.data[i - w - 1] as i32
-                - 2 * small.data[i - 1] as i32
-                - small.data[i + w - 1] as i32;
-            let gy = small.data[i + w - 1] as i32 + 2 * small.data[i + w] as i32
-                + small.data[i + w + 1] as i32
-                - small.data[i - w - 1] as i32
-                - 2 * small.data[i - w] as i32
-                - small.data[i - w + 1] as i32;
+        let y = y as usize;
+        let up = &small.data[(y - 1) * w..y * w];
+        let mid = &small.data[y * w..(y + 1) * w];
+        let dn = &small.data[(y + 1) * w..(y + 2) * w];
+        let c_row = (y / cell_px) * GRID;
+        for x in 1..(WORK - 1) as usize {
+            let gx = up[x + 1] as i32 + 2 * mid[x + 1] as i32 + dn[x + 1] as i32
+                - up[x - 1] as i32
+                - 2 * mid[x - 1] as i32
+                - dn[x - 1] as i32;
+            let gy = dn[x - 1] as i32 + 2 * dn[x] as i32 + dn[x + 1] as i32
+                - up[x - 1] as i32
+                - 2 * up[x] as i32
+                - up[x + 1] as i32;
             // compare squared magnitude to squared floor — sqrt is monotonic,
             // so the filter decision is identical and the sqrt runs only on
             // pixels that pass
@@ -81,14 +84,17 @@ pub fn edgehash(gray: &GrayImage) -> u64 {
             }
             let mag = mag2.sqrt();
             // undirected orientation in [0, π) at 45° bin spacing, cyclic;
-            // magnitude splits linearly between the two nearest bins
+            // magnitude splits linearly between the two nearest bins. atan2
+            // stays: the split fraction f must be bit-identical and only the
+            // true f64 angle produces it (a (gx,gy) LUT would need ~33 MB of
+            // f64s — slower than the intrinsic).
             let pos = (gy as f64)
                 .atan2(gx as f64)
                 .rem_euclid(std::f64::consts::PI)
                 / std::f64::consts::FRAC_PI_4;
             let b0 = pos as usize;
             let f = pos - pos.floor();
-            let c = ((y as usize / cell_px) * GRID + (x as usize) / cell_px) * ORIENT;
+            let c = (c_row + x / cell_px) * ORIENT;
             cells[c + b0] += (1.0 - f) * mag;
             cells[c + (b0 + 1) % ORIENT] += f * mag;
         }

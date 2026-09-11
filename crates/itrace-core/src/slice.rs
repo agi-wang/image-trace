@@ -111,6 +111,16 @@ pub fn slice_match(a: &GrayImage, b: &GrayImage, rows: u32, cols: u32, threshold
             let col = (i as u32) % cols;
             let mut best = (0.0f64, 0u32, 0u32, 0u32);
             for ri in 0..4u32 {
+                // Rotated dims — (h,w) for 90°/270° — are known before the
+                // rotation is built, so oversized rotations never materialize.
+                let (rw, rh) = if ri % 2 == 0 {
+                    (cell.width, cell.height)
+                } else {
+                    (cell.height, cell.width)
+                };
+                if rw > a_small.width || rh > a_small.height {
+                    continue;
+                }
                 // ri == 0 borrows the cell; other rotations are built on demand.
                 let owned;
                 let rot = if ri == 0 {
@@ -119,9 +129,6 @@ pub fn slice_match(a: &GrayImage, b: &GrayImage, rows: u32, cols: u32, threshold
                     owned = rotate_cell(cell, ri);
                     &owned
                 };
-                if rot.width > a_small.width || rot.height > a_small.height {
-                    continue;
-                }
                 let (s, x, y) = template_match(&a_small, rot);
                 if s > best.0 {
                     best = (s, x, y, ri * 90);
@@ -157,20 +164,39 @@ pub fn slice_match(a: &GrayImage, b: &GrayImage, rows: u32, cols: u32, threshold
 
 /// Whole-image containment test: is either image a crop/sub-image of the other?
 /// Returns (score, contained). Downscales for speed; tries both directions.
+/// The two direction checks are independent template matches — they run in
+/// parallel. Return semantics are unchanged: a ≥0.8 b-in-a score short-circuits,
+/// otherwise the a-in-b result (or none) decides.
 pub fn contains(a: &GrayImage, b: &GrayImage) -> (f64, bool) {
     let a_s = fit_max(a, MAX_SIDE);
     let b_s = fit_max(b, MAX_SIDE);
+    // `fwd` = score of b inside a, `rev` = score of a inside b; each is `None`
+    // when the inner image cannot fit inside the outer one.
+    let (fwd, rev) = rayon::join(
+        || {
+            if b_s.width <= a_s.width && b_s.height <= a_s.height {
+                Some(template_match(&a_s, &b_s).0)
+            } else {
+                None
+            }
+        },
+        || {
+            if a_s.width <= b_s.width && a_s.height <= b_s.height {
+                Some(template_match(&b_s, &a_s).0)
+            } else {
+                None
+            }
+        },
+    );
     // b inside a?
-    if b_s.width <= a_s.width && b_s.height <= a_s.height {
-        let (s, _, _) = template_match(&a_s, &b_s);
+    if let Some(s) = fwd {
         if s >= 0.8 {
             return (s, true);
         }
     }
     // a inside b?
-    if a_s.width <= b_s.width && a_s.height <= b_s.height {
-        let (s, _, _) = template_match(&b_s, &a_s);
-        return (s, s >= 0.8);
+    match rev {
+        Some(s) => (s, s >= 0.8),
+        None => (0.0, false),
     }
-    (0.0, false)
 }

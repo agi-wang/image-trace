@@ -72,7 +72,8 @@ pub trait FeatureExtractor: Sync {
     fn similarity(&self, a: &[u8], b: &[u8]) -> f64;
     /// True when every dihedral variant yields the same feature (the
     /// histogram/moment features): the 8×8 variant cross-product in
-    /// `similarity_matrix` is then redundant and only variant 0 is compared.
+    /// `similarity_matrix` is then redundant and only variant 0 is compared,
+    /// and `compute_all_variants` stores only the variant-0 row.
     fn rotation_invariant(&self) -> bool {
         false
     }
@@ -348,11 +349,18 @@ pub(crate) fn pool_descriptors(descs: &crate::descriptors::DescriptorSet) -> Vec
 /// One stored-feature row: (variant_idx, feature_name, bytes, dims).
 type VariantRow = (u8, String, Vec<u8>, usize);
 
-/// Compute every registered feature for one already-decoded variant image.
-/// Extractors run in parallel; rows keep registry order.
-pub fn compute_variant_features(gray: &GrayImage, rgb: &RgbImage) -> Vec<(String, Vec<u8>, usize)> {
+/// Shared body of [`compute_variant_features`]: extractors run in parallel,
+/// rows keep registry order. `include_invariant` gates rotation-invariant
+/// extractors — they produce byte-identical output on every variant, so
+/// `compute_all_variants` computes them only on variant 0.
+fn variant_features(
+    gray: &GrayImage,
+    rgb: &RgbImage,
+    include_invariant: bool,
+) -> Vec<(String, Vec<u8>, usize)> {
     EXTRACTORS
         .par_iter()
+        .filter(move |e| include_invariant || !e.rotation_invariant())
         .map(|e| {
             let bytes = e.compute(gray, rgb);
             let dims = e.dims(&bytes);
@@ -361,12 +369,27 @@ pub fn compute_variant_features(gray: &GrayImage, rgb: &RgbImage) -> Vec<(String
         .collect()
 }
 
-/// Compute features for all 8 orientation variants of a decoded image.
+/// Compute every registered feature for one already-decoded variant image.
+/// Extractors run in parallel; rows keep registry order.
+pub fn compute_variant_features(gray: &GrayImage, rgb: &RgbImage) -> Vec<(String, Vec<u8>, usize)> {
+    variant_features(gray, rgb, true)
+}
+
+/// Compute features for the orientation variants of a decoded image.
 /// The image is first downscaled to the `MAX_SIDE` working scale (matching
 /// the live-comparison path in `compare.rs`), so stored payloads for inputs
 /// larger than 512px change relative to unscaled extraction. Variants run
 /// in parallel; rows stay ordered by variant index, then registry order.
 /// Returns (variant_idx, feature_name, bytes, dims) rows.
+///
+/// Rotation-invariant extractors ([`FeatureExtractor::rotation_invariant`]
+/// — currently `histogram_hsv`, `hu_moments`, `colorhash_bits`) emit
+/// byte-identical payloads on all 8 variants, so they are computed and
+/// emitted only for variant 0 — 14 rows on variant 0, the 11 remaining
+/// extractors on variants 1..8 (91 rows total, down from 112). Readers
+/// tolerate missing variant rows: the matrix path for invariant features
+/// compares only variant 0 anyway, and variant iteration is driven by the
+/// keys present in each image's feature map.
 pub fn compute_all_variants(
     img: &image::DynamicImage,
 ) -> Vec<(u8, String, Vec<u8>, usize)> {
@@ -380,7 +403,7 @@ pub fn compute_all_variants(
         .into_par_iter()
         .map(|vi| {
             let r = image_io::to_rgb(&rgb_vars[vi]);
-            compute_variant_features(&gray_vars[vi], &r)
+            variant_features(&gray_vars[vi], &r, vi == 0)
                 .into_iter()
                 .map(|(name, bytes, dims)| (vi as u8, name, bytes, dims))
                 .collect()
@@ -454,22 +477,50 @@ fn variant_max<T>(
     mx
 }
 
+/// Shared streaming pair core: score every upper-triangle pair (i < j) in
+/// parallel and collect the (i, j, score) triples `keep` accepts, in (i, j)
+/// order. `pair_matrix` and `similarity_pairs_above` are the two consumers —
+/// the score closure decides which payloads/variants feed each comparison.
+fn pair_select(
+    n: usize,
+    score: &(dyn Fn(usize, usize) -> f64 + Sync),
+    keep: &(dyn Fn(f64) -> bool + Sync),
+) -> Vec<(usize, usize, f64)> {
+    (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| (i + 1..n).map(move |j| (i, j)))
+        .filter_map(|(i, j)| {
+            let s = score(i, j);
+            if keep(s) {
+                Some((i, j, s))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Symmetric N×N matrix with unit diagonal filled from parallel pair scores.
 fn pair_matrix(n: usize, score: &(dyn Fn(usize, usize) -> f64 + Sync)) -> Vec<Vec<f64>> {
     let mut m = vec![vec![0f64; n]; n];
     for (i, row) in m.iter_mut().enumerate() {
         row[i] = 1.0;
     }
-    let results: Vec<(usize, usize, f64)> = (0..n)
-        .into_par_iter()
-        .flat_map_iter(|i| (i + 1..n).map(move |j| (i, j)))
-        .map(|(i, j)| (i, j, score(i, j)))
-        .collect();
-    for (i, j, s) in results {
+    for (i, j, s) in pair_select(n, score, &|_| true) {
         m[i][j] = s;
         m[j][i] = s;
     }
     m
+}
+
+/// The variant list a comparison scans: all 8 for the rotation-aware
+/// cross-product, just variant 0 otherwise.
+fn compared_variants(rotation_invariant: bool) -> Vec<u8> {
+    if rotation_invariant {
+        (0..NUM_VARIANTS).collect()
+    } else {
+        vec![0]
+    }
 }
 
 /// N×N similarity matrix over stored payloads. variant-max when rot_inv.
@@ -480,13 +531,30 @@ pub fn generic_similarity_matrix(
     rotation_invariant: bool,
     sim: &(dyn Fn(&[u8], &[u8]) -> f64 + Sync),
 ) -> Vec<Vec<f64>> {
-    let variants: Vec<u8> = if rotation_invariant { (0..NUM_VARIANTS).collect() } else { vec![0] };
-    pair_matrix(ids.len(), &|i, j| {
-        match (vectors.get(&ids[i]), vectors.get(&ids[j])) {
+    let variants = compared_variants(rotation_invariant);
+    pair_matrix(
+        ids.len(),
+        &|i, j| match (vectors.get(&ids[i]), vectors.get(&ids[j])) {
             (Some(ma), Some(mb)) => variant_max(ma, mb, &variants, |a, b| sim(a, b)),
             _ => 0.0,
-        }
-    })
+        },
+    )
+}
+
+/// Decode each stored blob once per (image, variant) — the decoded maps the
+/// matrix and pair-stream paths then score without per-pair unpacking.
+fn decoded_map<'a>(
+    vectors: &'a FeatureMap,
+    ids: &[i64],
+    kernel: MatrixKernel,
+) -> HashMap<i64, HashMap<u8, Decoded<'a>>> {
+    ids.iter()
+        .filter_map(|&id| {
+            vectors
+                .get(&id)
+                .map(|m| (id, m.iter().map(|(&v, b)| (v, kernel.decode(b))).collect()))
+        })
+        .collect()
 }
 
 /// N×N matrix on a [`MatrixKernel`]: decode each stored blob once per
@@ -498,21 +566,15 @@ fn decoded_similarity_matrix(
     rotation_invariant: bool,
     kernel: MatrixKernel,
 ) -> Vec<Vec<f64>> {
-    let decoded: HashMap<i64, HashMap<u8, Decoded>> = ids
-        .iter()
-        .filter_map(|&id| {
-            vectors.get(&id).map(|m| {
-                (id, m.iter().map(|(&v, b)| (v, kernel.decode(b))).collect())
-            })
-        })
-        .collect();
-    let variants: Vec<u8> = if rotation_invariant { (0..NUM_VARIANTS).collect() } else { vec![0] };
-    pair_matrix(ids.len(), &|i, j| {
-        match (decoded.get(&ids[i]), decoded.get(&ids[j])) {
+    let decoded = decoded_map(vectors, ids, kernel);
+    let variants = compared_variants(rotation_invariant);
+    pair_matrix(
+        ids.len(),
+        &|i, j| match (decoded.get(&ids[i]), decoded.get(&ids[j])) {
             (Some(ma), Some(mb)) => variant_max(ma, mb, &variants, |a, b| kernel.score(a, b)),
             _ => 0.0,
-        }
-    })
+        },
+    )
 }
 
 /// Entry point: N×N similarity matrix for an algorithm over stored features.
@@ -532,9 +594,169 @@ pub fn similarity_matrix(
             let rot_inv = rotation_invariant && !ext.rotation_invariant();
             match ext.matrix_kernel() {
                 Some(k) => decoded_similarity_matrix(vectors, ids, rot_inv, k),
-                None => generic_similarity_matrix(vectors, ids, rot_inv, &|a, b| ext.similarity(a, b)),
+                None => {
+                    generic_similarity_matrix(vectors, ids, rot_inv, &|a, b| ext.similarity(a, b))
+                }
             }
         }
         None => pair_matrix(ids.len(), &|_, _| 0.0),
+    }
+}
+
+/// Streaming sibling of [`similarity_matrix`]: emit only the upper-triangle
+/// pairs whose score reaches `threshold`, without materializing the N×N
+/// matrix. Returns `(i, j, score)` triples in (i, j) order, where `i`/`j`
+/// index into `ids`. Scoring is identical to the matrix path — same
+/// decode-once kernels, same variant cross-product with the 0.9999
+/// early-exit — so the result equals the ≥-threshold cells of
+/// `similarity_matrix` on the same inputs.
+pub fn similarity_pairs_above(
+    vectors: &FeatureMap,
+    ids: &[i64],
+    algorithm: &str,
+    rotation_invariant: bool,
+    threshold: f64,
+) -> Vec<(usize, usize, f64)> {
+    let keep = move |s: f64| s >= threshold;
+    match extractor_for_algo(algorithm) {
+        Some(ext) => {
+            let variants = compared_variants(rotation_invariant && !ext.rotation_invariant());
+            match ext.matrix_kernel() {
+                Some(k) => {
+                    let decoded = decoded_map(vectors, ids, k);
+                    pair_select(
+                        ids.len(),
+                        &|i, j| match (decoded.get(&ids[i]), decoded.get(&ids[j])) {
+                            (Some(ma), Some(mb)) => {
+                                variant_max(ma, mb, &variants, |a, b| k.score(a, b))
+                            }
+                            _ => 0.0,
+                        },
+                        &keep,
+                    )
+                }
+                None => pair_select(
+                    ids.len(),
+                    &|i, j| match (vectors.get(&ids[i]), vectors.get(&ids[j])) {
+                        (Some(ma), Some(mb)) => {
+                            variant_max(ma, mb, &variants, |a, b| ext.similarity(a, b))
+                        }
+                        _ => 0.0,
+                    },
+                    &keep,
+                ),
+            }
+        }
+        // unknown algorithm mirrors the matrix path's 0.0-filled off-diagonal
+        None => pair_select(ids.len(), &|_, _| 0.0, &keep),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A FeatureMap of `ids` × `variants` filled from a byte pattern
+    /// derived per (id, variant) — deterministic, no fixtures.
+    fn map_with(ids: &[i64], variants: &[u8], dims: usize) -> FeatureMap {
+        ids.iter()
+            .map(|&id| {
+                let vm = variants
+                    .iter()
+                    .map(|&v| {
+                        let bytes: Vec<u8> = (0..dims)
+                            .map(|k| {
+                                (id as u8)
+                                    .wrapping_mul(31)
+                                    .wrapping_add(v)
+                                    .wrapping_add(k as u8)
+                            })
+                            .collect();
+                        (v, bytes)
+                    })
+                    .collect();
+                (id, vm)
+            })
+            .collect()
+    }
+
+    /// `similarity_pairs_above` must equal the ≥-threshold upper-triangle
+    /// cells of `similarity_matrix` — kernel path (phash) and the generic
+    /// byte path (blockhash, no matrix kernel) alike.
+    #[test]
+    fn pairs_above_matches_matrix_cells() {
+        let ids = [10i64, 11, 12, 13];
+        let variants: Vec<u8> = (0..NUM_VARIANTS).collect();
+        for (algo, dims) in [
+            ("phash", 8usize),
+            ("blockhash", 128),
+            ("histogram", 216 * 4),
+        ] {
+            for rot_inv in [false, true] {
+                let map = map_with(&ids, &variants, dims);
+                let m = similarity_matrix(&map, &ids, algo, rot_inv);
+                for &threshold in &[0.0f64, 0.5, 0.9, 1.0] {
+                    let pairs = similarity_pairs_above(&map, &ids, algo, rot_inv, threshold);
+                    let expected: Vec<(usize, usize, f64)> = (0..ids.len())
+                        .flat_map(|i| (i + 1..ids.len()).map(move |j| (i, j)))
+                        .filter(|&(i, j)| m[i][j] >= threshold)
+                        .map(|(i, j)| (i, j, m[i][j]))
+                        .collect();
+                    assert_eq!(
+                        pairs, expected,
+                        "algo={algo} rot_inv={rot_inv} th={threshold}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Unknown algorithm mirrors the matrix path: off-diagonal cells are
+    /// 0.0 — emitted as pairs only when the threshold admits them.
+    #[test]
+    fn pairs_above_unknown_algo() {
+        let ids = [1i64, 2];
+        let map = map_with(&ids, &[0], 8);
+        assert_eq!(
+            similarity_pairs_above(&map, &ids, "nope", true, 0.0),
+            vec![(0, 1, 0.0)]
+        );
+        assert!(similarity_pairs_above(&map, &ids, "nope", true, 0.5).is_empty());
+    }
+
+    /// Rotation-invariant extractors emit one variant-0 row; the rest emit
+    /// all 8. Total rows = 8·(N−3) + 3.
+    #[test]
+    fn invariant_extractors_emit_variant0_only() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([(x * 3) as u8, (y * 5) as u8, (x ^ y) as u8])
+        }));
+        let rows = compute_all_variants(&img);
+        let n_inv = EXTRACTORS.iter().filter(|e| e.rotation_invariant()).count();
+        let n_all = EXTRACTORS.len();
+        assert_eq!(
+            rows.len(),
+            (NUM_VARIANTS as usize) * (n_all - n_inv) + n_inv
+        );
+        for (v, name, _, _) in &rows {
+            let ext = extractor_for_feature(name).unwrap();
+            if ext.rotation_invariant() {
+                assert_eq!(*v, 0, "invariant {name} emitted variant {v}");
+            }
+        }
+        // every non-invariant feature still covers all 8 variants
+        for ext in EXTRACTORS.iter().filter(|e| !e.rotation_invariant()) {
+            let got: Vec<u8> = rows
+                .iter()
+                .filter(|(_, n, _, _)| n == ext.feature_name())
+                .map(|(v, _, _, _)| *v)
+                .collect();
+            assert_eq!(
+                got,
+                (0..NUM_VARIANTS).collect::<Vec<u8>>(),
+                "{}",
+                ext.feature_name()
+            );
+        }
     }
 }

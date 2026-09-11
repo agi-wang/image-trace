@@ -27,6 +27,9 @@ const SUBS: usize = 8; // 64 bits → 8 × 8-bit substrings
 const SUBKEYS: usize = 256; // distinct values of one 8-bit substring
 
 /// Apply a dihedral transform to an 8×8 bit matrix packed row-major in a u64.
+/// Reference implementation — kept for the equivalence test; the hot path
+/// uses the branch-free SWAR versions below.
+#[cfg(test)]
 fn xform8x8(h: u64, f: fn(usize, usize) -> (usize, usize)) -> u64 {
     let mut out = 0u64;
     for i in 0..8usize {
@@ -40,20 +43,52 @@ fn xform8x8(h: u64, f: fn(usize, usize) -> (usize, usize)) -> u64 {
     out
 }
 
+/// SWAR transpose of the packed 8×8 bit matrix (i,j) → (j,i): three
+/// masked delta-swaps (off-diagonal distances 7, 14, 28 bits).
+#[inline]
+fn transpose8x8(mut x: u64) -> u64 {
+    let t = (x ^ (x >> 7)) & 0x00AA00AA00AA00AA;
+    x ^= t ^ (t << 7);
+    let t = (x ^ (x >> 14)) & 0x0000CCCC0000CCCC;
+    x ^= t ^ (t << 14);
+    let t = (x ^ (x >> 28)) & 0x00000000F0F0F0F0;
+    x ^ t ^ (t << 28)
+}
+
+/// SWAR horizontal flip (i,j) → (i,7-j): reverse the bits of each byte.
+#[inline]
+fn fliph8x8(mut x: u64) -> u64 {
+    x = ((x >> 1) & 0x5555555555555555) | ((x & 0x5555555555555555) << 1);
+    x = ((x >> 2) & 0x3333333333333333) | ((x & 0x3333333333333333) << 2);
+    ((x >> 4) & 0x0F0F0F0F0F0F0F0F) | ((x & 0x0F0F0F0F0F0F0F0F) << 4)
+}
+
+/// SWAR vertical flip (i,j) → (7-i,j): reverse byte order.
+#[inline]
+fn flipv8x8(x: u64) -> u64 {
+    x.swap_bytes()
+}
+
 /// Rotation/flip-invariant canonical form of an 8×8 perceptual hash:
 /// the minimum u64 over all 8 dihedral transforms. Two images that are exact
 /// 90°-rotations or mirrors of each other share the same canonical key.
 /// (Near-duplicate transforms land within a few bits — covered by MIH radius.)
+///
+/// The eight transforms are generated from transpose T, horizontal flip H
+/// and vertical flip V (each a few SWAR ops): rot90 = H·T, rot270 = V·T,
+/// rot180 = V·H, anti-transpose = H·V·T.
 pub fn canonical_rot64(h: u64) -> u64 {
+    let t = transpose8x8(h); // transpose
+    let fh = fliph8x8(h); // flip h
     [
         h,
-        xform8x8(h, |i, j| (j, 7 - i)),          // rot90
-        xform8x8(h, |i, j| (7 - i, 7 - j)),      // rot180
-        xform8x8(h, |i, j| (7 - j, i)),          // rot270
-        xform8x8(h, |i, j| (i, 7 - j)),          // flip h
-        xform8x8(h, |i, j| (7 - i, j)),          // flip v
-        xform8x8(h, |i, j| (j, i)),              // transpose
-        xform8x8(h, |i, j| (7 - j, 7 - i)),      // anti-transpose
+        fliph8x8(t),      // rot90
+        fh.swap_bytes(),  // rot180 = V·H
+        t.swap_bytes(),   // rot270 = V·T
+        fh,               // flip h
+        flipv8x8(h),      // flip v
+        t,                // transpose
+        fliph8x8(t.swap_bytes()), // anti-transpose = H·V·T
     ]
     .into_iter()
     .min()
@@ -107,27 +142,34 @@ impl MihIndex {
         }
     }
 
-    /// Owner ids of all stored keys within hamming `radius` of `key`.
-    pub fn query(&self, key: u64, radius: u32) -> Vec<u32> {
-        let mut cand: Vec<u32> = Vec::new();
+    /// Owner ids of all stored keys within hamming `radius` of `key`,
+    /// appended to `out` (sorted + deduped in place). Reusing one buffer
+    /// across queries avoids an allocation per lookup.
+    fn query_into(&self, key: u64, radius: u32, out: &mut Vec<u32>) {
+        out.clear();
         for (t, table) in self.tables.iter().enumerate() {
             let sub = ((key >> (t * 8)) & 0xff) as usize;
-            // Popcount-filter while streaming buckets: the predicate is
-            // per-position, so filtering before the dedup sort yields the
-            // same set while sorting far fewer elements.
-            cand.extend(
+            // Popcount-filter while streaming buckets; map positions to
+            // owner ids directly — the final sort+dedup absorbs duplicate
+            // positions (same key in several matching substrings) and
+            // duplicate owners, so the result equals deduping positions
+            // first, with one less sort pass.
+            out.extend(
                 table[sub]
                     .iter()
                     .copied()
-                    .filter(|&p| (self.keys[p as usize] ^ key).count_ones() <= radius),
+                    .filter(|&p| (self.keys[p as usize] ^ key).count_ones() <= radius)
+                    .map(|p| self.owners[p as usize]),
             );
         }
-        cand.sort_unstable();
-        cand.dedup();
-        let mut owners: Vec<u32> =
-            cand.into_iter().map(|p| self.owners[p as usize]).collect();
-        owners.sort_unstable();
-        owners.dedup();
+        out.sort_unstable();
+        out.dedup();
+    }
+
+    /// Owner ids of all stored keys within hamming `radius` of `key`.
+    pub fn query(&self, key: u64, radius: u32) -> Vec<u32> {
+        let mut owners = Vec::new();
+        self.query_into(key, radius, &mut owners);
         owners
     }
 
@@ -138,6 +180,34 @@ impl MihIndex {
         hits
     }
 }
+
+/// Fast `Hasher` for the u32 owner ids in the per-entry vote map — the std
+/// SipHash default measurably dominates when each entry only sees a handful
+/// of candidate hits. One multiply-xor round (fxhash-style) spreads
+/// sequential ids well enough for power-of-two tables.
+#[derive(Default)]
+struct VoteHasher(u64);
+
+impl std::hash::Hasher for VoteHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 =
+                (self.0.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(n)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+/// owner-id → per-algo vote bitmask.
+type VoteMap = HashMap<u32, u32, std::hash::BuildHasherDefault<VoteHasher>>;
 
 /// One row per image: per-algo variant keys (`variant_keys[a][v]` = the
 /// 64-bit hash of orientation variant v under gate-hash algo a).
@@ -166,11 +236,13 @@ pub fn dedup_candidates(entries: &[DedupKeys], radius: u32, min_votes: u32) -> V
         .into_par_iter()
         .map(|a| {
             let mut idx = MihIndex::new();
+            let mut uniq: Vec<u64> = Vec::new(); // reused across entries
             for (i, e) in entries.iter().enumerate() {
-                let mut uniq: Vec<u64> = e.variant_keys[a].clone();
+                uniq.clear();
+                uniq.extend_from_slice(&e.variant_keys[a]);
                 uniq.sort_unstable();
                 uniq.dedup();
-                for key in uniq {
+                for &key in &uniq {
                     idx.insert(key, i as u32);
                 }
             }
@@ -183,13 +255,18 @@ pub fn dedup_candidates(entries: &[DedupKeys], radius: u32, min_votes: u32) -> V
         .flat_map(|(i, e)| {
             let i = i as u32;
             // algo bitmask per other-image: a match under algo a sets bit a
-            let mut hit: HashMap<u32, u32> = HashMap::new();
+            let mut hit = VoteMap::default();
+            // Scratch buffers reused across every key query of this entry.
+            let mut uniq: Vec<u64> = Vec::new();
+            let mut hits: Vec<u32> = Vec::new();
             for (a, idx) in indexes.iter().enumerate() {
-                let mut uniq: Vec<u64> = e.variant_keys[a].clone();
+                uniq.clear();
+                uniq.extend_from_slice(&e.variant_keys[a]);
                 uniq.sort_unstable();
                 uniq.dedup();
-                for key in uniq {
-                    for j in idx.query(key, radius) {
+                for &key in &uniq {
+                    idx.query_into(key, radius, &mut hits);
+                    for &j in &hits {
                         if j != i {
                             *hit.entry(j).or_insert(0) |= 1 << a;
                         }
@@ -205,4 +282,61 @@ pub fn dedup_candidates(entries: &[DedupKeys], radius: u32, min_votes: u32) -> V
     out.sort_unstable();
     out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each SWAR dihedral transform must equal the reference bit-loop
+    /// transform on edge patterns and pseudo-random hashes.
+    #[test]
+    fn swar_transforms_match_reference() {
+        type CoordMap = fn(usize, usize) -> (usize, usize);
+        let transforms: [CoordMap; 8] = [
+            |i, j| (j, 7 - i),     // rot90
+            |i, j| (7 - i, 7 - j), // rot180
+            |i, j| (7 - j, i),     // rot270
+            |i, j| (i, 7 - j),     // flip h
+            |i, j| (7 - i, j),     // flip v
+            |i, j| (j, i),         // transpose
+            |i, j| (7 - j, 7 - i), // anti-transpose
+            |i, j| (i, j),         // identity
+        ];
+        let swar: [fn(u64) -> u64; 8] = [
+            |x| fliph8x8(transpose8x8(x)),
+            |x| fliph8x8(x).swap_bytes(),
+            |x| transpose8x8(x).swap_bytes(),
+            fliph8x8,
+            flipv8x8,
+            transpose8x8,
+            |x| fliph8x8(transpose8x8(x).swap_bytes()),
+            |x| x,
+        ];
+        let mut v = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            v ^= v << 13;
+            v ^= v >> 7;
+            v ^= v << 17;
+            v
+        };
+        let edges = [
+            0u64,
+            u64::MAX,
+            1,
+            0x8000000000000000,
+            0x5555555555555555,
+            0xAAAAAAAAAAAAAAAA,
+            0x00FF00FF00FF00FF,
+            0xFF00FF00FF00FF00,
+            0x0101010101010101,
+            0x8080808080808080,
+        ];
+        for i in 0..512 {
+            let h = if i < edges.len() { edges[i] } else { next() };
+            for (f, s) in transforms.iter().zip(swar.iter()) {
+                assert_eq!(s(h), xform8x8(h, *f), "transform mismatch at {h:#x}");
+            }
+        }
+    }
 }

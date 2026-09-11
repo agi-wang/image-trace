@@ -21,6 +21,8 @@ use super::{FeatureExtractor, FeatureKind};
 const GRID: usize = 32;
 /// Canonical raster side; each tile is `CANON/GRID` px square.
 const CANON: u32 = 128;
+/// Tile edge in pixels (`CANON/GRID` = 4).
+const TP: usize = CANON as usize / GRID;
 const BITS: usize = GRID * GRID; // 1024
 /// Fewer overlapping tiles than this makes the normalized score too noisy.
 const MIN_OVERLAP: usize = BITS / 4;
@@ -45,18 +47,24 @@ impl FeatureExtractor for BlockhashExtractor {
     }
     fn compute(&self, gray: &GrayImage, _rgb: &RgbImage) -> Vec<u8> {
         let small = image_io::resize_gray_exact(gray, CANON, CANON);
-        let tp = (CANON as usize) / GRID; // tile edge in px
-        let mut means = [0f64; BITS];
-        for ty in 0..GRID {
-            for tx in 0..GRID {
-                let mut sum = 0u64;
-                for y in ty * tp..(ty + 1) * tp {
-                    for x in tx * tp..(tx + 1) * tp {
-                        sum += small.get(x as u32, y as u32) as u64;
-                    }
-                }
-                means[ty * GRID + tx] = sum as f64 / (tp * tp) as f64;
+        // one row-major sweep scattering pixels into per-tile u64 sums —
+        // the same exact integer accumulation the per-tile loops did
+        let mut sums = [0u64; BITS];
+        for (y, row) in small
+            .data
+            .as_chunks::<{ CANON as usize }>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let tile_row = (y / TP) * GRID;
+            for (tx, px) in row.as_chunks::<TP>().0.iter().enumerate() {
+                sums[tile_row + tx] += px.iter().map(|&v| v as u64).sum::<u64>();
             }
+        }
+        let mut means = [0f64; BITS];
+        for (t, &s) in sums.iter().enumerate() {
+            means[t] = s as f64 / (TP * TP) as f64;
         }
         // select_nth_unstable for the upper middle, then take the max of the
         // low partition — the same two order statistics the full sort averaged.

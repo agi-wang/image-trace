@@ -1,6 +1,9 @@
 //! itrace — offline CLI for Image Trace.
 //! Operates directly on the store; for the HTTP API run `itrace-server`.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
@@ -110,20 +113,24 @@ fn main() -> anyhow::Result<()> {
         Cmd::Compare { project_id, algorithm, threshold, rotation_invariant } => {
             let images = store.list_images(project_id, 0, i64::MAX)?;
             let desc_algos = compare::desc_algos_for(&algorithm);
-            let prepared: Vec<Prepared> = images
+            // Keep original positions — members index `prepared`, not `images`
+            let (idx, prepared): (Vec<usize>, Vec<Prepared>) = images
                 .par_iter()
-                .filter_map(|img| {
+                .enumerate()
+                .filter_map(|(k, img)| {
                     let bytes = store.read_file(&img.file_path).ok()?;
-                    Prepared::from_bytes(&bytes, &desc_algos, rotation_invariant).ok()
+                    Prepared::from_bytes(&bytes, &desc_algos, rotation_invariant)
+                        .ok()
+                        .map(|p| (k, p))
                 })
-                .collect();
+                .unzip();
             let (groups, ungrouped, _m) =
                 compare::analyze(&prepared, &algorithm, threshold, rotation_invariant);
             println!("{} images, {} groups, {} unique", images.len(), groups.len(), ungrouped.len());
             for (gi, members) in groups.iter().enumerate() {
                 println!("group {}:", gi + 1);
                 for &m in members {
-                    println!("  - {} ({})", images[m].filename, images[m].id);
+                    println!("  - {} ({})", images[idx[m]].filename, images[idx[m]].id);
                 }
             }
         }
@@ -166,13 +173,11 @@ fn main() -> anyhow::Result<()> {
                 if map.is_empty() {
                     continue;
                 }
-                let m = features::similarity_matrix(map, &ids, algo, true);
-                for (i, row) in m.iter().enumerate() {
-                    for (j, &s) in row.iter().enumerate().skip(i + 1) {
-                        if s >= threshold {
-                            pair_hits.entry((i, j)).or_default().push(algo.to_string());
-                        }
-                    }
+                // Same scoring as similarity_matrix, streamed — no N×N.
+                let pairs =
+                    features::similarity_pairs_above(map, &ids, algo, true, threshold);
+                for (i, j, _s) in pairs {
+                    pair_hits.entry((i, j)).or_default().push(algo.to_string());
                 }
             }
             let confirmed: Vec<(usize, usize)> = pair_hits
@@ -233,11 +238,19 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
         let data = std::fs::read(path)?;
         let rel = unique_key(store, "uploads", name);
         store.write_file(&rel, &data)?;
-        let feats = hashes::compute_image_features_bytes(&data)?;
+        // Decode once — the insert-time hashes and precompute share it
+        // (previously compute_image_features_bytes + precompute decoded
+        // twice and re-read the blob).
+        let img = image_io::decode(&data)?;
+        let feats = hashes::compute_image_features_decoded(
+            &img,
+            hashes::blake3_hex(&data),
+            data.len() as u64,
+        );
         let rec = store.insert_image(&NewImage {
             project_id,
             filename: name.to_string(),
-            file_path: rel.clone(),
+            file_path: rel,
             file_hash: feats.file_hash,
             phash: Some(hashes::to_hex(feats.hashes.phash)),
             dhash: Some(hashes::to_hex(feats.hashes.dhash)),
@@ -249,7 +262,7 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
             width: Some(feats.width as i64),
             height: Some(feats.height as i64),
         })?;
-        precompute(store, rec.id, &rel)?;
+        precompute_decoded(store, rec.id, &img)?;
         println!("+ {} -> image id {}", name, rec.id);
         return Ok(());
     }
@@ -261,11 +274,16 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
         for img in extracted {
             let key = unique_key(store, "extracted", &img.filename);
             store.write_file(&key, &img.data)?;
-            let feats = hashes::compute_image_features_bytes(&img.data)?;
+            let decoded = image_io::decode(&img.data)?;
+            let feats = hashes::compute_image_features_decoded(
+                &decoded,
+                hashes::blake3_hex(&img.data),
+                img.data.len() as u64,
+            );
             let rec = store.insert_image(&NewImage {
                 project_id,
                 filename: img.filename.clone(),
-                file_path: key.clone(),
+                file_path: key,
                 file_hash: feats.file_hash,
                 phash: Some(hashes::to_hex(feats.hashes.phash)),
                 dhash: Some(hashes::to_hex(feats.hashes.dhash)),
@@ -277,7 +295,7 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
                 width: Some(feats.width as i64),
                 height: Some(feats.height as i64),
             })?;
-            precompute(store, rec.id, &key)?;
+            precompute_decoded(store, rec.id, &decoded)?;
             println!("+ {} -> image id {}", img.filename, rec.id);
         }
         return Ok(());
@@ -314,8 +332,14 @@ fn write_features(
     }
 }
 
-fn precompute(store: &Store, image_id: i64, key: &str) -> anyhow::Result<()> {
-    write_features(store, image_id, compute_rows(store, key))
+/// Feature rows from an already-decoded image (the `add` path decoded it
+/// for the insert-time hashes — no second decode, no blob re-read).
+fn precompute_decoded(
+    store: &Store,
+    image_id: i64,
+    img: &image::DynamicImage,
+) -> anyhow::Result<()> {
+    write_features(store, image_id, Ok(features::compute_all_variants(img)))
 }
 
 fn unique_key(store: &Store, prefix: &str, name: &str) -> String {

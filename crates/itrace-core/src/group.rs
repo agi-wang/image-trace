@@ -1,5 +1,7 @@
 //! Union-Find grouping over pairwise similarity scores.
 
+use rayon::prelude::*;
+
 /// Disjoint-set with path compression + union by rank.
 pub struct UnionFind {
     parent: Vec<usize>,
@@ -52,13 +54,23 @@ impl UnionFind {
 /// Returns (groups of indices len>1, ungrouped indices).
 pub fn cluster(matrix: &[Vec<f64>], threshold: f64) -> (Vec<Vec<usize>>, Vec<usize>) {
     let n = matrix.len();
+    // Collect the above-threshold edges in parallel — collect() keeps
+    // the (i, j) scan order, so the sequential unions below see the
+    // exact same edge sequence as a serial scan and produce the same
+    // union-find trees.
+    let edges: Vec<(usize, usize)> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            matrix[i]
+                .iter()
+                .enumerate()
+                .skip(i + 1)
+                .filter_map(move |(j, &s)| (s >= threshold).then_some((i, j)))
+        })
+        .collect();
     let mut uf = UnionFind::new(n);
-    for (i, row) in matrix.iter().enumerate() {
-        for (j, &s) in row.iter().enumerate().skip(i + 1) {
-            if s >= threshold {
-                uf.union(i, j);
-            }
-        }
+    for (i, j) in edges {
+        uf.union(i, j);
     }
     let mut groups = Vec::new();
     let mut ungrouped = Vec::new();

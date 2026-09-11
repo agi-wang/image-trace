@@ -228,10 +228,27 @@ impl FeatureExtractor for SliceProfileExtractor {
         let (w, h) = (g.width as usize, g.height as usize);
 
         // Dense per-line signals, then resampled to BINS — handles any size.
+        // One row-major sweep fills both directions: row signals accumulate
+        // per row, column signals per x — each accumulator sees its values
+        // in the same order as the old separate passes → identical sums.
         let mut row_m = vec![0.0f64; h];
         let mut row_g = vec![0.0f64; h];
         let mut col_m = vec![0.0f64; w];
         let mut col_g = vec![0.0f64; w];
+        // per-x (x0, x1, half) tap positions hoisted out of the sweep
+        let xspan: Vec<(usize, usize, f64)> = (0..w)
+            .map(|x| {
+                if w < 2 {
+                    (0, 0, 1.0)
+                } else if x == 0 {
+                    (0, 1, 1.0)
+                } else if x + 1 == w {
+                    (w - 2, w - 1, 1.0)
+                } else {
+                    (x - 1, x + 1, 2.0)
+                }
+            })
+            .collect();
         for y in 0..h {
             // centered difference (forward/backward at the borders) so the
             // signal reverses and transposes exactly under the dihedral group
@@ -244,35 +261,25 @@ impl FeatureExtractor for SliceProfileExtractor {
             } else {
                 (y - 1, y + 1, 2.0)
             };
+            let row = &g.data[y * w..(y + 1) * w];
+            let r0 = &g.data[y0 * w..(y0 + 1) * w];
+            let r1 = &g.data[y1 * w..(y1 + 1) * w];
             let mut s = 0.0;
             let mut gs = 0.0;
             for x in 0..w {
-                let v = g.data[y * w + x] as f64;
+                let v = row[x] as f64;
                 s += v;
-                gs += (g.data[y1 * w + x] as f64 - g.data[y0 * w + x] as f64).abs() / half;
+                gs += (r1[x] as f64 - r0[x] as f64).abs() / half;
+                let (x0, x1, halfx) = xspan[x];
+                col_m[x] += v;
+                col_g[x] += (row[x1] as f64 - row[x0] as f64).abs() / halfx;
             }
             row_m[y] = s / w as f64;
             row_g[y] = gs / w as f64;
         }
         for x in 0..w {
-            let (x0, x1, half) = if w < 2 {
-                (0, 0, 1.0)
-            } else if x == 0 {
-                (0, 1, 1.0)
-            } else if x + 1 == w {
-                (w - 2, w - 1, 1.0)
-            } else {
-                (x - 1, x + 1, 2.0)
-            };
-            let mut s = 0.0;
-            let mut gs = 0.0;
-            for y in 0..h {
-                let v = g.data[y * w + x] as f64;
-                s += v;
-                gs += (g.data[y * w + x1] as f64 - g.data[y * w + x0] as f64).abs() / half;
-            }
-            col_m[x] = s / h as f64;
-            col_g[x] = gs / h as f64;
+            col_m[x] /= h as f64;
+            col_g[x] /= h as f64;
         }
 
         let mut out = Vec::with_capacity(4 * BINS);

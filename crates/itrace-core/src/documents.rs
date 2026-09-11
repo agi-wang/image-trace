@@ -86,8 +86,10 @@ fn extract_office<R: Read + Seek>(stem: &str, reader: R) -> anyhow::Result<Vec<E
             continue;
         }
         // Cap the read as well — the declared size can understate the
-        // real inflated length on malformed archives.
-        let mut data = Vec::new();
+        // real inflated length on malformed archives. `entry.size()` is a
+        // trustworthy-enough reserve hint (capped) — it avoids the
+        // double-and-copy growth chain for multi-MiB media entries.
+        let mut data = Vec::with_capacity(entry.size().min(MAX_MEDIA_BYTES + 1) as usize);
         entry.take(MAX_MEDIA_BYTES + 1).read_to_end(&mut data)?;
         if data.len() as u64 > MAX_MEDIA_BYTES {
             continue;
@@ -121,10 +123,11 @@ fn extract_office<R: Read + Seek>(stem: &str, reader: R) -> anyhow::Result<Vec<E
 /// in the pure-Rust build — requires a pdfium/mupdf backend feature.
 fn extract_pdf(stem: &str, data: &[u8]) -> anyhow::Result<Vec<ExtractedImage>> {
     let doc = lopdf::Document::load_mem(data)?;
-    // Collect owned decode jobs first — `PdfImage` borrows the document, so
-    // the inflate/PNG-encode work is fanned out over owned payloads while
-    // job order (hence result order) stays page order.
-    let mut jobs: Vec<PdfJob> = Vec::new();
+    // Jobs borrow the raw stream bytes off the parsed document — the
+    // inflate/PNG-encode work still fans out over rayon (the document
+    // outlives the job list) but we skip a full copy of every embedded
+    // payload. Job order (hence result order) stays page order.
+    let mut jobs: Vec<PdfJob<'_>> = Vec::new();
     for (page_no, page_id) in doc.get_pages() {
         let images = match doc.get_page_images(page_id) {
             Ok(v) => v,
@@ -136,15 +139,15 @@ fn extract_pdf(stem: &str, data: &[u8]) -> anyhow::Result<Vec<ExtractedImage>> {
                 // already a JPEG codestream
                 jobs.push(PdfJob::Jpeg {
                     page_no,
-                    content: img.content.to_vec(),
+                    content: img.content,
                 });
             } else if filters.iter().any(|f| f == "FlateDecode") {
                 jobs.push(PdfJob::Flate(FlateImage {
                     page_no,
-                    content: img.content.to_vec(),
+                    content: img.content,
                     width: img.width,
                     height: img.height,
-                    color_space: img.color_space.clone(),
+                    color_space: img.color_space,
                     bits_per_component: img.bits_per_component,
                 }));
             }
@@ -155,7 +158,7 @@ fn extract_pdf(stem: &str, data: &[u8]) -> anyhow::Result<Vec<ExtractedImage>> {
     let decoded: Vec<(u32, &'static str, Vec<u8>)> = jobs
         .into_par_iter()
         .filter_map(|job| match job {
-            PdfJob::Jpeg { page_no, content } => Some((page_no, "jpg", content)),
+            PdfJob::Jpeg { page_no, content } => Some((page_no, "jpg", content.to_vec())),
             PdfJob::Flate(f) => decode_flate_image(&f).map(|png| (f.page_no, "png", png)),
         })
         .collect();
@@ -173,27 +176,27 @@ fn extract_pdf(stem: &str, data: &[u8]) -> anyhow::Result<Vec<ExtractedImage>> {
     Ok(out)
 }
 
-/// One decodable PDF image payload, owned so decode work can run on rayon
-/// workers without borrowing the parsed document.
-enum PdfJob {
+/// One decodable PDF image payload — borrows the compressed stream bytes
+/// from the parsed document; rayon jobs stay scoped to `extract_pdf`.
+enum PdfJob<'a> {
     /// DCTDecode — content is already a JPEG codestream.
-    Jpeg { page_no: u32, content: Vec<u8> },
+    Jpeg { page_no: u32, content: &'a [u8] },
     /// FlateDecode — raw samples to inflate, convert, and re-encode as PNG.
-    Flate(FlateImage),
+    Flate(FlateImage<'a>),
 }
 
-/// Owned subset of `lopdf::xobject::PdfImage` fields used by the
+/// Borrowed subset of `lopdf::xobject::PdfImage` fields used by the
 /// FlateDecode path.
-struct FlateImage {
+struct FlateImage<'a> {
     page_no: u32,
-    content: Vec<u8>,
+    content: &'a [u8],
     width: i64,
     height: i64,
     color_space: Option<String>,
     bits_per_component: Option<i64>,
 }
 
-fn decode_flate_image(img: &FlateImage) -> Option<Vec<u8>> {
+fn decode_flate_image(img: &FlateImage<'_>) -> Option<Vec<u8>> {
     let w = img.width as usize;
     let h = img.height as usize;
     let bpc = img.bits_per_component.unwrap_or(8);
@@ -202,61 +205,91 @@ fn decode_flate_image(img: &FlateImage) -> Option<Vec<u8>> {
     }
     // Reject absurd geometries before any w*h arithmetic can overflow.
     let npix = w.checked_mul(h)?;
-    let mut inflated = inflate_zlib(&img.content)?;
     let cs = img.color_space.as_deref().unwrap_or("");
-    let rgb: Vec<u8> = match cs {
-        "DeviceRGB" | "CalRGB" => {
-            if inflated.len() / 3 < npix {
+    // Expected sample count (and per-pixel channels) per colorspace; unknown
+    // spaces bail here — same `None` as before, minus the wasted inflate.
+    let channels = match cs {
+        "DeviceRGB" | "CalRGB" => 3usize,
+        "DeviceGray" | "CalGray" | "" => 1usize,
+        "DeviceCMYK" => 4usize,
+        _ => return None,
+    };
+    let need = npix.checked_mul(channels)?;
+    let inflated = inflate_zlib(img.content, need)?;
+    let rgb: Vec<u8> = match channels {
+        3 => {
+            // `len / 3 < npix` ⟺ `len < npix*3` (need is checked above).
+            if inflated.len() < need {
                 return None;
             }
-            inflated.truncate(npix * 3);
-            inflated
+            let mut v = inflated;
+            v.truncate(need);
+            v
         }
-        "DeviceGray" | "CalGray" | "" => {
+        1 => {
             if inflated.len() < npix {
                 return None;
             }
-            let mut rgb = Vec::with_capacity(npix * 3);
-            for &g in &inflated[..npix] {
-                rgb.extend_from_slice(&[g, g, g]);
+            // Fill a pre-sized buffer — one 3-byte store per pixel instead
+            // of a `extend_from_slice` call each.
+            let mut rgb = vec![0u8; npix.checked_mul(3)?];
+            for (dst, &g) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(&inflated[..npix])
+            {
+                *dst = [g, g, g];
             }
             rgb
         }
-        "DeviceCMYK" => {
-            if inflated.len() / 4 < npix {
+        _ => {
+            // 4 — DeviceCMYK
+            if inflated.len() < need {
                 return None;
             }
-            let mut rgb = Vec::with_capacity(npix * 3);
-            for c in inflated[..npix * 4].as_chunks::<4>().0 {
+            let mut rgb = vec![0u8; npix.checked_mul(3)?];
+            for (dst, c) in rgb
+                .as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .zip(inflated[..need].as_chunks::<4>().0)
+            {
                 let (cy, m, y, k) = (
                     c[0] as f32 / 255.0,
                     c[1] as f32 / 255.0,
                     c[2] as f32 / 255.0,
                     c[3] as f32 / 255.0,
                 );
-                rgb.extend_from_slice(&[
+                *dst = [
                     ((1.0 - cy) * (1.0 - k) * 255.0) as u8,
                     ((1.0 - m) * (1.0 - k) * 255.0) as u8,
                     ((1.0 - y) * (1.0 - k) * 255.0) as u8,
-                ]);
+                ];
             }
             rgb
         }
-        _ => return None,
     };
     let buf: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
         image::ImageBuffer::from_raw(w as u32, h as u32, rgb)?;
     let mut png = std::io::Cursor::new(Vec::with_capacity(npix / 2));
-    buf.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    // Fast deflate is already the default; the win is a fixed Sub filter —
+    // Adaptive re-runs every candidate filter + a scoring pass per scanline.
+    // Output stays a valid PNG of identical pixels (only the bytes differ).
+    use image::ImageEncoder;
+    image::codecs::png::PngEncoder::new_with_quality(
+        &mut png,
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::Sub,
+    )
+    .write_image(&buf, w as u32, h as u32, image::ExtendedColorType::Rgb8)
+    .ok()?;
     Some(png.into_inner())
 }
 
 /// Inflate a zlib stream with a hard output cap — malformed or hostile
-/// streams bail instead of growing an unbounded buffer.
-fn inflate_zlib(data: &[u8]) -> Option<Vec<u8>> {
+/// streams bail instead of growing an unbounded buffer. `expected` is the
+/// caller's predicted output size, used only as a (capped) reserve hint.
+fn inflate_zlib(data: &[u8], expected: usize) -> Option<Vec<u8>> {
     const MAX_INFLATED: u64 = 512 << 20; // 512 MiB
     let mut dec = flate2::read::ZlibDecoder::new(data).take(MAX_INFLATED + 1);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(expected.min(64 << 20));
     dec.read_to_end(&mut out).ok()?;
     if out.len() as u64 > MAX_INFLATED {
         return None;

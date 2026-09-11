@@ -14,3 +14,4 @@ rayon.workspace = true
 itrace-core = { path = "../itrace-core" }
 itrace-store = { path = "../itrace-store" }
 image.workspace = true
+mimalloc = "0.1"

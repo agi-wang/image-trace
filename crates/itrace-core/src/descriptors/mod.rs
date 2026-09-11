@@ -119,43 +119,73 @@ fn hamming_capped(a: &[u8], b: &[u8], cap: u32) -> Option<u32> {
 
 /// Cross-checked nearest-neighbour matching (BFMatcher crossCheck equivalent).
 ///
-/// The a×b distance matrix is computed exactly once (parallel rows);
-/// the forward argmin, the column-wise backward argmin and the reported
-/// distance all read from it, so each pair distance is computed once.
+/// Two passes, no a×b distance matrix:
+/// 1. parallel per-row forward argmin, `hamming_capped` bounded by the
+///    running best — `Some(d)` iff `d < best`, so a tie keeps the
+///    earlier index, identical to a strict `<` scan over an exact row.
+/// 2. backward argmin computed only for the columns some row selected:
+///    one capped scan per such column finds the first row attaining the
+///    column minimum, bailing entirely as soon as a distance below the
+///    candidates' own best appears (then no candidate can be argmin).
 pub fn match_cross_check(a: &DescriptorSet, b: &DescriptorSet) -> Vec<Match> {
     if a.desc_len != b.desc_len || a.is_empty() || b.is_empty() {
         return Vec::new();
     }
     let (an, bn) = (a.len(), b.len());
-    // matrix rows + per-row forward argmin (first minimum wins)
-    let rows: Vec<(Vec<u32>, usize)> = (0..an)
+    // Pass 1 — forward argmin per a-row (first minimum wins).
+    let fwd: Vec<(usize, u32)> = (0..an)
         .into_par_iter()
         .map(|i| {
             let ra = a.row(i);
-            let row: Vec<u32> = (0..bn).map(|j| desc_hamming(ra, b.row(j))).collect();
-            let mut best = 0usize;
-            for (j, &d) in row.iter().enumerate().skip(1) {
-                if d < row[best] {
-                    best = j;
+            let mut best = u32::MAX;
+            let mut best_j = 0usize;
+            for j in 0..bn {
+                if let Some(d) = hamming_capped(ra, b.row(j), best) {
+                    best = d;
+                    best_j = j;
                 }
             }
-            (row, best)
+            (best_j, best)
         })
         .collect();
-    // backward argmin per column in one sequential pass over the rows
-    // (scan order = row index → strict < keeps the first minimum's index)
-    let mut col_best: Vec<(u32, usize)> = vec![(u32::MAX, usize::MAX); bn];
-    for (k, (row, _)) in rows.iter().enumerate() {
-        for (j, &d) in row.iter().enumerate() {
-            if d < col_best[j].0 {
-                col_best[j] = (d, k);
-            }
-        }
+    // For each selected column, the smallest forward distance among its
+    // candidate rows — the value a column argmin must attain to match.
+    let mut col_min: Vec<u32> = vec![u32::MAX; bn];
+    for &(j, d) in &fwd {
+        col_min[j] = col_min[j].min(d);
     }
+    // Pass 2 — backward argmin, one scan per selected column (parallel).
+    // `cap` starts at d_min+1 so the first `Some(d)` is the first row at
+    // or below d_min: d < d_min means the column minimum beats every
+    // candidate (no match); d == d_min records the argmin and tightens
+    // the cap so any later d < d_min still bails. Scan order = row
+    // index → first-min-index, same as the old column scan.
+    let col_argmin: Vec<Option<usize>> = (0..bn)
+        .into_par_iter()
+        .map(|j| {
+            let d_min = col_min[j];
+            if d_min == u32::MAX {
+                return None;
+            }
+            let rb = b.row(j);
+            let mut cap = d_min + 1;
+            let mut argmin = usize::MAX;
+            for k in 0..an {
+                if let Some(d) = hamming_capped(a.row(k), rb, cap) {
+                    if d < d_min {
+                        return None;
+                    }
+                    argmin = k;
+                    cap = d_min;
+                }
+            }
+            Some(argmin)
+        })
+        .collect();
     let mut out = Vec::new();
-    for (i, (row, j)) in rows.iter().enumerate() {
-        if col_best[*j].1 == i {
-            out.push(Match { a_idx: i, b_idx: *j, distance: row[*j] });
+    for (i, &(j, d)) in fwd.iter().enumerate() {
+        if col_argmin[j] == Some(i) {
+            out.push(Match { a_idx: i, b_idx: j, distance: d });
         }
     }
     out.sort_by_key(|m| m.distance);
@@ -218,4 +248,85 @@ pub fn match_score(a: &DescriptorSet, b: &DescriptorSet, top_k: usize) -> f64 {
     let quality = (1.0 - avg.min(norm) / norm).clamp(0.0, 1.0);
     let density = (matches.len() as f64 / top_k as f64).min(1.0);
     quality * density
+}
+
+#[cfg(test)]
+mod xcheck_equiv_tests {
+    use super::*;
+
+    /// Reference: the old full-matrix implementation.
+    fn reference(a: &DescriptorSet, b: &DescriptorSet) -> Vec<Match> {
+        if a.desc_len != b.desc_len || a.is_empty() || b.is_empty() {
+            return Vec::new();
+        }
+        let (an, bn) = (a.len(), b.len());
+        let rows: Vec<(Vec<u32>, usize)> = (0..an)
+            .map(|i| {
+                let ra = a.row(i);
+                let row: Vec<u32> = (0..bn).map(|j| desc_hamming(ra, b.row(j))).collect();
+                let mut best = 0usize;
+                for (j, &d) in row.iter().enumerate().skip(1) {
+                    if d < row[best] {
+                        best = j;
+                    }
+                }
+                (row, best)
+            })
+            .collect();
+        let mut col_best: Vec<(u32, usize)> = vec![(u32::MAX, usize::MAX); bn];
+        for (k, (row, _)) in rows.iter().enumerate() {
+            for (j, &d) in row.iter().enumerate() {
+                if d < col_best[j].0 {
+                    col_best[j] = (d, k);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for (i, (row, j)) in rows.iter().enumerate() {
+            if col_best[*j].1 == i {
+                out.push(Match { a_idx: i, b_idx: *j, distance: row[*j] });
+            }
+        }
+        out.sort_by_key(|m| m.distance);
+        out
+    }
+
+    fn set(seed: u64, n: usize, len: usize, dup_every: usize) -> DescriptorSet {
+        let mut data = vec![0u8; n * len];
+        let mut k = seed;
+        for b in data.iter_mut() {
+            k = k.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *b = (k >> 33) as u8;
+        }
+        // dup_every>1 injects exact-duplicate rows → distance-0 ties
+        if dup_every > 1 {
+            for r in (dup_every..n).step_by(dup_every) {
+                let (dst, src) = (r * len, (r - 1) * len);
+                data.copy_within(src..src + len, dst);
+            }
+        }
+        DescriptorSet {
+            keypoints: vec![Keypoint { x: 0.0, y: 0.0, level: 0, angle: 0.0, response: 0.0 }; n],
+            desc_len: len,
+            data,
+        }
+    }
+
+    #[test]
+    fn matches_reference() {
+        for (an, bn, len, dup) in [
+            (1, 1, 32, 0), (5, 7, 32, 0), (64, 64, 32, 0), (33, 40, 8, 0),
+            (50, 50, 32, 2), (40, 40, 32, 3), (17, 9, 33, 0), (200, 180, 32, 4),
+        ] {
+            let a = set(7, an, len, dup);
+            let b = set(13, bn, len, dup);
+            let got = match_cross_check(&a, &b);
+            let want = reference(&a, &b);
+            assert_eq!(got.len(), want.len(), "an={an} bn={bn} len={len} dup={dup}");
+            for (g, w) in got.iter().zip(&want) {
+                assert_eq!((g.a_idx, g.b_idx, g.distance), (w.a_idx, w.b_idx, w.distance),
+                    "an={an} bn={bn} len={len} dup={dup}");
+            }
+        }
+    }
 }

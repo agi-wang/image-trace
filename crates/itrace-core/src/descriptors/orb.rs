@@ -341,6 +341,57 @@ fn fast_candidates(sm: &GrayImage, border: i32) -> Vec<(u32, u32, i32)> {
     found
 }
 
+/// FAST candidates → keypoints for one blurred level image: score with
+/// Harris responses, orient by intensity centroid, report coordinates in
+/// the base frame (`x · scale`).
+fn level_keypoints(sm: &GrayImage, level: u8, scale: f32, border: i32) -> Vec<Keypoint> {
+    let found = fast_candidates(sm, border);
+    let grads = GradMaps::new(sm);
+    found
+        .par_iter()
+        .map(|&(x, y, fast_s)| Keypoint {
+            x: x as f32 * scale,
+            y: y as f32 * scale,
+            level,
+            angle: centroid_angle(sm, x, y),
+            response: grads.response(x, y) as f32 * (1.0 + fast_s as f32 / 255.0),
+        })
+        .collect()
+}
+
+/// Shared tail of detection: merge per-level keypoints, keep the top
+/// `max_features` by response, then describe each survivor on its own
+/// level's blurred image (`levels[l].0`, at `scales[l]`).
+fn describe_keypoints(
+    levels: &[(GrayImage, Vec<Keypoint>)],
+    scales: &[f64],
+    max_features: usize,
+    pat: &BriefPattern,
+) -> DescriptorSet {
+    let mut cands: Vec<Keypoint> =
+        levels.iter().flat_map(|(_, k)| k.iter().copied()).collect();
+
+    // keep top max_features by response, roughly balanced per level
+    cands.sort_by(|a, b| b.response.partial_cmp(&a.response).unwrap_or(std::cmp::Ordering::Equal));
+    cands.truncate(max_features.max(64));
+
+    // describe each keypoint on its own level's blurred image
+    cands.sort_by_key(|k| k.level);
+    let bytes: Vec<[u8; 32]> = cands
+        .par_iter()
+        .map(|kp| {
+            let l = kp.level as usize;
+            let li = &levels[l].0;
+            brief_describe(li, kp.x / scales[l] as f32, kp.y / scales[l] as f32, kp.angle, pat)
+        })
+        .collect();
+    let mut data = Vec::with_capacity(bytes.len() * 32);
+    for b in &bytes {
+        data.extend_from_slice(b);
+    }
+    DescriptorSet { keypoints: cands, desc_len: 32, data }
+}
+
 /// Full ORB pipeline: one blurred pyramid computed once per level and
 /// shared by FAST detection, Harris scoring, orientation and BRIEF
 /// description (each level is downscaled from `gray`, never chained,
@@ -387,42 +438,57 @@ pub fn detect_orb(gray: &GrayImage, max_features: usize) -> DescriptorSet {
                 &owned
             };
             let sm = blur3(base);
-            let found = fast_candidates(&sm, border);
-            let grads = GradMaps::new(&sm);
-            let scale = scales[l] as f32;
-            let kps = found
-                .par_iter()
-                .map(|&(x, y, fast_s)| Keypoint {
-                    x: x as f32 * scale,
-                    y: y as f32 * scale,
-                    level: l as u8,
-                    angle: centroid_angle(&sm, x, y),
-                    response: grads.response(x, y) as f32 * (1.0 + fast_s as f32 / 255.0),
-                })
-                .collect();
+            let kps = level_keypoints(&sm, l as u8, scales[l] as f32, border);
             (sm, kps)
         })
         .collect();
-    let mut cands: Vec<Keypoint> =
-        levels.iter().flat_map(|(_, k)| k.iter().copied()).collect();
+    describe_keypoints(&levels, &scales, max_features, pat)
+}
 
-    // keep top max_features by response, roughly balanced per level
-    cands.sort_by(|a, b| b.response.partial_cmp(&a.response).unwrap_or(std::cmp::Ordering::Equal));
-    cands.truncate(max_features.max(64));
-
-    // describe each keypoint on its own level's blurred image
-    cands.sort_by_key(|k| k.level);
-    let bytes: Vec<[u8; 32]> = cands
+/// ORB over a caller-supplied pyramid: `gray` is level 0 (scale 1.0) and
+/// `levels` adds `(scale, image)` pairs — `image` is the base frame ÷
+/// `scale`. Keypoints are reported in the base frame and tagged with the
+/// level index (`gray` → 0, `levels[k]` → k+1). Levels too small for the
+/// 31-px patch border are skipped — the same guard `detect_orb` applies
+/// to its own pyramid — and each level keeps its top `max_features`
+/// keypoints by response.
+///
+/// `detect_orb` runs the same per-level pipeline over its self-built
+/// `SCALE_FACTOR` pyramid; a caller that already holds level images
+/// (e.g. `orbscale`'s Gaussian pyramid) skips that rebuild entirely.
+pub fn detect_orb_with_pyramid(
+    gray: &GrayImage,
+    max_features: usize,
+    levels: &[(f64, &GrayImage)],
+) -> DescriptorSet {
+    let pat = brief_pattern();
+    let border = PATCH_RADIUS + 2;
+    let usable = |&(_, base): &(f64, &GrayImage)| {
+        base.width > 2 * border as u32 && base.height > 2 * border as u32
+    };
+    let mut bases: Vec<(f64, &GrayImage)> = Vec::with_capacity(levels.len() + 1);
+    if usable(&(1.0, gray)) {
+        bases.push((1.0, gray));
+    }
+    bases.extend(levels.iter().copied().filter(usable));
+    let scales: Vec<f64> = bases.iter().map(|&(s, _)| s).collect();
+    let det: Vec<(GrayImage, Vec<Keypoint>)> = bases
         .par_iter()
-        .map(|kp| {
-            let l = kp.level as usize;
-            let li = &levels[l].0;
-            brief_describe(li, kp.x / scales[l] as f32, kp.y / scales[l] as f32, kp.angle, pat)
+        .enumerate()
+        .map(|(l, &(_, base))| {
+            let sm = blur3(base);
+            let mut kps = level_keypoints(&sm, l as u8, scales[l] as f32, border);
+            // per-level budget: caller pyramids are coarse (one image per
+            // octave), so cap each level instead of one global top-K —
+            // otherwise the largest level's candidates crowd out the rest
+            kps.sort_by(|a, b| {
+                b.response
+                    .partial_cmp(&a.response)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            kps.truncate(max_features.max(64));
+            (sm, kps)
         })
         .collect();
-    let mut data = Vec::with_capacity(bytes.len() * 32);
-    for b in &bytes {
-        data.extend_from_slice(b);
-    }
-    DescriptorSet { keypoints: cands, desc_len: 32, data }
+    describe_keypoints(&det, &scales, usize::MAX, pat)
 }

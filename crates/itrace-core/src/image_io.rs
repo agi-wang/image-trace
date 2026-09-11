@@ -95,49 +95,92 @@ pub fn resize_gray_max(gray: &GrayImage, max_side: u32) -> GrayImage {
 /// 0 orig, 1 rot90, 2 rot180, 3 rot270,
 /// 4 fliph, 5 fliph+rot90, 6 fliph+rot180, 7 fliph+rot270
 pub fn orientation_variants(img: &DynamicImage) -> Vec<DynamicImage> {
+    // Compute the flip's rotations before moving `flip` into its slot —
+    // saves one full-buffer clone of the image.
     let flip = img.fliph();
+    let flip90 = flip.rotate90();
+    let flip180 = flip.rotate180();
+    let flip270 = flip.rotate270();
     vec![
         img.clone(),
         img.rotate90(),
         img.rotate180(),
         img.rotate270(),
-        flip.clone(),
-        flip.rotate90(),
-        flip.rotate180(),
-        flip.rotate270(),
+        flip,
+        flip90,
+        flip180,
+        flip270,
     ]
 }
 
 /// Variants for a grayscale buffer — cheaper than going through DynamicImage.
 pub fn gray_orientation_variants(gray: &GrayImage) -> Vec<GrayImage> {
     let (w, h) = (gray.width, gray.height);
+    let (wu, hu) = (w as usize, h as usize);
+    // Degenerate 0-sized buffer — every variant is empty (rotated variants
+    // swap dims). Guarded because chunks_exact_mut(0) would panic.
+    if wu == 0 || hu == 0 {
+        let rot = || GrayImage::new(h, w, Vec::new());
+        return vec![
+            gray.clone(),
+            rot(),
+            gray.clone(),
+            rot(),
+            gray.clone(),
+            rot(),
+            gray.clone(),
+            rot(),
+        ];
+    }
     // out(x,y) = gray[src(x,y)]; monomorphized per transform — no dispatch.
+    // Used only for the strided (transpose-class) transforms; the row-parallel
+    // ones below take memcpy/reverse fast paths.
     fn mapped(
         gray: &GrayImage,
         nw: u32,
         nh: u32,
         src: impl Fn(u32, u32) -> (u32, u32),
     ) -> GrayImage {
-        let mut data = vec![0u8; (nw * nh) as usize];
-        for y in 0..nh {
-            for x in 0..nw {
-                let (sx, sy) = src(x, y);
-                data[(y * nw + x) as usize] = gray.data[(sy * gray.width + sx) as usize];
+        let (nwu, w) = (nw as usize, gray.width as usize);
+        let mut data = vec![0u8; nwu * nh as usize];
+        // Iterate by destination row — kills the per-pixel dst multiply and
+        // its bounds check.
+        for (y, dst_row) in data.chunks_exact_mut(nwu).enumerate() {
+            let y = y as u32;
+            for (x, px) in dst_row.iter_mut().enumerate() {
+                let (sx, sy) = src(x as u32, y);
+                *px = gray.data[sy as usize * w + sx as usize];
             }
         }
         GrayImage::new(nw, nh, data)
     }
+    // flip_horizontal in place on a fresh buffer: dst(x,y) = src(w-1-x,y) —
+    // a per-row reverse.
+    let mut flip_data = gray.data.clone();
+    for row in flip_data.chunks_exact_mut(wu) {
+        row.reverse();
+    }
+    // rot180 = full-buffer reverse of row-major data:
+    // dst(y*w+x) = src(w*h-1-(y*w+x)).
+    let mut rot180_data = gray.data.clone();
+    rot180_data.reverse();
+    // flip+rot180 = flip_vertical: dst row y = src row h-1-y — memcpy rows.
+    let mut flipv_data = vec![0u8; wu * hu];
+    for (y, dst_row) in flipv_data.chunks_exact_mut(wu).enumerate() {
+        let sy = (hu - 1 - y) * wu;
+        dst_row.copy_from_slice(&gray.data[sy..sy + wu]);
+    }
     vec![
         gray.clone(),
-        // rot90 cw: new(x,y) = old(y, w-1-x) — checked below
+        // rot90 cw: new(x,y) = old(y, w-1-x)
         mapped(gray, h, w, |x, y| (y, h - 1 - x)),
-        mapped(gray, w, h, |x, y| (w - 1 - x, h - 1 - y)),
+        GrayImage::new(w, h, rot180_data),
         mapped(gray, h, w, |x, y| (w - 1 - y, x)),
-        mapped(gray, w, h, |x, y| (w - 1 - x, y)),
+        GrayImage::new(w, h, flip_data),
         // flip + rot90: rotate90(flip(img)) → new(x,y) = flip(y, h-1-x) = old(w-1-y, h-1-x)
         mapped(gray, h, w, |x, y| (w - 1 - y, h - 1 - x)),
         // flip + rot180 = flip_vertical
-        mapped(gray, w, h, |x, y| (x, h - 1 - y)),
+        GrayImage::new(w, h, flipv_data),
         // flip + rot270: rotate270(flip) → new(x,y)=flip(w-1-y, x) = old(w-1-(w-1-y), x)=old(y,x)... transpose
         mapped(gray, h, w, |x, y| (y, x)),
     ]

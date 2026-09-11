@@ -18,6 +18,7 @@ itrace-core = { path = "../itrace-core" }
 itrace-store = { path = "../itrace-store" }
 rayon.workspace = true
 image.workspace = true
+mimalloc = "0.1"
 
 [features]
 akaze = ["itrace-core/akaze"]

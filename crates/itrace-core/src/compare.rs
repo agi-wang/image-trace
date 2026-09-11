@@ -189,25 +189,57 @@ fn fit_max(g: &GrayImage, max_side: u32) -> Cow<'_, GrayImage> {
     }
 }
 
+/// Lazily caches `fit_exact(src, w, h)` per target dims. Across one image's
+/// dihedral variants the min-dims target takes ≤2 distinct values (the
+/// variants only swap w/h), so `src` is resized at most twice per scored
+/// pair instead of once per variant.
+struct ExactFits<'a> {
+    src: &'a GrayImage,
+    fits: HashMap<(u32, u32), Cow<'a, GrayImage>>,
+}
+
+impl<'a> ExactFits<'a> {
+    fn new(src: &'a GrayImage) -> Self {
+        Self { src, fits: HashMap::new() }
+    }
+    /// `src` at exactly `w`×`h` — borrowed when `src` already has those dims.
+    fn get(&mut self, w: u32, h: u32) -> &GrayImage {
+        let src = self.src;
+        self.fits.entry((w, h)).or_insert_with(|| fit_exact(src, w, h))
+    }
+}
+
 fn ssim_common(a: &GrayImage, b: &GrayImage) -> f64 {
-    let h = a.height.min(b.height);
-    let w = a.width.min(b.width);
-    metrics::ssim(&fit_exact(a, w, h), &fit_exact(b, w, h))
+    ssim_fits(&mut ExactFits::new(a), b)
+}
+
+/// SSIM at the pair's min dims; `af` supplies the (cached) a-side resize.
+fn ssim_fits(af: &mut ExactFits<'_>, b: &GrayImage) -> f64 {
+    let h = af.src.height.min(b.height);
+    let w = af.src.width.min(b.width);
+    metrics::ssim(af.get(w, h), &fit_exact(b, w, h))
 }
 
 fn template_common(a: &GrayImage, b: &GrayImage) -> f64 {
     let ra = fit_max(a, 256);
+    template_fits(&mut ExactFits::new(&ra), b)
+}
+
+/// NCC at min dims after the ≤256 pre-scale; `af` caches the a-side
+/// fit_exact over the already fit_max'd source.
+fn template_fits(af: &mut ExactFits<'_>, b: &GrayImage) -> f64 {
     let rb = fit_max(b, 256);
-    let h = ra.height.min(rb.height);
-    let w = ra.width.min(rb.width);
-    metrics::ncc(&fit_exact(&ra, w, h), &fit_exact(&rb, w, h))
+    let h = af.src.height.min(rb.height);
+    let w = af.src.width.min(rb.width);
+    metrics::ncc(af.get(w, h), &fit_exact(&rb, w, h))
 }
 
 /// 0.3·phash + 0.3·ssim + 0.4·orb fusion over borrowed parts — shared by
 /// `hybrid_score` and the rot-inv per-variant loop so variants can be scored
-/// without cloning images/histograms into a throwaway `Prepared`.
+/// without cloning images/histograms into a throwaway `Prepared`. `af`
+/// caches the a-side ssim resize so it isn't repeated per variant.
 fn hybrid_parts(
-    a_gray: &GrayImage,
+    af: &mut ExactFits<'_>,
     a_phash: u64,
     a_orb: Option<&DescriptorSet>,
     b_gray: &GrayImage,
@@ -220,7 +252,7 @@ fn hybrid_parts(
     for (w, algo) in weights {
         let s = match algo {
             "phash" => hashes::hash_similarity(a_phash, b_phash),
-            "ssim" => ssim_common(a_gray, b_gray),
+            "ssim" => ssim_fits(af, b_gray),
             "orb" => {
                 let (Some(da), Some(db)) = (a_orb, b_orb) else {
                     continue;
@@ -237,7 +269,7 @@ fn hybrid_parts(
 
 fn hybrid_score(a: &Prepared, b: &Prepared) -> f64 {
     hybrid_parts(
-        &a.gray,
+        &mut ExactFits::new(&a.gray),
         a.hashes.phash,
         a.descs.get("orb"),
         &b.gray,
@@ -265,11 +297,21 @@ fn rotated_score(algo: &str, a: &Prepared, b: &Prepared) -> f64 {
     }
     match algo {
         "ssim" | "template" => {
+            // `a` is constant across b's variants while the fit target only
+            // depends on vg's dims — hoist the a-side resize into a per-pair
+            // cache (also covering template's fit_max pre-scale).
+            let ra;
+            let mut af = if algo == "template" {
+                ra = fit_max(&a.gray, 256);
+                ExactFits::new(&ra)
+            } else {
+                ExactFits::new(&a.gray)
+            };
             for vg in b.variant_grays.iter().skip(1) {
                 let s = if algo == "ssim" {
-                    ssim_common(&a.gray, vg)
+                    ssim_fits(&mut af, vg)
                 } else {
-                    template_common(&a.gray, vg)
+                    template_fits(&mut af, vg)
                 };
                 best = best.max(s);
                 if best >= 0.95 {
@@ -295,11 +337,12 @@ fn rotated_score(algo: &str, a: &Prepared, b: &Prepared) -> f64 {
         "auto" => {
             let a_orb = a.descs.get("orb");
             let b_orb = b.variant_descs.get("orb");
+            let mut af = ExactFits::new(&a.gray);
             for (i, vb) in b.variant_hashes.iter().enumerate() {
                 let vg = b.variant_grays.get(i).unwrap_or(&b.gray);
                 let vo = b_orb.and_then(|dv| dv.get(i));
                 best = best.max(hybrid_parts(
-                    &a.gray,
+                    &mut af,
                     a.hashes.phash,
                     a_orb,
                     vg,

@@ -100,20 +100,22 @@ fn downsample(rgb: &RgbImage) -> [[f64; N * N]; 3] {
     }
     // Map each output cell to its source rectangle and box-average it.
     // Exact under any dihedral transform, unlike resample filters.
+    let (w, h) = (rgb.width as usize, rgb.height as usize);
     for by in 0..N {
-        let y0 = (by as u32 * rgb.height) / N as u32;
-        let y1 = ((by as u32 + 1) * rgb.height) / N as u32;
+        let y0 = (by * h) / N;
+        let y1 = ((by + 1) * h) / N;
         for bx in 0..N {
-            let x0 = (bx as u32 * rgb.width) / N as u32;
-            let x1 = ((bx as u32 + 1) * rgb.width) / N as u32;
+            let x0 = (bx * w) / N;
+            let x1 = ((bx + 1) * w) / N;
             let mut acc = [0.0f64; 3];
             let mut cnt = 0u32;
-            for y in y0..y1.max(y0 + 1).min(rgb.height) {
-                for x in x0..x1.max(x0 + 1).min(rgb.width) {
-                    let (r, g, b) = rgb.pixel(x, y);
-                    acc[0] += f64::from(r);
-                    acc[1] += f64::from(g);
-                    acc[2] += f64::from(b);
+            for y in y0..y1.max(y0 + 1).min(h) {
+                let row = &rgb.data[y * w * 3..(y + 1) * w * 3];
+                for x in x0..x1.max(x0 + 1).min(w) {
+                    let px = &row[x * 3..x * 3 + 3];
+                    acc[0] += f64::from(px[0]);
+                    acc[1] += f64::from(px[1]);
+                    acc[2] += f64::from(px[2]);
                     cnt += 1;
                 }
             }

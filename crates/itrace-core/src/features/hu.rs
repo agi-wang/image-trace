@@ -111,39 +111,50 @@ fn hu_log_moments(gray: &GrayImage) -> [f64; 7] {
         return [0.0; 7];
     }
     let t = otsu_threshold(&g.data);
-    // ink = minority side of the split (ties → bright side)
-    let above = g.data.iter().filter(|&&v| v > t).count() as f64;
-    let total = g.data.len() as f64;
-    let ink_above = above <= total - above;
-    let m00 = if ink_above { above } else { total - above };
-    if m00 <= 0.0 {
+    // Binary mask of the bright side (v > t), counting it in the same pass.
+    // ink = minority side of the split (ties → bright side): when the dark
+    // side is smaller the mask is inverted in place — word ops only.
+    let n = g.data.len();
+    let mut mask = vec![0u64; n.div_ceil(64)];
+    let (mut above, mut sx_raw, mut sy_raw) = (0u64, 0u64, 0u64);
+    for (i, &v) in g.data.iter().enumerate() {
+        if v > t {
+            mask[i / 64] |= 1u64 << (i % 64);
+            above += 1;
+            sx_raw += (i as u32 % w) as u64;
+            sy_raw += (i as u32 / w) as u64;
+        }
+    }
+    let ink_above = above * 2 <= n as u64;
+    let (m00, sx, sy) = if ink_above {
+        (above, sx_raw, sy_raw)
+    } else {
+        // flip bits within the valid range (top word may be partial)
+        for word in mask.iter_mut() {
+            *word = !*word;
+        }
+        let rem = n % 64;
+        if rem != 0 {
+            if let Some(last) = mask.last_mut() {
+                *last &= (1u64 << rem) - 1;
+            }
+        }
+        // complement sums: Σx over all pixels = h·w(w−1)/2 (exact integers,
+        // so the u64 difference equals the old per-bit f64 accumulation)
+        let (w64, h64) = (w as u64, h as u64);
+        (
+            n as u64 - above,
+            h64 * (w64 * (w64 - 1) / 2) - sx_raw,
+            w64 * (h64 * (h64 - 1) / 2) - sy_raw,
+        )
+    };
+    if m00 == 0 {
         return [0.0; 7];
     }
-    let is_ink = |v: u8| (v > t) == ink_above;
-
-    // Binary ink mask, built once: bit i = pixel i in row-major order. The
-    // moment passes iterate set bits in index order — the same accumulation
-    // order as the row-major pixel loops they replace.
-    let mut mask = vec![0u64; g.data.len().div_ceil(64)];
-    for (i, &v) in g.data.iter().enumerate() {
-        if is_ink(v) {
-            mask[i / 64] |= 1u64 << (i % 64);
-        }
-    }
-
-    let mut cx = 0.0f64;
-    let mut cy = 0.0f64;
-    for (wi, &word) in mask.iter().enumerate() {
-        let mut m = word;
-        while m != 0 {
-            let i = wi * 64 + m.trailing_zeros() as usize;
-            m &= m - 1;
-            cx += (i as u32 % w) as f64;
-            cy += (i as u32 / w) as f64;
-        }
-    }
-    cx /= m00;
-    cy /= m00;
+    // exact-integer sums → identical to the old f64 accumulation / m00
+    let m00f = m00 as f64;
+    let cx = sx as f64 / m00f;
+    let cy = sy as f64 / m00f;
 
     let (mut mu20, mut mu02, mut mu11) = (0.0f64, 0.0f64, 0.0f64);
     let (mut mu30, mut mu03, mut mu21, mut mu12) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
@@ -167,8 +178,8 @@ fn hu_log_moments(gray: &GrayImage) -> [f64; 7] {
     }
 
     // η_pq = μ_pq / m00^(1 + (p+q)/2) — scale + intensity invariant
-    let n2 = m00 * m00; // exponent 1+2/2 = 2
-    let n3 = n2 * m00.sqrt(); // exponent 1+3/2 = 2.5
+    let n2 = m00f * m00f; // exponent 1+2/2 = 2
+    let n3 = n2 * m00f.sqrt(); // exponent 1+3/2 = 2.5
     let e20 = mu20 / n2;
     let e02 = mu02 / n2;
     let e11 = mu11 / n2;

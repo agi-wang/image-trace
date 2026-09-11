@@ -94,6 +94,13 @@ impl GrayImage {
     pub fn get(&self, x: u32, y: u32) -> u8 {
         self.data[(y * self.width + x) as usize]
     }
+    /// Row `y` as a `width`-byte slice — hoists the row offset out of
+    /// per-pixel loops.
+    #[inline]
+    pub fn row(&self, y: u32) -> &[u8] {
+        let start = y as usize * self.width as usize;
+        &self.data[start..start + self.width as usize]
+    }
 }
 
 /// A BGR-free RGB buffer (used for histogram / color features).
@@ -113,5 +120,12 @@ impl RgbImage {
     pub fn pixel(&self, x: u32, y: u32) -> (u8, u8, u8) {
         let i = ((y * self.width + x) * 3) as usize;
         (self.data[i], self.data[i + 1], self.data[i + 2])
+    }
+    /// Row `y` as a `3*width`-byte slice of packed RGB triples.
+    #[inline]
+    pub fn row(&self, y: u32) -> &[u8] {
+        let w = self.width as usize * 3;
+        let start = y as usize * w;
+        &self.data[start..start + w]
     }
 }
