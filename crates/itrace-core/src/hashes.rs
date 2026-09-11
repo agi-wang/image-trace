@@ -250,7 +250,7 @@ pub fn colorhash(rgb: &RgbImage) -> u64 {
     if npix == 0 {
         return 0;
     }
-    for px in rgb.data.chunks_exact(3) {
+    for px in rgb.data.as_chunks::<3>().0 {
         let r = px[0] as f64 / 255.0;
         let g = px[1] as f64 / 255.0;
         let b = px[2] as f64 / 255.0;

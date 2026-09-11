@@ -80,14 +80,14 @@ pub fn desc_hamming(a: &[u8], b: &[u8]) -> u32 {
     let n = a.len().min(b.len());
     let (a, b) = (&a[..n], &b[..n]);
     let mut d = 0u32;
-    let mut ac = a.chunks_exact(8);
-    let mut bc = b.chunks_exact(8);
-    for (x, y) in (&mut ac).zip(&mut bc) {
-        let xa = u64::from_ne_bytes(x.try_into().unwrap());
-        let xb = u64::from_ne_bytes(y.try_into().unwrap());
+    let (ac, arem) = a.as_chunks::<8>();
+    let (bc, brem) = b.as_chunks::<8>();
+    for (x, y) in ac.iter().zip(bc) {
+        let xa = u64::from_ne_bytes(*x);
+        let xb = u64::from_ne_bytes(*y);
         d += (xa ^ xb).count_ones();
     }
-    for (x, y) in ac.remainder().iter().zip(bc.remainder()) {
+    for (x, y) in arem.iter().zip(brem) {
         d += (x ^ y).count_ones();
     }
     d
@@ -101,17 +101,17 @@ fn hamming_capped(a: &[u8], b: &[u8], cap: u32) -> Option<u32> {
     let n = a.len().min(b.len());
     let (a, b) = (&a[..n], &b[..n]);
     let mut d = 0u32;
-    let mut ac = a.chunks_exact(8);
-    let mut bc = b.chunks_exact(8);
-    for (x, y) in (&mut ac).zip(&mut bc) {
-        let xa = u64::from_ne_bytes(x.try_into().unwrap());
-        let xb = u64::from_ne_bytes(y.try_into().unwrap());
+    let (ac, arem) = a.as_chunks::<8>();
+    let (bc, brem) = b.as_chunks::<8>();
+    for (x, y) in ac.iter().zip(bc) {
+        let xa = u64::from_ne_bytes(*x);
+        let xb = u64::from_ne_bytes(*y);
         d += (xa ^ xb).count_ones();
         if d >= cap {
             return None;
         }
     }
-    for (x, y) in ac.remainder().iter().zip(bc.remainder()) {
+    for (x, y) in arem.iter().zip(brem) {
         d += (x ^ y).count_ones();
     }
     (d < cap).then_some(d)

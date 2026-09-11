@@ -92,7 +92,7 @@ pub fn hsv_histogram(rgb: &RgbImage) -> Vec<f32> {
     const SF: f32 = SBINS as f32;
     let mut hist = vec![0f32; HBINS * SBINS];
     let n = (rgb.width as usize) * (rgb.height as usize);
-    for px in rgb.data[..n * 3].chunks_exact(3) {
+    for px in rgb.data[..n * 3].as_chunks::<3>().0 {
         let r = px[0] as f32 / 255.0;
         let g = px[1] as f32 / 255.0;
         let b = px[2] as f32 / 255.0;
