@@ -102,7 +102,8 @@ past the working radius without a multi-node scatter/gather layer.
 
 {ITRACE_MIH_INDEX_DIR}/project_{id}/      # project gate-index bundle
   meta.json     {"magic":"ITMIHP1","version":1,"shard_bits":N,
-                 "gate_algo_count":M,"image_count":K}
+                 "gate_algo_count":M,"image_count":K,
+                 "feature_fingerprint":"<blake3 hex>"}
   image_ids.bin K × i64 LE  (owner slot → image_id, sorted ascending)
   indexes/
     0/ … M-1/   each a ShardedMihIndex (ITMIH1) for one gate algo
@@ -123,10 +124,13 @@ Server + CLI wiring for sharded MIH recall **and** optional persistent index:
 - Shared helpers in `itrace_core::index` (used by both paths):
   - `resolve_shard_bits` / `resolve_mih_index_dir` / `project_mih_index_path`
   - `load_or_build_project_gate_index` — dense `u32` owners ↔ `image_ids.bin`
-  - **Invalidation** on load: `shard_bits`, `gate_algo_count`, and exact
-    sorted image_id set vs current ready entries; mismatch → rebuild+overwrite.
-    Feature-blob changes with an unchanged image set are **not** detected
-    (delete the project dir to force rebuild).
+  - **Invalidation** on load: `shard_bits`, `gate_algo_count`, exact sorted
+    image_id set vs current ready entries, **and `feature_fingerprint`** —
+    a BLAKE3 hash over the indexed key material (canonical
+    sorted-by-image_id order; see “Feature fingerprint” below). Any
+    mismatch → rebuild + overwrite. Feature-blob changes with an
+    unchanged image set are detected: recomputed or backfilled vectors
+    invalidate even when every image_id stays the same.
 - **`resolve_shard_bits(override)`**:
   1. request/CLI `--shard-bits` / `DedupRequest.shard_bits` if present
   2. else env `ITRACE_MIH_SHARD_BITS`
@@ -175,9 +179,51 @@ verification cost is bounded by `min_hits` + radius, not pair count.
 export ITRACE_MIH_INDEX_DIR=/var/lib/itrace/mih
 export ITRACE_MIH_SHARD_BITS=8
 # first dedup for project 7 builds /var/lib/itrace/mih/project_7/
-# second dedup reuses it when ready image_ids + shard_bits + gate count match
+# second dedup reuses it when image_ids + shard_bits + gate count +
+# feature_fingerprint all match
 itrace-cli dedup 7
 ```
+
+## Feature fingerprint
+
+`meta.json.feature_fingerprint` is `blake3` hex over the exact key
+material persisted in the bundle, streamed in canonical order
+(entries sorted by `image_id`):
+
+- **Gate bundle (`ITMIHP1`):** for each `DedupKeys` — `image_id` (i64 LE),
+  `variant_keys.len()` (u32 LE), then per variant `keys.len()` (u32 LE)
+  and every `u64` key (LE).
+- **Crop bundle (`ITMIHC1`):** for each `CropKeys` — `image_id` (i64 LE),
+  `keys.len()` (u32 LE), then every `u64` key (LE).
+
+The check runs at load after the cheap magic/version/shard_bits/
+image-set checks; a mismatch (including bundles written before the
+field existed) falls through to build + overwrite. Because the hash
+covers the vectors themselves — not just the image set — any feature
+recompute, backfill, or corruption that leaves `image_id`s identical
+still forces a rebuild.
+
+## Roadmap
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 1 | `ImageStore` trait extraction + feature-fingerprint MIH invalidation | **done** |
+| 2 | `PostgresStore` backend behind the `ImageStore` trait | next |
+| 3 | Multi-node shard ownership + scatter/gather (design above) | planned |
+| 4 | Semantic DINOv2/HNSW recall channel | planned |
+
+### Phase 1 delivered
+
+- `itrace_store::ImageStore` — object-safe trait covering
+  projects/images/features/precompute/pair-cache/runs plus the blob
+  facade; `SqliteStore` is the default impl and `pub type Store =
+  SqliteStore` keeps the old name compiling.
+- `itrace-cli` and `itrace-server` hold `&dyn ImageStore` /
+  `Arc<dyn ImageStore>` — a future Postgres backend plugs in without
+  touching call sites.
+- `feature_fingerprint` (above) in both `ITMIHP1` and `ITMIHC1` metas;
+  tested: unchanged vectors reuse (`index_loaded=true`), same-ids
+  mutated vectors rebuild (`index_loaded=false`).
 
 ## Microbench
 

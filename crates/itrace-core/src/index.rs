@@ -57,9 +57,11 @@
 //!
 //! Owners are dense `u32` slots into `image_ids.bin` (NOT ephemeral enumerate
 //! indices). On load we require exact match of `shard_bits`, `gate_algo_count`,
-//! and the sorted image_id set vs current ready entries; any mismatch rebuilds
-//! and overwrites. Feature-blob changes for an unchanged image set are not
-//! detected — delete the project dir to force a rebuild.
+//! the sorted image_id set vs current ready entries, and a BLAKE3
+//! `feature_fingerprint` over the indexed key material (canonical
+//! sorted-by-image_id order); any mismatch rebuilds and overwrites. The
+//! fingerprint catches feature-blob changes that leave the image set
+//! unchanged — recomputed vectors, newly registered features, etc.
 //!
 //! # Crop/slice recall channel (`project_{id}_crop/`)
 //!
@@ -566,6 +568,44 @@ fn image_id_sets_equal(persisted: &[i64], mut current: Vec<i64>) -> bool {
     a == current
 }
 
+/// BLAKE3 hex over the gate channel's indexed key material in canonical
+/// order: image_ids sorted ascending, then each entry's variant keys in
+/// stored order. Persisted in the bundle meta so feature-blob changes
+/// with an unchanged image_id set still invalidate the index.
+fn gate_fingerprint(entries: &[DedupKeys]) -> String {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_unstable_by_key(|&i| entries[i].image_id);
+    let mut h = blake3::Hasher::new();
+    for &i in &order {
+        let e = &entries[i];
+        h.update(&e.image_id.to_le_bytes());
+        h.update(&(e.variant_keys.len() as u32).to_le_bytes());
+        for keys in &e.variant_keys {
+            h.update(&(keys.len() as u32).to_le_bytes());
+            for &k in keys {
+                h.update(&k.to_le_bytes());
+            }
+        }
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// [`gate_fingerprint`] for the crop channel's flattened key sets.
+fn crop_fingerprint(entries: &[CropKeys]) -> String {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_unstable_by_key(|&i| entries[i].image_id);
+    let mut h = blake3::Hasher::new();
+    for &i in &order {
+        let e = &entries[i];
+        h.update(&e.image_id.to_le_bytes());
+        h.update(&(e.keys.len() as u32).to_le_bytes());
+        for &k in &e.keys {
+            h.update(&k.to_le_bytes());
+        }
+    }
+    h.finalize().to_hex().to_string()
+}
+
 fn build_sharded_indexes(
     entries: &[DedupKeys],
     shard_bits: u32,
@@ -593,11 +633,14 @@ fn build_sharded_indexes(
 }
 
 /// Save a project gate-index bundle (see module docs). Overwrites `dir`.
+/// `fingerprint` is [`gate_fingerprint`] over the source entries — the
+/// loader refuses bundles whose stored value doesn't match a recompute.
 pub fn save_project_gate_index(
     dir: &std::path::Path,
     indexes: &[ShardedMihIndex],
     image_ids: &[i64],
     shard_bits: u32,
+    fingerprint: &str,
 ) -> std::io::Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)?;
@@ -611,6 +654,7 @@ pub fn save_project_gate_index(
         "gate_algo_count": indexes.len(),
         "image_count": image_ids.len(),
         "key_count": key_count,
+        "feature_fingerprint": fingerprint,
     });
     std::fs::write(
         dir.join("meta.json"),
@@ -678,6 +722,13 @@ pub fn try_load_project_gate_index(
     if !image_id_sets_equal(&image_ids, entries.iter().map(|e| e.image_id).collect()) {
         return Ok(None);
     }
+    // Feature-blob fingerprint: catches recomputed/changed vectors that
+    // leave the image_id set untouched. Bundles written before the field
+    // existed fail the check and rebuild once.
+    let stored_fp = meta.get("feature_fingerprint").and_then(|v| v.as_str());
+    if stored_fp != Some(gate_fingerprint(entries).as_str()) {
+        return Ok(None);
+    }
     let indexes_dir = dir.join("indexes");
     let mut indexes = Vec::with_capacity(m);
     for a in 0..m {
@@ -709,7 +760,13 @@ pub fn load_or_build_project_gate_index(
     }
     let (image_ids, owner_for_entry) = owner_plan(entries);
     let indexes = build_sharded_indexes(entries, shard_bits, &owner_for_entry);
-    save_project_gate_index(dir, &indexes, &image_ids, shard_bits)?;
+    save_project_gate_index(
+        dir,
+        &indexes,
+        &image_ids,
+        shard_bits,
+        &gate_fingerprint(entries),
+    )?;
     Ok((indexes, image_ids, false))
 }
 
@@ -1138,6 +1195,7 @@ fn save_crop_index(
     idx: &ShardedMihIndex,
     image_ids: &[i64],
     shard_bits: u32,
+    fingerprint: &str,
 ) -> std::io::Result<()> {
     if dir.exists() {
         std::fs::remove_dir_all(dir)?;
@@ -1149,6 +1207,7 @@ fn save_crop_index(
         "shard_bits": shard_bits,
         "image_count": image_ids.len(),
         "key_count": idx.len(),
+        "feature_fingerprint": fingerprint,
     });
     std::fs::write(
         dir.join("meta.json"),
@@ -1189,6 +1248,10 @@ fn try_load_crop_index(
     if !image_id_sets_equal(&image_ids, entries.iter().map(|e| e.image_id).collect()) {
         return Ok(None);
     }
+    let stored_fp = meta.get("feature_fingerprint").and_then(|v| v.as_str());
+    if stored_fp != Some(crop_fingerprint(entries).as_str()) {
+        return Ok(None);
+    }
     let idx = match ShardedMihIndex::load_dir(&dir.join("index")) {
         Ok(i) => i,
         Err(_) => return Ok(None),
@@ -1211,7 +1274,7 @@ pub fn load_or_build_crop_index(
     }
     let (image_ids, owner_for_entry) = owner_plan_crop(entries);
     let idx = build_crop_index(entries, shard_bits, &owner_for_entry);
-    save_crop_index(dir, &idx, &image_ids, shard_bits)?;
+    save_crop_index(dir, &idx, &image_ids, shard_bits, &crop_fingerprint(entries))?;
     Ok((idx, image_ids, false))
 }
 
@@ -1539,6 +1602,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Feature-blob change with an unchanged image_id set must force a
+    /// rebuild — this is the fingerprint check, the invalidation gap the
+    /// old meta could not see.
+    #[test]
+    fn project_gate_index_invalidates_on_feature_change() {
+        let mut entries = sample_entries(20);
+        let shard_bits = 3u32;
+        let dir = std::env::temp_dir().join(format!(
+            "itrace-mih-fp-{}-{}",
+            std::process::id(),
+            0x3333
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (_, loaded) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+                .expect("build");
+        assert!(!loaded);
+        let (_, loaded2) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+                .expect("load");
+        assert!(loaded2, "unchanged features must reuse the index");
+
+        // Same image_ids, one mutated variant key → fingerprint mismatch
+        entries[3].variant_keys[0][0] ^= 0x1;
+        let (_, loaded3) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+                .expect("rebuild");
+        assert!(!loaded3, "mutated feature vector must invalidate");
+        let expected = dedup_candidates_sharded(&entries, 7, 2, shard_bits);
+        let (pairs3, _) =
+            dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+                .expect("reload after rebuild");
+        assert_eq!(pairs3, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn project_mih_index_path_layout() {
         let p = project_mih_index_path(std::path::Path::new("/tmp/mih"), 42);
@@ -1609,6 +1710,18 @@ mod tests {
             crop_candidates_cached(&changed, 5, 1, 4, Some(&dir)).expect("rebuild");
         assert!(!loaded3);
         assert_eq!(p3, crop_candidates(&changed, 5, 1, 4));
+
+        // same ids but a mutated feature key → fingerprint mismatch → rebuild
+        // (mutate `changed` so the image set stays identical to the bundle)
+        let mut mutated = changed.clone();
+        mutated[2].keys[0] ^= 0x1;
+        let (p4, loaded4) =
+            crop_candidates_cached(&mutated, 5, 1, 4, Some(&dir)).expect("fp rebuild");
+        assert!(!loaded4, "mutated crop keys must invalidate");
+        assert_eq!(p4, crop_candidates(&mutated, 5, 1, 4));
+        let (_, loaded5) =
+            crop_candidates_cached(&mutated, 5, 1, 4, Some(&dir)).expect("fp reload");
+        assert!(loaded5);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

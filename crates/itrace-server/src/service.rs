@@ -13,7 +13,7 @@ use itrace_core::features;
 use itrace_core::{documents, hashes, image_io, index, slice};
 use itrace_core::{GrayImage, RgbImage, HASH_GATE_ALGOS, SMART_ALGOS};
 use itrace_core::smart_pair_confirmed;
-use itrace_store::{ImageMeta, ImageRecord, NewImage, NewRun, Project, Store};
+use itrace_store::{ImageMeta, ImageRecord, ImageStore, NewImage, NewRun, Project};
 
 use crate::{enqueue_precompute_decoded, unique_key, ApiError, ApiResult, AppState};
 
@@ -45,7 +45,7 @@ pub fn handle_upload(
     filename: &str,
     data: Vec<u8>,
 ) -> ApiResult<Value> {
-    let store = &state.store;
+    let store = &*state.store;
     let rel = unique_key(store, "uploads", filename);
     store.write_file(&rel, &data)?;
     let file_size = data.len() as i64;
@@ -118,7 +118,7 @@ pub fn handle_upload(
 }
 
 fn insert_one_image(
-    store: &Store,
+    store: &dyn ImageStore,
     project_id: i64,
     key: &str,
     filename: &str,
@@ -922,7 +922,7 @@ fn chrono_now() -> String {
 
 // ---------- match data / visualize / slices ----------
 
-fn load_gray(store: &Store, file_path: &str) -> anyhow::Result<GrayImage> {
+fn load_gray(store: &dyn ImageStore, file_path: &str) -> anyhow::Result<GrayImage> {
     let bytes = store.read_file(file_path).context("图像文件不存在")?;
     let decoded = image_io::decode(&bytes)?;
     let small = image_io::resize_max_side(&decoded, 1024);
@@ -939,7 +939,7 @@ fn load_gray_cached(
     if let Some(g) = state.gray_cache.lock().unwrap().get(&image_id) {
         return Ok(Arc::clone(g));
     }
-    let g = Arc::new(load_gray(&state.store, file_path)?);
+    let g = Arc::new(load_gray(&*state.store, file_path)?);
     let mut cache = state.gray_cache.lock().unwrap();
     if cache.len() >= 64 {
         if let Some(&k) = cache.keys().next() {
@@ -1011,7 +1011,7 @@ pub fn match_data(
 
 /// Read + decode + resize one image, returning its gray and rgb buffers.
 fn decode_side(
-    store: &Store,
+    store: &dyn ImageStore,
     file_path: &str,
     max_side: u32,
 ) -> ApiResult<(GrayImage, RgbImage)> {
@@ -1027,7 +1027,7 @@ pub fn visualize(
     b_path: &str,
     algo: &str,
 ) -> ApiResult<Value> {
-    let store = &state.store;
+    let store = &*state.store;
     let ext = descriptors::extractor_for(algo)
         .ok_or_else(|| ApiError::bad(format!("算法 {algo} 在此构建中不可用")))?;
     let (a, b) = rayon::join(|| decode_side(store, a_path, 640), || decode_side(store, b_path, 640));

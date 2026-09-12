@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use itrace_core::compare::{self, Prepared};
 use itrace_core::{documents, hashes, image_io, features, index, slice};
 use itrace_core::HASH_GATE_ALGOS;
-use itrace_store::{NewImage, Store};
+use itrace_store::{ImageStore, NewImage, SqliteStore};
 
 #[derive(Parser)]
 #[command(name = "itrace", version, about = "Image Trace — 图像比对与查重")]
@@ -92,7 +92,7 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let store = Store::open(&cli.data_dir).context("打开数据目录失败")?;
+    let store = SqliteStore::open(&cli.data_dir).context("打开数据目录失败")?;
 
     match cli.cmd {
         Cmd::Create { name, description } => {
@@ -262,7 +262,7 @@ fn main() -> anyhow::Result<()> {
 /// CLI path mirroring server `run_dedup_scan`: load gate-hash variant keys
 /// from the store, MIH recall via `dedup_confirmed`, print groups like smart.
 fn run_cli_dedup(
-    store: &Store,
+    store: &dyn ImageStore,
     project_id: i64,
     radius: u32,
     threshold: f64,
@@ -476,7 +476,7 @@ fn run_cli_dedup(
     Ok(())
 }
 
-fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()> {
+fn add_file(store: &dyn ImageStore, project_id: i64, path: &PathBuf) -> anyhow::Result<()> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     if image_io::is_supported_image(name) {
         let data = std::fs::read(path)?;
@@ -563,13 +563,13 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
 type FeatureRows = Vec<(u8, String, Vec<u8>, usize)>;
 
 /// Decode `key` and compute all feature rows (CPU-heavy; no DB access).
-fn compute_rows(store: &Store, key: &str) -> anyhow::Result<FeatureRows> {
+fn compute_rows(store: &dyn ImageStore, key: &str) -> anyhow::Result<FeatureRows> {
     Ok(features::compute_all_variants(&image_io::decode(&store.read_file(key)?)?))
 }
 
 /// Status protocol: computing → batched write → ready / pending.
 fn write_features(
-    store: &Store,
+    store: &dyn ImageStore,
     image_id: i64,
     rows: anyhow::Result<FeatureRows>,
 ) -> anyhow::Result<()> {
@@ -591,14 +591,14 @@ fn write_features(
 /// Feature rows from an already-decoded image (the `add` path decoded it
 /// for the insert-time hashes — no second decode, no blob re-read).
 fn precompute_decoded(
-    store: &Store,
+    store: &dyn ImageStore,
     image_id: i64,
     img: &image::DynamicImage,
 ) -> anyhow::Result<()> {
     write_features(store, image_id, Ok(features::compute_all_variants(img)))
 }
 
-fn unique_key(store: &Store, prefix: &str, name: &str) -> String {
+fn unique_key(store: &dyn ImageStore, prefix: &str, name: &str) -> String {
     let c = format!("{prefix}/{name}");
     if !store.file_exists(&c) {
         return c;
