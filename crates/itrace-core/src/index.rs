@@ -1109,8 +1109,38 @@ pub fn dedup_confirmed_cached(
     shard_bits: u32,
     project_index_dir: Option<&std::path::Path>,
 ) -> std::io::Result<(usize, ConfirmedPairs, bool)> {
-    let (pairs, loaded) =
+    dedup_confirmed_cached_with_extra(
+        entries,
+        radius,
+        threshold,
+        min_votes,
+        shard_bits,
+        project_index_dir,
+        &[],
+    )
+}
+
+/// Like [`dedup_confirmed_cached`], but unions caller-supplied `extra`
+/// candidate pairs (e.g. semantic-channel hits from
+/// [`crate::semantic::semantic_candidates`]) into the MIH recall set
+/// **before** [`confirm_pairs`] verification. `extra` pairs are entry
+/// indices — normalized and deduplicated by
+/// [`crate::semantic::union_candidate_pairs`]. Verification is unchanged:
+/// an extra-recalled pair still needs the cross-variant max score ≥
+/// `threshold`, so extra recall can never widen confirmed merges.
+/// `extra = &[]` is bit-identical to [`dedup_confirmed_cached`].
+pub fn dedup_confirmed_cached_with_extra(
+    entries: &[DedupKeys],
+    radius: u32,
+    threshold: f64,
+    min_votes: u32,
+    shard_bits: u32,
+    project_index_dir: Option<&std::path::Path>,
+    extra: &[(u32, u32)],
+) -> std::io::Result<(usize, ConfirmedPairs, bool)> {
+    let (mut pairs, loaded) =
         dedup_candidates_sharded_cached(entries, radius, min_votes, shard_bits, project_index_dir)?;
+    crate::semantic::union_candidate_pairs(&mut pairs, extra.iter().copied());
     let confirmed = confirm_pairs(entries, &pairs, threshold);
     Ok((pairs.len(), confirmed, loaded))
 }
@@ -1608,6 +1638,56 @@ mod tests {
             }
         }
         entries
+    }
+
+    /// The semantic-channel union seam: an extra pair MIH recall missed
+    /// (match under only 1 of 3 gate algos < min_votes=2) is folded into
+    /// the candidate set BEFORE verification, so it confirms on its
+    /// variant-max hash score exactly like an MIH hit — and a pair the
+    /// verifier rejects still cannot confirm.
+    #[test]
+    fn dedup_confirmed_cached_with_extra_unions_before_verify() {
+        let mut entries = sample_entries(40);
+        // entry 2 = near-dup of entry 0 under algo 0 only → MIH (min_votes
+        // 2) never emits (0, 2) even though its keys nearly match.
+        entries[2].variant_keys[0] = entries[0].variant_keys[0]
+            .iter()
+            .map(|&k| k ^ 0x3)
+            .collect();
+        let (base_n, base_conf, base_loaded) =
+            dedup_confirmed_cached_with_extra(&entries, 7, 0.9, 2, 5, None, &[]).unwrap();
+        assert!(!base_loaded);
+        assert!(!base_conf.iter().any(|&(i, j, _)| (i, j) == (0, 2)));
+
+        let (union_n, conf, _) =
+            dedup_confirmed_cached_with_extra(&entries, 7, 0.9, 2, 5, None, &[(2, 0)]).unwrap();
+        assert!(union_n > base_n);
+        assert!(
+            conf.iter().any(|&(i, j, _)| (i, j) == (0, 2)),
+            "extra candidate not confirmed: {conf:?}"
+        );
+        for &(i, j, _) in &base_conf {
+            assert!(conf.iter().any(|&(a, b, _)| (a, b) == (i, j)));
+        }
+
+        // A semantically-recalled pair that fails verification stays out.
+        let (_, conf_reject, _) =
+            dedup_confirmed_cached_with_extra(&entries, 7, 0.9, 2, 5, None, &[(0, 5)]).unwrap();
+        assert!(!conf_reject.iter().any(|&(i, j, _)| (i, j) == (0, 5)));
+    }
+
+    /// Flag-off contract: `extra = &[]` is bit-identical to the pre-R2
+    /// `dedup_confirmed_cached` entry point (default smoke unchanged).
+    #[test]
+    fn dedup_confirmed_cached_with_extra_empty_parity() {
+        let entries = sample_entries(40);
+        let a = dedup_confirmed_cached(&entries, 7, 0.5, 2, 5, None).unwrap();
+        let b = dedup_confirmed_cached_with_extra(&entries, 7, 0.5, 2, 5, None, &[]).unwrap();
+        assert_eq!((a.0, a.2), (b.0, b.2));
+        assert_eq!(a.1.len(), b.1.len());
+        for (x, y) in a.1.iter().zip(&b.1) {
+            assert_eq!((x.0, x.1, x.2.to_bits()), (y.0, y.1, y.2.to_bits()));
+        }
     }
 
     #[test]

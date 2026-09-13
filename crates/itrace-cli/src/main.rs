@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 
 use itrace_core::compare::{self, Prepared};
-use itrace_core::{documents, hashes, image_io, features, index, slice};
+use itrace_core::{documents, hashes, image_io, features, index, semantic, slice};
 use itrace_core::HASH_GATE_ALGOS;
 use itrace_store::{ImageStore, NewImage};
 
@@ -362,13 +362,54 @@ fn run_cli_dedup(
     let t0 = std::time::Instant::now();
     let index_dir = index::resolve_mih_index_dir()
         .map(|base| index::project_mih_index_path(&base, project_id));
-    let (cand_n, confirmed, index_loaded) = index::dedup_confirmed_cached(
+    let ready_by_id: std::collections::HashMap<i64, &itrace_store::ImageMeta> =
+        ready.iter().map(|r| (r.id, *r)).collect();
+
+    // Semantic recall channel (Phase 4 R2, opt-in via ITRACE_SEMANTIC=1):
+    // embed every indexed image, ANN-probe for high-cosine neighbours and
+    // union the hits into the MIH candidate set BEFORE verification —
+    // confirm_pairs is unchanged, so a semantic hit still needs the
+    // cross-variant hash score ≥ threshold and cannot widen merges.
+    // Entries that fail to read/embed get a zero vector (cosine 0 to
+    // everything → never a candidate), keeping `sem_entries` index-aligned
+    // with `entries`.
+    let sem_pairs: Vec<(u32, u32)> = if semantic::semantic_channel_enabled() {
+        match semantic::embedder_from_env() {
+            Some(embedder) => {
+                let sem_entries: Vec<semantic::SemanticVecs> = entries
+                    .par_iter()
+                    .map(|e| {
+                        let vector = ready_by_id
+                            .get(&e.image_id)
+                            .and_then(|m| store.read_file(&m.file_path).ok())
+                            .and_then(|b| embedder.embed_bytes(&b).ok())
+                            .unwrap_or_else(|| vec![0.0; embedder.dim()]);
+                        semantic::SemanticVecs {
+                            image_id: e.image_id,
+                            vector,
+                        }
+                    })
+                    .collect();
+                semantic::semantic_candidates(
+                    &sem_entries,
+                    semantic::resolve_semantic_k(None),
+                    semantic::resolve_semantic_min_cosine(None),
+                )
+            }
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let (cand_n, confirmed, index_loaded) = index::dedup_confirmed_cached_with_extra(
         &entries,
         radius,
         threshold,
         min_votes,
         shard_bits,
         index_dir.as_deref(),
+        &sem_pairs,
     )?;
 
     // Crop/slice recall channel: windowed-phash keys → hit-counted
@@ -406,8 +447,6 @@ fn run_cli_dedup(
     } else {
         (Vec::new(), false)
     };
-    let ready_by_id: std::collections::HashMap<i64, &itrace_store::ImageMeta> =
-        ready.iter().map(|r| (r.id, *r)).collect();
     let crop_confirmed: Vec<(i64, i64, f64)> = crop_pairs
         .par_iter()
         .filter_map(|&(i, j)| {
@@ -485,11 +524,19 @@ fn run_cli_dedup(
         }
     }
     let naive = (n as u64) * (n as u64 - 1) / 2;
+    // Per-channel contribution note appears only when the channel is
+    // armed, keeping default output byte-identical.
+    let sem_note = if semantic::semantic_channel_enabled() {
+        format!(" +{} sem", sem_pairs.len())
+    } else {
+        String::new()
+    };
     println!(
-        "indexed {}, candidates {} (+{} crop), naive {}, {} dup groups / {} images, scan {:.3}s, index_loaded={}, crop_index_loaded={}",
+        "indexed {}, candidates {} (+{} crop{}), naive {}, {} dup groups / {} images, scan {:.3}s, index_loaded={}, crop_index_loaded={}",
         entries.len(),
         cand_n,
         crop_pairs.len(),
+        sem_note,
         naive,
         shown,
         grouped,
