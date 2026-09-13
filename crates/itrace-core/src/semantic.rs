@@ -18,25 +18,30 @@
 //!   pairs under the same contract as `index::dedup_candidates*` /
 //!   `index::crop_candidates*` so they can be unioned directly.
 //!
-//! # Dedup wiring sketch (opt-in, `ITRACE_SEMANTIC=1`)
+//! # Dedup wiring (opt-in, `ITRACE_SEMANTIC=1`)
 //!
-//! The channel is **off by default** and no-ops without a real embedder:
+//! The channel is **off by default**. When [`semantic_channel_enabled`]
+//! and [`embedder_from_env`] resolves a backend, both dedup entry points
+//! (`itrace-cli dedup` and the server's `/dedup` scan) run it:
 //!
-//! 1. Precompute (follow-up): for each ready image, run
-//!    `embedder.embed_bytes(blob)` and persist the vector as a feature
-//!    (e.g. `feature_store` algorithm `dinov2`).
-//! 2. Dedup: when [`semantic_channel_enabled`] and embeddings are present,
-//!    collect `SemanticVecs` for the same `entries` the gate scan uses,
-//!    build a [`HnswIndex`] (later a persisted `project_{id}_sem/` bundle
-//!    mirroring `ITMIHP1`), and merge via
-//!    `union_candidate_pairs(&mut pairs, semantic_candidates(...))` before
-//!    `confirm_pairs` / smart re-scoring.
-//! 3. Verification: semantic hits are *candidates only* — a pair emitted by
-//!    this channel still requires downstream confirmation (strict cosine
-//!    plus the existing hash/crop gates), so enabling it can add recall but
-//!    cannot silently widen merges. [`embedder_from_env`] is the production
-//!    seam; it returns `None` today, so `ITRACE_SEMANTIC=1` is inert until a
-//!    DINOv2 backend lands.
+//! 1. Embed: each image in the gate scan's `entries` is embedded via
+//!    `embedder.embed_bytes(blob)` — per-scan decoding today (R2 dev
+//!    path); a persisted feature/`project_{id}_sem/` bundle mirroring
+//!    `ITMIHP1` is the follow-up.
+//! 2. Recall: [`semantic_candidates`] builds an in-memory [`HnswIndex`]
+//!    over those vectors and emits `(entry_i, entry_j)` candidate pairs
+//!    at `resolve_semantic_k` / `resolve_semantic_min_cosine`.
+//! 3. Union + verify: [`union_candidate_pairs`] folds them into the MIH
+//!    candidate set **before** `confirm_pairs` / the variant-max hash
+//!    re-score. Semantic hits are *candidates only* — a pair still needs
+//!    the existing hash/crop confirmation, so the channel can add recall
+//!    but cannot silently widen merges. With the flag off the path is
+//!    skipped entirely and dedup output is bit-identical.
+//!
+//! Backend resolution: `ITRACE_SEMANTIC_MODEL` names a DINOv2 ONNX
+//! weights path (runtime is a follow-up). While no real backend exists,
+//! arming the flag auto-selects [`StubEmbedder`] unless a model path is
+//! configured — `ITRACE_SEMANTIC_STUB=1` forces the stub even then.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
@@ -47,8 +52,9 @@ use rayon::prelude::*;
 ///
 /// Implementations return raw `f32` embeddings; [`HnswIndex`] L2-normalizes
 /// internally, so backends need not normalize. Object-safe: dedup will hold
-/// `Box<dyn SemanticEmbedder>` / `Arc<dyn SemanticEmbedder>`.
-pub trait SemanticEmbedder {
+/// `Box<dyn SemanticEmbedder>` / `Arc<dyn SemanticEmbedder>`. `Send + Sync`
+/// because dedup embeds the batch in parallel.
+pub trait SemanticEmbedder: Send + Sync {
     /// Output embedding dimension (e.g. 384 for DINOv2-vits14, 768 for base).
     fn dim(&self) -> usize;
     /// Embed raw image file bytes → embedding vector of length [`Self::dim`].
@@ -60,16 +66,39 @@ pub trait SemanticEmbedder {
     }
 }
 
-/// Production embedder seam: resolves the configured embedding backend
-/// (planned: `ITRACE_SEMANTIC_MODEL=<dinov2.onnx path>`). Returns `None`
-/// until a real backend lands — callers must treat *enabled but `None`* as
-/// a no-op so `ITRACE_SEMANTIC=1` never changes default dedup behaviour.
+/// Production embedder seam: resolves the configured embedding backend.
+///
+/// - `ITRACE_SEMANTIC` unset/off → `None` (channel disarmed; default).
+/// - Armed + `ITRACE_SEMANTIC_MODEL` set + `ITRACE_SEMANTIC_STUB` unset →
+///   `None`: a configured production weights path never silently degrades
+///   to the stub (the ONNX backend itself is a follow-up).
+/// - Armed otherwise (no model path, or `ITRACE_SEMANTIC_STUB=1`) →
+///   [`StubEmbedder`]. The stub is a deterministic dev/test stand-in —
+///   **not** semantic DINOv2 embeddings.
 pub fn embedder_from_env() -> Option<Box<dyn SemanticEmbedder>> {
-    None
+    if !semantic_channel_enabled() {
+        return None;
+    }
+    let model_set = std::env::var(SEMANTIC_MODEL_ENV)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let stub_forced = std::env::var(SEMANTIC_STUB_ENV)
+        .map(|v| semantic_flag_on(&v))
+        .unwrap_or(false);
+    if model_set && !stub_forced {
+        return None;
+    }
+    Some(Box::new(StubEmbedder::default()))
 }
 
 /// Env flag arming the semantic recall channel.
 pub const SEMANTIC_ENV: &str = "ITRACE_SEMANTIC";
+/// Env var naming the production embedding weights file (DINOv2 ONNX —
+/// a follow-up; no runtime is wired yet).
+pub const SEMANTIC_MODEL_ENV: &str = "ITRACE_SEMANTIC_MODEL";
+/// Env var forcing [`StubEmbedder`] even when `ITRACE_SEMANTIC_MODEL` is
+/// configured.
+pub const SEMANTIC_STUB_ENV: &str = "ITRACE_SEMANTIC_STUB";
 /// Default k for per-image ANN probes in the semantic channel.
 pub const DEFAULT_SEMANTIC_K: usize = 32;
 /// Default minimum cosine similarity for a semantic candidate pair.
@@ -116,6 +145,102 @@ pub fn resolve_semantic_min_cosine(override_c: Option<f32>) -> f32 {
         })
         .unwrap_or(DEFAULT_SEMANTIC_MIN_COSINE)
         .clamp(-1.0, 1.0)
+}
+
+/// Default [`StubEmbedder`] grid side: 16×16 → a 256-dim embedding.
+pub const DEFAULT_STUB_GRID: usize = 16;
+
+/// Deterministic dev/test embedder — **not** a semantic model.
+///
+/// Decodes the image, converts to grayscale, block-averages it onto a
+/// `grid × grid` layout and mean-subtracts (a coarse content-smooth
+/// projection, closer to a tiny perceptual embedding than to DINOv2).
+/// Near-duplicate images land at high cosine, unrelated ones near 0, so
+/// the channel can be exercised end-to-end without weights. Bytes that
+/// don't decode fall back to a hash-derived vector (still deterministic)
+/// so a corrupt blob can never fail a scan.
+pub struct StubEmbedder {
+    /// Downsample grid side; `dim() = grid²`.
+    grid: usize,
+}
+
+impl StubEmbedder {
+    /// `grid × grid` grayscale-block embedding (`dim = grid²`).
+    pub fn with_grid(grid: usize) -> Self {
+        assert!((1..=64).contains(&grid), "stub grid out of range");
+        Self { grid }
+    }
+
+    /// Block-average `gray` onto `grid × grid` cells, then mean-subtract so
+    /// a global brightness shift doesn't dominate cosine. Degenerate
+    /// (zero-area) images embed to the zero vector — cosine 0 against
+    /// everything, i.e. never a candidate.
+    fn embed_gray(&self, gray: &crate::GrayImage) -> Vec<f32> {
+        let g = self.grid;
+        let mut out = vec![0.0f32; g * g];
+        let (w, h) = (gray.width as usize, gray.height as usize);
+        if w == 0 || h == 0 {
+            return out;
+        }
+        for cy in 0..g {
+            let y0 = cy * h / g;
+            let y1 = (((cy + 1) * h) / g).max(y0 + 1).min(h);
+            for cx in 0..g {
+                let x0 = cx * w / g;
+                let x1 = (((cx + 1) * w) / g).max(x0 + 1).min(w);
+                let mut sum = 0.0f64;
+                for y in y0..y1 {
+                    for &px in &gray.data[y * w + x0..y * w + x1] {
+                        sum += px as f64;
+                    }
+                }
+                out[cy * g + cx] = (sum / ((y1 - y0) * (x1 - x0)) as f64) as f32;
+            }
+        }
+        let mean = out.iter().sum::<f32>() / out.len() as f32;
+        for v in &mut out {
+            *v -= mean;
+        }
+        out
+    }
+}
+
+impl Default for StubEmbedder {
+    fn default() -> Self {
+        Self::with_grid(DEFAULT_STUB_GRID)
+    }
+}
+
+/// Deterministic pseudo-embedding for bytes that don't decode as an image:
+/// a SplitMix64 stream seeded by blake3 — stable across runs and
+/// near-orthogonal to real image vectors.
+fn hash_embed(dim: usize, bytes: &[u8]) -> Vec<f32> {
+    let h = blake3::hash(bytes);
+    let mut s = u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap());
+    (0..dim)
+        .map(|_| {
+            s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            // uniform in [-1, 1)
+            ((z >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0) * 2.0 - 1.0) as f32
+        })
+        .collect()
+}
+
+impl SemanticEmbedder for StubEmbedder {
+    fn dim(&self) -> usize {
+        self.grid * self.grid
+    }
+
+    fn embed_bytes(&self, bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
+        match crate::image_io::decode(bytes) {
+            Ok(img) => Ok(self.embed_gray(&crate::image_io::to_gray(&img))),
+            Err(_) => Ok(hash_embed(self.dim(), bytes)),
+        }
+    }
 }
 
 /// Cosine similarity of two equal-length vectors (both normalized here, so
@@ -866,8 +991,159 @@ mod tests {
         ] {
             assert_eq!(semantic_flag_on(v), want, "flag {v:?}");
         }
-        // currently no production embedder → enabled-or-not stays a no-op
+    }
+
+    /// All env-mutating `embedder_from_env` coverage lives in ONE test so
+    /// parallel test threads can't race on the process env.
+    #[test]
+    fn embedder_from_env_registration() {
+        for v in [SEMANTIC_ENV, SEMANTIC_STUB_ENV, SEMANTIC_MODEL_ENV] {
+            std::env::remove_var(v);
+        }
+        assert!(embedder_from_env().is_none(), "channel off → no embedder");
+
+        // armed + no model path → auto-stub (dev path)
+        std::env::set_var(SEMANTIC_ENV, "1");
+        let e = embedder_from_env().expect("armed + no model → stub");
+        assert_eq!(e.dim(), DEFAULT_STUB_GRID * DEFAULT_STUB_GRID);
+
+        // a configured model path without the stub override keeps the
+        // production seam inert — never silently stubs
+        std::env::set_var(SEMANTIC_MODEL_ENV, "/tmp/nonexistent-dinov2.onnx");
         assert!(embedder_from_env().is_none());
+        // …unless the stub is explicitly forced
+        std::env::set_var(SEMANTIC_STUB_ENV, "1");
+        assert!(embedder_from_env().is_some());
+
+        // disarmed wins over every other knob
+        std::env::set_var(SEMANTIC_ENV, "0");
+        assert!(embedder_from_env().is_none());
+
+        for v in [SEMANTIC_ENV, SEMANTIC_STUB_ENV, SEMANTIC_MODEL_ENV] {
+            std::env::remove_var(v);
+        }
+    }
+
+    /// Synthetic PNG: gradient + per-seed channel offset — the same
+    /// generator style the image_io/pipeline tests use (no fixtures).
+    fn test_png(seed: u8, w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.put_pixel(
+                    x,
+                    y,
+                    image::Rgb([
+                        ((x * 255) / w) as u8,
+                        ((y * 255) / h) as u8,
+                        ((x ^ y) as u8).wrapping_add(seed),
+                    ]),
+                );
+            }
+        }
+        let mut cur = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut cur, image::ImageFormat::Png)
+            .unwrap();
+        cur.into_inner()
+    }
+
+    /// Structurally different image: vertical stripes + coarse blocks —
+    /// lands far from the gradient `test_png` in stub space.
+    fn stripes_png(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = if (x / 4 + y / 16) % 2 == 0 { 30 } else { 220 };
+                img.put_pixel(x, y, image::Rgb([v, 255 - v, (x % 251) as u8]));
+            }
+        }
+        let mut cur = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut cur, image::ImageFormat::Png)
+            .unwrap();
+        cur.into_inner()
+    }
+
+    /// Near-duplicate of a PNG: decode, nudge ~4% of pixels slightly,
+    /// re-encode — a stand-in for recompressed/retouched duplicates.
+    fn near_dup_png(png: &[u8], delta: u8) -> Vec<u8> {
+        let mut img = crate::image_io::decode(png).unwrap().to_rgb8();
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            if x % 5 == 0 && y % 5 == 0 {
+                p.0[0] = p.0[0].wrapping_add(delta);
+                p.0[1] = p.0[1].wrapping_sub(delta / 2);
+            }
+        }
+        let mut cur = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut cur, image::ImageFormat::Png)
+            .unwrap();
+        cur.into_inner()
+    }
+
+    #[test]
+    fn stub_embedder_deterministic_and_dim() {
+        let e = StubEmbedder::default();
+        assert_eq!(e.dim(), DEFAULT_STUB_GRID * DEFAULT_STUB_GRID);
+        let bytes = test_png(3, 96, 64);
+        let a = e.embed_bytes(&bytes).unwrap();
+        assert_eq!(a, e.embed_bytes(&bytes).unwrap());
+        assert_eq!(a.len(), e.dim());
+        // structured images embed well away from the zero vector
+        let n = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(n > 0.5, "structured image should not embed to ~zero");
+        // grid variant + undecodable-bytes fallback (deterministic, dim ok)
+        let small = StubEmbedder::with_grid(4);
+        assert_eq!(small.dim(), 16);
+        let h1 = small.embed_bytes(b"not an image").unwrap();
+        assert_eq!(h1, small.embed_bytes(b"not an image").unwrap());
+        assert_eq!(h1.len(), 16);
+    }
+
+    #[test]
+    fn stub_embedder_near_dup_close_far_apart() {
+        let e = StubEmbedder::default();
+        let orig = test_png(7, 96, 96);
+        let dup = near_dup_png(&orig, 3);
+        let other = stripes_png(96, 96);
+        let (vo, vd, vs) = (
+            e.embed_bytes(&orig).unwrap(),
+            e.embed_bytes(&dup).unwrap(),
+            e.embed_bytes(&other).unwrap(),
+        );
+        let near = cosine_similarity(&vo, &vd);
+        let far = cosine_similarity(&vo, &vs);
+        assert!(near > 0.9, "near-dup cosine {near}");
+        assert!(
+            far < DEFAULT_SEMANTIC_MIN_COSINE,
+            "unrelated cosine {far} must stay under the default floor"
+        );
+    }
+
+    /// The R2 dev path end-to-end in miniature: stub-embed a batch, run
+    /// `semantic_candidates` — the near-dup pair must be emitted at the
+    /// default floor while the unrelated image stays out.
+    #[test]
+    fn stub_channel_emits_candidate_pair() {
+        let e = StubEmbedder::default();
+        let orig = test_png(11, 96, 96);
+        let blobs = [
+            e.embed_bytes(&orig).unwrap(),
+            e.embed_bytes(&near_dup_png(&orig, 4)).unwrap(),
+            e.embed_bytes(&stripes_png(96, 96)).unwrap(),
+        ];
+        let entries: Vec<SemanticVecs> = blobs
+            .into_iter()
+            .enumerate()
+            .map(|(i, vector)| SemanticVecs {
+                image_id: i as i64 + 1,
+                vector,
+            })
+            .collect();
+        let pairs = semantic_candidates(&entries, 8, DEFAULT_SEMANTIC_MIN_COSINE);
+        assert!(pairs.contains(&(0, 1)), "near-dup pair missing: {pairs:?}");
+        assert!(!pairs.iter().any(|&(a, b)| a == 2 || b == 2));
     }
 
     #[test]

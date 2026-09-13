@@ -211,7 +211,7 @@ still forces a rebuild.
 | 1 | `ImageStore` trait extraction + feature-fingerprint MIH invalidation | **done** |
 | 2 | `PostgresStore` backend behind the `ImageStore` trait | **done** |
 | 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
-| 4 | Semantic DINOv2/HNSW recall channel | **in progress — R1: embedder trait + in-memory ANN** |
+| 4 | Semantic DINOv2/HNSW recall channel | **in progress — R2: stub embedder + dedup union wired** |
 
 ### Phase 1 delivered
 
@@ -342,6 +342,12 @@ but diverge beyond every hash radius (heavy recolor/composite transforms):
   ONNX model loaded from a weights path (`ort` + `ITRACE_SEMANTIC_MODEL`);
   **that download is a follow-up and never happens in CI** — tests and
   wiring use in-crate stubs.
+- **`StubEmbedder`** (R2) — deterministic dev/test stand-in: decode →
+  grayscale → block-average onto a 16×16 grid (256-dim), mean-subtracted;
+  undecodable bytes fall back to a blake3-seeded pseudo-vector so a scan
+  never fails. Content-smooth enough that near-duplicates land at high
+  cosine, but **not** a semantic model — it exists to exercise the channel
+  end-to-end until DINOv2 lands.
 - **`HnswIndex`** — in-memory HNSW ANN index over cosine-normalized `f32`
   vectors (`insert` + `query(k)`, deterministic seeded level draws, no new
   deps). Unit-tested on synthetic clusters: same-cluster members fill top-k
@@ -351,15 +357,19 @@ but diverge beyond every hash radius (heavy recolor/composite transforms):
   gate/crop channels; `union_candidate_pairs` merges them into the MIH
   candidate list before verification.
 
-**Wiring sketch (default off):** with `ITRACE_SEMANTIC=1`, a dedup run that
-has stored embeddings builds the index over the same `entries` as the gate
-scan, then `union_candidate_pairs(&mut pairs, semantic_candidates(...))`
-ahead of `confirm_pairs` / smart re-scoring. Semantic hits are *candidates
-only* — a pair still needs downstream confirmation (strict cosine + the
-existing hash/crop gates), so the channel can add recall without silently
-widening merges. `embedder_from_env()` is the production seam; it returns
-`None` today, so the flag is inert until a real backend and the
-`feature_store` embedding column land.
+**Wiring (default off):** with `ITRACE_SEMANTIC=1`, `embedder_from_env()`
+resolves a backend — `ITRACE_SEMANTIC_MODEL` set + `ITRACE_SEMANTIC_STUB`
+unset → `None` (a configured production path never silently stubs);
+otherwise `StubEmbedder`. Both dedup entry points then embed each indexed
+image (`run_cli_dedup` / `run_dedup_scan` re-decode blobs per scan — the
+persisted-embedding precompute is the follow-up), run
+`semantic_candidates` at `ITRACE_SEMANTIC_K` / `ITRACE_SEMANTIC_MIN_COS`,
+and fold the hits into the MIH candidate set ahead of the variant-max
+hash verification (`dedup_confirmed_cached_with_extra` /
+`union_candidate_pairs`). Semantic hits are *candidates only* — a pair
+still needs the existing hash/crop confirmation, so the channel can add
+recall without silently widening merges. Flag unset → the path is skipped
+and dedup output is bit-identical to the pre-R2 baseline.
 
 **Follow-ups:** DINOv2 ONNX weights + `ort` backend; persisted
 `project_{id}_sem/` bundle (`image_ids.bin` + serialized graph) with the
@@ -369,7 +379,9 @@ graph across nodes (per-shard HNSW or per-node full graph) once the
 
 | Variable | Effect |
 |----------|--------|
-| `ITRACE_SEMANTIC` | `1`/`true`/`on` arms the semantic channel (no-op until an embedder + embeddings exist; unset/`0`/`false`/`off` = off) |
+| `ITRACE_SEMANTIC` | `1`/`true`/`on` arms the semantic channel (unset/`0`/`false`/`off` = off) |
+| `ITRACE_SEMANTIC_MODEL` | DINOv2 ONNX weights path for the production backend (follow-up; when set without `ITRACE_SEMANTIC_STUB` the channel stays inert — no silent stub) |
+| `ITRACE_SEMANTIC_STUB` | `1` forces `StubEmbedder` even when `ITRACE_SEMANTIC_MODEL` is set; stub is auto-selected whenever the channel is armed with no model path |
 | `ITRACE_SEMANTIC_K` | Per-image ANN probe width (default 32) |
 | `ITRACE_SEMANTIC_MIN_COS` | Cosine floor for a semantic candidate (default 0.75) |
 

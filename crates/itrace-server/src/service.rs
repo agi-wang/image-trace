@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use itrace_core::compare::{self, Prepared};
 use itrace_core::descriptors;
 use itrace_core::features;
-use itrace_core::{documents, hashes, image_io, index, slice};
+use itrace_core::{documents, hashes, image_io, index, semantic, slice};
 use itrace_core::{GrayImage, RgbImage, HASH_GATE_ALGOS, SMART_ALGOS};
 use itrace_core::smart_pair_confirmed;
 use itrace_store::{ImageMeta, ImageRecord, ImageStore, NewImage, NewRun, Project};
@@ -593,7 +593,7 @@ pub fn run_dedup_scan(
     // in memory each scan (identical to prior behaviour).
     let index_dir = index::resolve_mih_index_dir()
         .map(|base| index::project_mih_index_path(&base, project_id));
-    let (pairs, index_loaded) = index::dedup_candidates_sharded_cached(
+    let (mut pairs, index_loaded) = index::dedup_candidates_sharded_cached(
         &entries,
         radius,
         min_votes,
@@ -601,6 +601,47 @@ pub fn run_dedup_scan(
         index_dir.as_deref(),
     )?;
     let naive = (n as u64) * (n as u64 - 1) / 2;
+
+    // ---------- semantic recall channel (Phase 4 R2, opt-in) ----------
+    // ITRACE_SEMANTIC=1 arms the channel; embedder_from_env resolves the
+    // backend (StubEmbedder while no real DINOv2/ONNX backend exists —
+    // ITRACE_SEMANTIC_MODEL/ITRACE_SEMANTIC_STUB select). Hits union into
+    // the MIH candidate set BEFORE the variant-max verification below,
+    // so semantic recall can grow but confirmed merges still need the
+    // same hash score bar. Entries that fail to read/embed get a zero
+    // vector (cosine 0 → never a candidate), keeping `sem_entries`
+    // index-aligned with `entries`.
+    let sem_pairs: Vec<(u32, u32)> = if semantic::semantic_channel_enabled() {
+        match semantic::embedder_from_env() {
+            Some(embedder) => {
+                let by_id: HashMap<i64, &ImageMeta> =
+                    ready.iter().map(|r| (r.id, *r)).collect();
+                let sem_entries: Vec<semantic::SemanticVecs> = entries
+                    .par_iter()
+                    .map(|e| {
+                        let vector = by_id
+                            .get(&e.image_id)
+                            .and_then(|m| store.read_file(&m.file_path).ok())
+                            .and_then(|b| embedder.embed_bytes(&b).ok())
+                            .unwrap_or_else(|| vec![0.0; embedder.dim()]);
+                        semantic::SemanticVecs {
+                            image_id: e.image_id,
+                            vector,
+                        }
+                    })
+                    .collect();
+                semantic::semantic_candidates(
+                    &sem_entries,
+                    semantic::resolve_semantic_k(None),
+                    semantic::resolve_semantic_min_cosine(None),
+                )
+            }
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    semantic::union_candidate_pairs(&mut pairs, sem_pairs.iter().copied());
 
     // ---------- crop/slice recall channel ----------
     // Gate hashes are whole-image: a crop70 or 2×2 slice tile moves too
@@ -768,6 +809,7 @@ pub fn run_dedup_scan(
         "indexed_images": entries.len(),
         "candidate_pairs": pairs.len(),
         "crop_candidates": crop_pairs.len(),
+        "semantic_candidates": sem_pairs.len(),
         "naive_pairs": naive,
         "found_duplicates": !dup_groups.is_empty(),
         "duplicate_groups": dup_groups,
