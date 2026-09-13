@@ -212,7 +212,8 @@ still forces a rebuild.
 | 2 | `PostgresStore` backend behind the `ImageStore` trait | **done** |
 | 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
 | 4 | Semantic DINOv2/HNSW recall channel | **done — foundation** (stub + HNSW + wiring; R3 double regression) |
-| 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **done — R1 ONNX skeleton + R2 `project_{id}_sem/` persist/fingerprint; R3 double regression** |
+| 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **done — R1 ONNX skeleton + R2 `project_{id}_sem/` persist/fingerprint + R3 double regression** |
+| 6 | Persisted HNSW graph + sharded semantic recall | **in progress — R1: `project_{id}_sem/hnsw.bin` graph persist** |
 
 ### Phase 1 delivered
 
@@ -383,7 +384,7 @@ rebuilds per scan); sharding the
 graph across nodes (per-shard HNSW or per-node full graph) once the
 `ITMIHN1` transport seam is real.
 
-### Phase 5 (done — R1+R2; R3 evidence gathered) — ONNX semantic backend
+### Phase 5 (done) — ONNX semantic backend
 
 `itrace_core::semantic_onnx` (R1, behind the opt-in `semantic-onnx`
 cargo feature) provides **`OnnxSemanticEmbedder`**: a `SemanticEmbedder`
@@ -413,8 +414,8 @@ default builds and CI never see the dependency.
 **R2 — persisted `project_{id}_sem/` bundle.** When
 `ITRACE_MIH_INDEX_DIR` is set and the channel is armed, dedup
 load-or-builds `{DIR}/project_{id}_sem/` so repeat scans skip model
-inference (the in-memory HNSW is still rebuilt per scan — cheap next to
-embedding):
+inference (Phase 6 R1 additionally persists the HNSW graph in
+`hnsw.bin`):
 
 ```text
 project_{id}_sem/
@@ -424,6 +425,7 @@ project_{id}_sem/
                   "feature_fingerprint":"<blake3 hex>"}
   image_ids.bin  K × i64 LE — owner slots, sorted ascending
   vectors.bin    K × D × f32 LE — row i belongs to image_ids.bin[i]
+  hnsw.bin       ITSEMH1 graph (Phase 6 R1) — see below
 ```
 
 `SemanticEmbedder::fingerprint()` is the invalidation key — `stub:g16`
@@ -447,8 +449,44 @@ membership is asserted identical across all three scans. See
 `datasets/built/reports/PHASE5_R3_DOUBLE_REGRESSION.md`.
 
 Remaining follow-ups: real `dinov2_vits14`/`vitb14` weights + recall
-calibration on transformed-image fixtures; persisting the HNSW graph
-itself (`vectors.bin`-adjacent) if rebuild cost matters at scale.
+calibration on transformed-image fixtures.
+
+### Phase 6 (in progress) — persisted HNSW graph
+
+**R1 — `project_{id}_sem/hnsw.bin` (`ITSEMH1` v1).** Sibling-file choice:
+the graph gets its own magic/version rather than extending `ITSEMP1`, so
+the vectors bundle stays a pure `(image_ids, vectors)` payload and the
+graph validates independently — a missing/stale `hnsw.bin` degrades to a
+graph rebuild off the verified vectors, never a re-embed. The header
+embeds the same BLAKE3 `feature_fingerprint` as `meta.json`, so a stale
+graph can never pair with rebuilt or mismatched vectors.
+
+```text
+hnsw.bin
+  magic       7B  "ITSEMH1"          version   u64 LE = 1
+  fingerprint 64B ASCII hex — must equal meta's recomputed
+              feature_fingerprint (binds graph to vectors.bin)
+  dim, m, ef_construction, ef_search, rng, max_level   u64 LE each
+  entry       u64 LE — entry-point node idx (u64::MAX = empty)
+  node_count  u64 LE — must equal meta's image_count
+  per node:   id u32 LE (owner slot), n_layers u64 LE,
+              vec dim×f32 LE (L2-normalized), then per layer
+              u64 count + count×u32 neighbour node idxs
+```
+
+`load_or_build_project_sem_index` now returns `ProjectSemIndex`
+(`entries` + `owner_ids` + `index` + `vecs_loaded`/`graph_loaded`);
+callers use `semantic_candidates_with_index` directly. A full cache hit
+restores the graph without re-inserting — CLI reports
+`+N sem (cached), sem_hnsw_loaded=true`, `/dedup` JSON gains
+`sem_hnsw_loaded`. Load validation is bounds-checked end to end
+(entry/neighbour refs in range, `n_layers ≤ MAX_LEVEL+1`, exact
+end-of-file); any violation → rebuild + overwrite.
+
+Remaining follow-ups: multi-node semantic/HNSW sharding (per-shard graph
+or per-node full graph) once the `ITMIHN1` seam is real; graph format
+compaction (u16 neighbour refs, omitting stored vecs by deriving them
+from `vectors.bin`) if bundle size matters.
 
 | Variable | Effect |
 |----------|--------|

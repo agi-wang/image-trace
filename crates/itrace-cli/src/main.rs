@@ -373,18 +373,18 @@ fn run_cli_dedup(
     // Entries that fail to read/embed get a zero vector (cosine 0 to
     // everything → never a candidate), keeping `sem_entries` index-aligned
     // with `entries`.
-    // With ITRACE_MIH_INDEX_DIR set, vectors persist in a
-    // `project_{id}_sem/` bundle (embedder-fingerprint + image-set
-    // invalidated — stale vectors are never reused); a matching bundle
-    // skips model inference entirely.
-    let (sem_pairs, sem_index_loaded): (Vec<(u32, u32)>, bool) =
+    // With ITRACE_MIH_INDEX_DIR set, vectors and the HNSW graph persist
+    // in a `project_{id}_sem/` bundle (embedder-fingerprint + image-set
+    // invalidated — stale vectors/graphs are never reused); a matching
+    // bundle skips model inference and the graph rebuild entirely.
+    let (sem_pairs, sem_index_loaded, sem_hnsw_loaded): (Vec<(u32, u32)>, bool, bool) =
         if semantic::semantic_channel_enabled() {
             match semantic::embedder_from_env() {
                 Some(embedder) => {
                     let image_ids: Vec<i64> = entries.iter().map(|e| e.image_id).collect();
                     let sem_dir = index::resolve_mih_index_dir()
                         .map(|base| semantic::project_sem_index_path(&base, project_id));
-                    let (sem_entries, loaded) = semantic::load_or_build_project_sem_index(
+                    let sem = semantic::load_or_build_project_sem_index(
                         sem_dir.as_deref(),
                         &image_ids,
                         &*embedder,
@@ -396,18 +396,21 @@ fn run_cli_dedup(
                         },
                     )?;
                     (
-                        semantic::semantic_candidates(
-                            &sem_entries,
+                        semantic::semantic_candidates_with_index(
+                            &sem.entries,
+                            &sem.index,
+                            &sem.owner_ids,
                             semantic::resolve_semantic_k(None),
                             semantic::resolve_semantic_min_cosine(None),
                         ),
-                        loaded,
+                        sem.vecs_loaded,
+                        sem.graph_loaded,
                     )
                 }
-                None => (Vec::new(), false),
+                None => (Vec::new(), false, false),
             }
         } else {
-            (Vec::new(), false)
+            (Vec::new(), false, false)
         };
 
     let (cand_n, confirmed, index_loaded) = index::dedup_confirmed_cached_with_extra(
@@ -536,9 +539,10 @@ fn run_cli_dedup(
     // armed, keeping default output byte-identical.
     let sem_note = if semantic::semantic_channel_enabled() {
         format!(
-            " +{} sem{}",
+            " +{} sem{}, sem_hnsw_loaded={}",
             sem_pairs.len(),
-            if sem_index_loaded { " (cached)" } else { "" }
+            if sem_index_loaded { " (cached)" } else { "" },
+            sem_hnsw_loaded
         )
     } else {
         String::new()

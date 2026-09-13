@@ -614,7 +614,7 @@ pub fn run_dedup_scan(
     // With ITRACE_MIH_INDEX_DIR set, vectors persist in a
     // `project_{id}_sem/` bundle (embedder-fingerprint + image-set
     // invalidated); a matching bundle skips model inference entirely.
-    let (sem_pairs, sem_index_loaded): (Vec<(u32, u32)>, bool) =
+    let (sem_pairs, sem_index_loaded, sem_hnsw_loaded): (Vec<(u32, u32)>, bool, bool) =
         if semantic::semantic_channel_enabled() {
             match semantic::embedder_from_env() {
                 Some(embedder) => {
@@ -623,7 +623,7 @@ pub fn run_dedup_scan(
                     let image_ids: Vec<i64> = entries.iter().map(|e| e.image_id).collect();
                     let sem_dir = index::resolve_mih_index_dir()
                         .map(|base| semantic::project_sem_index_path(&base, project_id));
-                    let (sem_entries, loaded) = semantic::load_or_build_project_sem_index(
+                    let sem = semantic::load_or_build_project_sem_index(
                         sem_dir.as_deref(),
                         &image_ids,
                         &*embedder,
@@ -635,18 +635,21 @@ pub fn run_dedup_scan(
                         },
                     )?;
                     (
-                        semantic::semantic_candidates(
-                            &sem_entries,
+                        semantic::semantic_candidates_with_index(
+                            &sem.entries,
+                            &sem.index,
+                            &sem.owner_ids,
                             semantic::resolve_semantic_k(None),
                             semantic::resolve_semantic_min_cosine(None),
                         ),
-                        loaded,
+                        sem.vecs_loaded,
+                        sem.graph_loaded,
                     )
                 }
-                None => (Vec::new(), false),
+                None => (Vec::new(), false, false),
             }
         } else {
-            (Vec::new(), false)
+            (Vec::new(), false, false)
         };
     semantic::union_candidate_pairs(&mut pairs, sem_pairs.iter().copied());
 
@@ -818,6 +821,7 @@ pub fn run_dedup_scan(
         "crop_candidates": crop_pairs.len(),
         "semantic_candidates": sem_pairs.len(),
         "sem_index_loaded": sem_index_loaded,
+        "sem_hnsw_loaded": sem_hnsw_loaded,
         "naive_pairs": naive,
         "found_duplicates": !dup_groups.is_empty(),
         "duplicate_groups": dup_groups,
