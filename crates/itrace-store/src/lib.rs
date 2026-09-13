@@ -1,12 +1,13 @@
-//! SQLite store: projects / images / feature vectors / pair cache / runs.
-//! File payloads go through `blob::BlobStore` — local fs or MinIO/S3.
+//! Metadata store: projects / images / feature vectors / pair cache /
+//! runs. File payloads go through `blob::BlobStore` — local fs or
+//! MinIO/S3 — regardless of the SQL backend.
 //!
 //! `ImageStore` is the backend seam every consumer (CLI, server) codes
-//! against; `SqliteStore` is the default implementation. A future
-//! Postgres backend implements the same trait — blob storage stays
-//! delegated to `BlobStore` either way.
+//! against. `SqliteStore` (default) and `PostgresStore` implement it;
+//! `open_image_store` picks one from `ITRACE_STORE`.
 
 pub mod blob;
+pub mod pg;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -249,12 +250,73 @@ pub trait ImageStore: Send + Sync {
     ) -> anyhow::Result<Option<AnalysisRunRecord>>;
 }
 
+/// Blob facade + data-dir plumbing shared by every metadata backend —
+/// blobs stay on `BlobStore` no matter which SQL engine owns metadata.
+pub(crate) struct StoreBase {
+    data_dir: PathBuf,
+    blobs: Arc<dyn BlobStore>,
+}
+
+impl StoreBase {
+    fn new(data_dir: &std::path::Path, blobs: Arc<dyn BlobStore>) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            blobs,
+        }
+    }
+
+    fn write_file(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.blobs.put(key, data)
+    }
+    fn read_file(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.blobs.get(key)
+    }
+    fn delete_file(&self, key: &str) -> anyhow::Result<()> {
+        self.blobs.delete(key)
+    }
+    fn file_exists(&self, key: &str) -> bool {
+        self.blobs.exists(key)
+    }
+    fn upload_dir(&self) -> PathBuf {
+        self.data_dir.join("uploads")
+    }
+    fn extract_dir(&self) -> PathBuf {
+        self.data_dir.join("extracted")
+    }
+
+    /// Resolve a stored key (e.g. "uploads/x.jpg") to a real fs path when
+    /// the blob backend is local; None under object storage — use
+    /// read_file instead.
+    fn resolve(&self, rel: &str) -> Option<PathBuf> {
+        let rel = rel.strip_prefix("data/").unwrap_or(rel);
+        self.blobs.local_path(rel)
+    }
+}
+
+/// Open the metadata backend selected by env (default SQLite):
+///
+/// - `ITRACE_STORE` = `sqlite` (default) → `SqliteStore` at
+///   `{data_dir}/image-trace.db`
+/// - `ITRACE_STORE` = `postgres` → `PostgresStore` at `ITRACE_DATABASE_URL`
+///   (or `DATABASE_URL`); `data_dir` still anchors the local `BlobStore`
+///   when `ITRACE_STORAGE=fs`.
+pub fn open_image_store(data_dir: &std::path::Path) -> anyhow::Result<Arc<dyn ImageStore>> {
+    match std::env::var("ITRACE_STORE").as_deref() {
+        Ok("postgres") | Ok("pg") => {
+            let url = std::env::var("ITRACE_DATABASE_URL")
+                .or_else(|_| std::env::var("DATABASE_URL"))
+                .context("ITRACE_STORE=postgres requires ITRACE_DATABASE_URL (or DATABASE_URL)")?;
+            Ok(Arc::new(pg::PostgresStore::connect(&url, data_dir)?))
+        }
+        _ => Ok(Arc::new(SqliteStore::open(data_dir)?)),
+    }
+}
+
 /// Thread-safe store. SQLite serializes writers anyway; a Mutex'd single
 /// connection in WAL mode is the right shape for a local-first tool.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
-    data_dir: PathBuf,
-    blobs: Arc<dyn BlobStore>,
+    base: StoreBase,
 }
 
 /// Back-compat alias — new code should name `SqliteStore` (concrete) or
@@ -269,14 +331,13 @@ impl SqliteStore {
         let blobs = blob::blob_store_from_env(data_dir)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            data_dir: data_dir.to_path_buf(),
-            blobs,
+            base: StoreBase::new(data_dir, blobs),
         })
     }
 
     /// Explicit backend override (tests).
     pub fn with_blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
-        self.blobs = blobs;
+        self.base.blobs = blobs;
         self
     }
 
@@ -367,39 +428,35 @@ impl SqliteStore {
 
 impl ImageStore for SqliteStore {
     fn blobs(&self) -> &Arc<dyn BlobStore> {
-        &self.blobs
+        &self.base.blobs
     }
     fn storage_kind(&self) -> &'static str {
-        self.blobs.kind()
+        self.base.blobs.kind()
     }
     fn write_file(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
-        self.blobs.put(key, data)
+        self.base.write_file(key, data)
     }
     fn read_file(&self, key: &str) -> anyhow::Result<Vec<u8>> {
-        self.blobs.get(key)
+        self.base.read_file(key)
     }
     fn delete_file(&self, key: &str) -> anyhow::Result<()> {
-        self.blobs.delete(key)
+        self.base.delete_file(key)
     }
     fn file_exists(&self, key: &str) -> bool {
-        self.blobs.exists(key)
+        self.base.file_exists(key)
     }
 
     fn data_dir(&self) -> &std::path::Path {
-        &self.data_dir
+        &self.base.data_dir
     }
     fn upload_dir(&self) -> PathBuf {
-        self.data_dir.join("uploads")
+        self.base.upload_dir()
     }
     fn extract_dir(&self) -> PathBuf {
-        self.data_dir.join("extracted")
+        self.base.extract_dir()
     }
-
-    /// Resolve a stored key (e.g. "uploads/x.jpg") to a real fs path when the
-    /// blob backend is local; None under object storage — use read_file instead.
     fn resolve(&self, rel: &str) -> Option<PathBuf> {
-        let rel = rel.strip_prefix("data/").unwrap_or(rel);
-        self.blobs.local_path(rel)
+        self.base.resolve(rel)
     }
 
     // ---------- projects ----------

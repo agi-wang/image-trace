@@ -3,7 +3,7 @@ name = "itrace-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SQLite persistence for Image Trace"
+description = "SQLite/Postgres persistence for Image Trace"
 
 [dependencies]
 anyhow.workspace = true
@@ -14,3 +14,6 @@ itrace-core = { path = "../itrace-core" }
 object_store = { version = "0.12", features = ["aws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
+postgres = "0.19"
+r2d2 = "0.8"
+r2d2_postgres = "0.18"

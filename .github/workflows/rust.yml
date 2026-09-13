@@ -13,6 +13,23 @@ env:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    services:
+      # PostgresStore contract parity (tests/store_contract.rs). The
+      # sqlite path runs regardless; the pg suite activates on
+      # ITRACE_TEST_DATABASE_URL.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: itrace
+          POSTGRES_PASSWORD: itrace
+          POSTGRES_DB: itrace
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U itrace -d itrace"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      ITRACE_TEST_DATABASE_URL: postgres://itrace:itrace@localhost:5432/itrace
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

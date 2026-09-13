@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use itrace_core::compare::{self, Prepared};
 use itrace_core::{documents, hashes, image_io, features, index, slice};
 use itrace_core::HASH_GATE_ALGOS;
-use itrace_store::{ImageStore, NewImage, SqliteStore};
+use itrace_store::{ImageStore, NewImage};
 
 #[derive(Parser)]
 #[command(name = "itrace", version, about = "Image Trace — 图像比对与查重")]
@@ -92,7 +92,7 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let store = SqliteStore::open(&cli.data_dir).context("打开数据目录失败")?;
+    let store = itrace_store::open_image_store(&cli.data_dir).context("打开数据目录失败")?;
 
     match cli.cmd {
         Cmd::Create { name, description } => {
@@ -105,7 +105,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Add { project_id, files } => {
             store.get_project(project_id).context("项目不存在")?;
             for f in files {
-                add_file(&store, project_id, &f)?;
+                add_file(&*store, project_id, &f)?;
             }
         }
         Cmd::Images { project_id } => {
@@ -122,10 +122,10 @@ fn main() -> anyhow::Result<()> {
                     i.feature_status != "ready"
                         || store.feature_algorithm_count(i.id).unwrap_or(0) < want
                 })
-                .map(|i| (i.id, compute_rows(&store, &i.file_path)))
+                .map(|i| (i.id, compute_rows(&*store, &i.file_path)))
                 .collect();
             for (id, rows) in computed {
-                if let Err(e) = write_features(&store, id, rows) {
+                if let Err(e) = write_features(&*store, id, rows) {
                     eprintln!("image {id} precompute failed: {e}");
                 }
             }
@@ -226,7 +226,7 @@ fn main() -> anyhow::Result<()> {
             println!("scan: {:.2}s, {} dup groups", t0.elapsed().as_secs_f64(), shown);
         }
         Cmd::Dedup { project_id, radius, threshold, min_votes, shard_bits } => {
-            run_cli_dedup(&store, project_id, radius, threshold, min_votes, shard_bits)?;
+            run_cli_dedup(&*store, project_id, radius, threshold, min_votes, shard_bits)?;
         }
         Cmd::Report { project_id, algorithm, threshold } => {
             let images = store.list_image_meta(project_id)?;

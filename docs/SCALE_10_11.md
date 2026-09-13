@@ -208,7 +208,7 @@ still forces a rebuild.
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 1 | `ImageStore` trait extraction + feature-fingerprint MIH invalidation | **done** |
-| 2 | `PostgresStore` backend behind the `ImageStore` trait | next |
+| 2 | `PostgresStore` backend behind the `ImageStore` trait | **done** |
 | 3 | Multi-node shard ownership + scatter/gather (design above) | planned |
 | 4 | Semantic DINOv2/HNSW recall channel | planned |
 
@@ -224,6 +224,39 @@ still forces a rebuild.
 - `feature_fingerprint` (above) in both `ITMIHP1` and `ITMIHC1` metas;
   tested: unchanged vectors reuse (`index_loaded=true`), same-ids
   mutated vectors rebuild (`index_loaded=false`).
+
+### Phase 2 delivered — `PostgresStore`
+
+`itrace_store::pg::PostgresStore` implements the full `ImageStore`
+surface on the sync `postgres` crate (tokio-postgres sync facade) over
+an `r2d2` pool (8 connections). The trait is synchronous, so a sync
+driver keeps server handlers free of `block_on`/`block_in_place`
+hazards; the pool supplies the concurrency SQLite's single Mutex'd
+connection never could.
+
+Backend selection is env-only — call sites stay untouched:
+
+```bash
+# default: sqlite (unchanged behavior)
+itrace-cli dedup 7
+# postgres metadata, fs/s3 blobs as before
+ITRACE_STORE=postgres \
+ITRACE_DATABASE_URL=postgres://itrace:itrace@localhost:5432/itrace \
+itrace-server
+```
+
+`docker compose up -d postgres` provides the dev instance (schema
+auto-applies on connect — `CREATE TABLE IF NOT EXISTS` DDL mirrors the
+SQLite `SCHEMA`). Type mapping: `INTEGER PK AUTOINCREMENT`→`BIGINT
+GENERATED ALWAYS AS IDENTITY`, `BLOB`→`BYTEA`, `REAL`→`DOUBLE
+PRECISION`, `rotation_invariant` int→`BOOLEAN`, ISO-8601 `created_at`
+TEXT preserved via `to_char(now() AT TIME ZONE 'UTC', …)`; `IN (…)`
+lists become `= ANY($n)` array params (no 999-variable chunking).
+
+Parity: `crates/itrace-store/tests/store_contract.rs` runs one
+contract suite against both backends — sqlite always, postgres when
+`ITRACE_TEST_DATABASE_URL` is set (CI provides a `postgres:16` service
+container on the `build-test` job).
 
 ## Microbench
 

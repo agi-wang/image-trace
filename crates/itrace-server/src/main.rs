@@ -23,7 +23,7 @@ use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
 use itrace_core::{self as core, DESCRIPTOR_ALGOS};
-use itrace_store::{ImageRecord, ImageStore, SqliteStore};
+use itrace_store::{ImageRecord, ImageStore};
 
 // ---------- state ----------
 
@@ -760,11 +760,11 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8000);
 
-    let store = SqliteStore::open(std::path::Path::new(&data_dir))?;
+    let store = itrace_store::open_image_store(std::path::Path::new(&data_dir))?;
     let _ = APP_STORAGE.set(store.storage_kind());
     tracing::info!("storage backend: {}", store.storage_kind());
     let state = AppState {
-        store: Arc::new(store),
+        store,
         gray_cache: Default::default(),
         prepared_cache: Default::default(),
     };

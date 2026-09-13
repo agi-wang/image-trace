@@ -30,8 +30,9 @@ crates/
 
 **元数据与特征向量**（projects/images/features/pair_cache/analysis_runs）走后端无关的
 `ImageStore` trait：`SqliteStore`（rusqlite）是默认实现，`pub type Store = SqliteStore`
-保持旧调用方兼容；CLI 与 server 均以 `&dyn ImageStore` / `Arc<dyn ImageStore>` 持握，
-未来 `PostgresStore`/`TiKV` 后端只需实现同一 trait 即可插入，调用点不改。
+保持旧调用方兼容；`PostgresStore`（`postgres` crate + r2d2 池）已实现同一 trait，
+由 `ITRACE_STORE=sqlite|postgres` + `ITRACE_DATABASE_URL` 经 `open_image_store` 选择；
+CLI 与 server 均以 `&dyn ImageStore` / `Arc<dyn ImageStore>` 持握，调用点与后端解耦。
 
 文件负载（uploads/extracted/thumbnails/visualizations）走 `BlobStore` trait 抽象，
 由 `ImageStore::blobs()` 委托。`ITRACE_STORAGE` 选择后端：
