@@ -213,7 +213,7 @@ still forces a rebuild.
 | 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
 | 4 | Semantic DINOv2/HNSW recall channel | **done — foundation** (stub + HNSW + wiring; R3 double regression) |
 | 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **done — R1 ONNX skeleton + R2 `project_{id}_sem/` persist/fingerprint + R3 double regression** |
-| 6 | Persisted HNSW graph + sharded semantic recall | **in progress — R1: `project_{id}_sem/hnsw.bin` graph persist** |
+| 6 | Persisted HNSW graph + sharded semantic recall | **in progress — R1 `hnsw.bin` persist done; R2: smoke asserts graph-loaded on cache hit** |
 
 ### Phase 1 delivered
 
@@ -482,6 +482,14 @@ restores the graph without re-inserting — CLI reports
 `sem_hnsw_loaded`. Load validation is bounds-checked end to end
 (entry/neighbour refs in range, `n_layers ≤ MAX_LEVEL+1`, exact
 end-of-file); any violation → rebuild + overwrite.
+
+**R2 — harness polish.** `scripts/smoke_semantic_persist.sh` now asserts
+the graph half, not just the vectors: armed run 1 must print
+`sem_hnsw_loaded=false` (graph built), armed run 2 must print both
+`+N sem (cached)` and `sem_hnsw_loaded=true` (graph restored — a vec-only
+hit would show `false`), `hnsw.bin` must exist in the bundle, and the
+flag-off run must show no sem fields at all. Confirmed-group membership
+is diffed identical across off/on1/on2.
 
 Remaining follow-ups: multi-node semantic/HNSW sharding (per-shard graph
 or per-node full graph) once the `ITMIHN1` seam is real; graph format

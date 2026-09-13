@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Semantic-persist smoke (Phase 5 R2+): with ITRACE_SEMANTIC=1 (forced
-# stub — no model weights) and ITRACE_MIH_INDEX_DIR set, dedup the same
-# project twice on the SAME index dir — run 1 builds the
-# project_{id}_sem/ bundle, run 2 must hit it ("+N sem (cached)") —
-# while confirmed duplicate groups match the flag-off baseline. The stub
-# is NOT production DINOv2; this exercises the persist path + wiring
-# only. Re-run with a distinct RUN_TAG for double-regression evidence.
+# Semantic-persist smoke (Phase 5 R2+, hardened Phase 6 R2): with
+# ITRACE_SEMANTIC=1 (forced stub — no model weights) and
+# ITRACE_MIH_INDEX_DIR set, dedup the same project twice on the SAME
+# index dir — run 1 builds the project_{id}_sem/ bundle (vectors +
+# ITSEMH1 hnsw.bin graph), run 2 must hit BOTH ("+N sem (cached)" AND
+# sem_hnsw_loaded=true — the cache hit proves the graph was restored,
+# not just the vectors). Confirmed duplicate groups must match the
+# flag-off baseline. The stub is NOT production DINOv2; this exercises
+# the persist path + wiring only. Re-run with a distinct RUN_TAG for
+# double-regression evidence.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -74,19 +77,26 @@ sem2=$(grep -oE '\+[0-9]+ sem' "$BASE/on2.txt" | grep -oE '[0-9]+' || true)
   || { echo "run1: no semantic candidates (want +N sem, N>=1)" >&2; exit 1; }
 [[ -n "$sem2" && "$sem2" -ge 1 ]] \
   || { echo "run2: no semantic candidates (want +N sem, N>=1)" >&2; exit 1; }
-# (b) run1 builds the bundle, run2 must hit it: "(cached)" only on run2,
+# (b) run1 builds the bundle, run2 must hit BOTH halves: "(cached)" only
+# on run2, `sem_hnsw_loaded` false→true (graph restored, not rebuilt),
 # and the project_{id}_sem/ bundle must exist on disk.
 grep -q 'sem (cached)' "$BASE/on1.txt" \
   && { echo "run1 unexpectedly hit the cache" >&2; exit 1; }
+grep -q 'sem_hnsw_loaded=false' "$BASE/on1.txt" \
+  || { echo "run1 must report sem_hnsw_loaded=false (graph built)" >&2; exit 1; }
 grep -qE '\+[0-9]+ sem \(cached\)' "$BASE/on2.txt" \
   || { echo "run2 did not hit the semantic bundle (want '+N sem (cached)')" >&2; exit 1; }
-for f in meta.json image_ids.bin vectors.bin; do
+grep -q 'sem_hnsw_loaded=true' "$BASE/on2.txt" \
+  || { echo "run2 did not restore the HNSW graph (want sem_hnsw_loaded=true)" >&2; exit 1; }
+for f in meta.json image_ids.bin vectors.bin hnsw.bin; do
   [[ -f "$IDX/project_${PID}_sem/$f" ]] \
     || { echo "missing bundle file project_${PID}_sem/$f" >&2; exit 1; }
 done
-# (c) Flag-off run must not show the sem note.
+# (c) Flag-off run must not show any sem fields.
 grep -qE '\+[0-9]+ sem' "$BASE/off.txt" \
   && { echo "flag-off run unexpectedly shows sem note" >&2; exit 1; }
+grep -q 'sem_hnsw_loaded' "$BASE/off.txt" \
+  && { echo "flag-off run unexpectedly shows sem_hnsw_loaded" >&2; exit 1; }
 # (d) Confirmed groups must not shrink under the armed channel, cached
 # or not — membership identical to the flag-off baseline.
 off_groups=$(grep -c "^duplicate group" "$BASE/off.txt")
