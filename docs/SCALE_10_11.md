@@ -211,7 +211,8 @@ still forces a rebuild.
 | 1 | `ImageStore` trait extraction + feature-fingerprint MIH invalidation | **done** |
 | 2 | `PostgresStore` backend behind the `ImageStore` trait | **done** |
 | 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
-| 4 | Semantic DINOv2/HNSW recall channel | **in progress — R2: stub embedder + dedup union wired** |
+| 4 | Semantic DINOv2/HNSW recall channel | **done — foundation** (stub + HNSW + wiring; R3 double regression) |
+| 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **in progress — R1: `semantic-onnx` skeleton** |
 
 ### Phase 1 delivered
 
@@ -331,17 +332,18 @@ or the downstream `dedup_confirmed` re-scoring. Real transport, service
 discovery, and wiring the `ITMIHN1` per-node dirs into the persistent
 project bundle flow are follow-up work.
 
-### Phase 4 (in progress) — semantic recall channel
+### Phase 4 (done — foundation) — semantic recall channel
 
 `itrace_core::semantic` adds the third recall channel's foundation —
 dense-embedding ANN retrieval for pairs whose images share scene semantics
 but diverge beyond every hash radius (heavy recolor/composite transforms):
 
 - **`SemanticEmbedder`** — object-safe pluggable backend
-  (`dim` / `embed_bytes` / `embed_path`). Production target is a DINOv2
-  ONNX model loaded from a weights path (`ort` + `ITRACE_SEMANTIC_MODEL`);
-  **that download is a follow-up and never happens in CI** — tests and
-  wiring use in-crate stubs.
+  (`dim` / `embed_bytes` / `embed_path`). The production impl is
+  `OnnxSemanticEmbedder` (Phase 5, `semantic-onnx` feature) loading a
+  DINOv2 ONNX model from `ITRACE_SEMANTIC_MODEL`; **weights downloads are
+  a follow-up and never happen in CI** — tests and wiring use in-crate
+  stubs.
 - **`StubEmbedder`** (R2) — deterministic dev/test stand-in: decode →
   grayscale → block-average onto a 16×16 grid (256-dim), mean-subtracted;
   undecodable bytes fall back to a blake3-seeded pseudo-vector so a scan
@@ -359,8 +361,9 @@ but diverge beyond every hash radius (heavy recolor/composite transforms):
 
 **Wiring (default off):** with `ITRACE_SEMANTIC=1`, `embedder_from_env()`
 resolves a backend — `ITRACE_SEMANTIC_MODEL` set + `ITRACE_SEMANTIC_STUB`
-unset → `None` (a configured production path never silently stubs);
-otherwise `StubEmbedder`. Both dedup entry points then embed each indexed
+unset → the ONNX backend is attempted and any load failure resolves to
+`None` (a configured production path never silently stubs); otherwise
+`StubEmbedder`. Both dedup entry points then embed each indexed
 image (`run_cli_dedup` / `run_dedup_scan` re-decode blobs per scan — the
 persisted-embedding precompute is the follow-up), run
 `semantic_candidates` at `ITRACE_SEMANTIC_K` / `ITRACE_SEMANTIC_MIN_COS`,
@@ -371,16 +374,50 @@ still needs the existing hash/crop confirmation, so the channel can add
 recall without silently widening merges. Flag unset → the path is skipped
 and dedup output is bit-identical to the pre-R2 baseline.
 
-**Follow-ups:** DINOv2 ONNX weights + `ort` backend; persisted
+**Follow-ups:** real DINOv2 weights + calibration (Phase 5; the
+`semantic-onnx` backend skeleton is in — see below); persisted
 `project_{id}_sem/` bundle (`image_ids.bin` + serialized graph) with the
 same feature-fingerprint invalidation as `ITMIHP1`/`ITMIHC1`; sharding the
 graph across nodes (per-shard HNSW or per-node full graph) once the
 `ITMIHN1` transport seam is real.
 
+### Phase 5 (in progress) — ONNX semantic backend
+
+`itrace_core::semantic_onnx` (R1, behind the opt-in `semantic-onnx`
+cargo feature) provides **`OnnxSemanticEmbedder`**: a `SemanticEmbedder`
+over `ort` built with `load-dynamic`, so `libonnxruntime` is `dlopen`'d
+at run time and **nothing is linked or downloaded at build time** —
+default builds and CI never see the dependency.
+
+- **Dylib resolution:** `ITRACE_ORT_DYLIB` → `ORT_DYLIB_PATH` → default
+  soname (`libonnxruntime.so`) next to the executable / loader path.
+- **Weights:** `ITRACE_SEMANTIC_MODEL` points at a local `.onnx` file.
+  `ort` *panics* on a missing dylib, so `OnnxSemanticEmbedder::load`
+  traps that under `catch_unwind` — missing/invalid weights or a
+  missing/incompatible runtime resolve to `Err` → `None` → **inert
+  channel, never a silent stub**.
+- **Model contract:** one f32 NCHW input `[1, 3, 224, 224]`, ImageNet
+  mean/std (`pixel_values` input preferred, else first declared input);
+  first output must be f32 `[1, D]` (pooled) or `[1, T, D]` (token map →
+  CLS row). Arbitrary ONNX graphs are rejected, not guessed.
+- **Testing without downloads:** `resolve_embedder` precedence is
+  covered by a mock-loader unit test; feature-gated tests cover
+  `Err`-not-panic load failures, the preprocess tensor, and a
+  ~200-byte hand-encoded `Flatten` ONNX fixture that runs `load` +
+  `embed_bytes` end-to-end on a dev box with a runtime installed
+  (skipped on CI). **Real DINOv2 weights are never fetched by tests or
+  CI.**
+
+R2 candidates: real `dinov2_vits14`/`vitb14` weights + recall
+calibration on transformed-image fixtures; persisted `project_{id}_sem/`
+bundle (`image_ids.bin` + serialized HNSW + feature fingerprint) so
+embeddings aren't recomputed per scan.
+
 | Variable | Effect |
 |----------|--------|
 | `ITRACE_SEMANTIC` | `1`/`true`/`on` arms the semantic channel (unset/`0`/`false`/`off` = off) |
-| `ITRACE_SEMANTIC_MODEL` | DINOv2 ONNX weights path for the production backend (follow-up; when set without `ITRACE_SEMANTIC_STUB` the channel stays inert — no silent stub) |
+| `ITRACE_SEMANTIC_MODEL` | Local DINOv2 ONNX weights path; with `semantic-onnx` builds the backend loads it — missing/invalid path or missing runtime resolves inert, never silently to the stub |
+| `ITRACE_ORT_DYLIB` | Explicit `libonnxruntime` shared-library path for `semantic-onnx` builds (falls back to `ORT_DYLIB_PATH`, then the default soname) |
 | `ITRACE_SEMANTIC_STUB` | `1` forces `StubEmbedder` even when `ITRACE_SEMANTIC_MODEL` is set; stub is auto-selected whenever the channel is armed with no model path |
 | `ITRACE_SEMANTIC_K` | Per-image ANN probe width (default 32) |
 | `ITRACE_SEMANTIC_MIN_COS` | Cosine floor for a semantic candidate (default 0.75) |

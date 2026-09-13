@@ -17,9 +17,15 @@ lopdf.workspace = true
 zip.workspace = true
 flate2 = "1"
 akaze = { version = "0.7", optional = true }
+ort = { workspace = true, optional = true }
 
 [features]
 default = []
 akaze = ["dep:akaze"]
+# ONNX Runtime `SemanticEmbedder` backend (`OnnxSemanticEmbedder`).
+# Opt-in: needs a libonnxruntime dylib at run time (ITRACE_ORT_DYLIB /
+# ORT_DYLIB_PATH / default soname). CI builds stay on `default` and
+# never see the dependency.
+semantic-onnx = ["dep:ort"]
 
 

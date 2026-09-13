@@ -31,6 +31,12 @@ lopdf = "0.36"
 zip = { version = "2.4", default-features = false, features = ["deflate"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# ONNX Runtime bindings. `load-dynamic` dlopens libonnxruntime at run
+# time — nothing is linked or downloaded at build time (the
+# `download-binaries` default feature stays off).
+ort = { version = "=2.0.0-rc.10", default-features = false, features = [
+    "load-dynamic",
+] }
 
 [profile.release]
 lto = true

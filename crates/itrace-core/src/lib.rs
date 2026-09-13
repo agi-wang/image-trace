@@ -15,6 +15,8 @@ pub mod index;
 pub mod metrics;
 pub mod ownership;
 pub mod semantic;
+#[cfg(feature = "semantic-onnx")]
+pub mod semantic_onnx;
 pub mod slice;
 
 use serde::{Deserialize, Serialize};

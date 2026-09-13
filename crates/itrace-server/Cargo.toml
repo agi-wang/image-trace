@@ -22,3 +22,5 @@ mimalloc = "0.1"
 
 [features]
 akaze = ["itrace-core/akaze"]
+# ONNX semantic backend (needs a libonnxruntime dylib at run time).
+semantic-onnx = ["itrace-core/semantic-onnx"]

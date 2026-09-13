@@ -39,6 +39,10 @@ jobs:
       - run: cargo build --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Compile the opt-in ONNX backend (ort load-dynamic: no link step,
+      # no binary/model download — the dylib is dlopen'd at run time).
+      - run: cargo clippy -p itrace-core --all-targets --features semantic-onnx -- -D warnings
+      - run: cargo test -p itrace-core --features semantic-onnx
 
   e2e:
     runs-on: ubuntu-latest
