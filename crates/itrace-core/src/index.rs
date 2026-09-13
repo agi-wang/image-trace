@@ -234,6 +234,48 @@ impl MihIndex {
         self.insert(key, owner);
         hits
     }
+
+    /// Write the compact shard payload format used by `shards/NNNN.bin`:
+    /// `u64 n`, then `n × u64` keys, then `n × u32` owners (LE).
+    pub(crate) fn save_bin(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&(self.keys.len() as u64).to_le_bytes())?;
+        for &k in &self.keys {
+            f.write_all(&k.to_le_bytes())?;
+        }
+        for &o in &self.owners {
+            f.write_all(&o.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Load a `NNNN.bin` written by [`save_bin`](Self::save_bin); bucket
+    /// tables are rebuilt by replaying inserts.
+    pub(crate) fn load_bin(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)?;
+        let mut nbuf = [0u8; 8];
+        f.read_exact(&mut nbuf)?;
+        let n = u64::from_le_bytes(nbuf) as usize;
+        let mut key_buf = [0u8; 8];
+        let mut keys = Vec::with_capacity(n);
+        for _ in 0..n {
+            f.read_exact(&mut key_buf)?;
+            keys.push(u64::from_le_bytes(key_buf));
+        }
+        let mut owner_buf = [0u8; 4];
+        let mut owners = Vec::with_capacity(n);
+        for _ in 0..n {
+            f.read_exact(&mut owner_buf)?;
+            owners.push(u32::from_le_bytes(owner_buf));
+        }
+        let mut idx = Self::new();
+        for (&k, &o) in keys.iter().zip(&owners) {
+            idx.insert(k, o);
+        }
+        Ok(idx)
+    }
 }
 
 /// Route `key` to a shard id using the high `shard_bits` of the key.
@@ -336,7 +378,6 @@ impl ShardedMihIndex {
 
     /// Persist to `path/` (`meta.json` + `shards/NNNN.bin`). See module docs.
     pub fn save_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
-        use std::io::Write;
         std::fs::create_dir_all(path)?;
         let shards_dir = path.join("shards");
         std::fs::create_dir_all(&shards_dir)?;
@@ -353,16 +394,7 @@ impl ShardedMihIndex {
             })?,
         )?;
         for (i, shard) in self.shards.iter().enumerate() {
-            let fname = format!("{i:04}.bin");
-            let mut f = std::fs::File::create(shards_dir.join(fname))?;
-            let n = shard.keys.len() as u64;
-            f.write_all(&n.to_le_bytes())?;
-            for &k in &shard.keys {
-                f.write_all(&k.to_le_bytes())?;
-            }
-            for &o in &shard.owners {
-                f.write_all(&o.to_le_bytes())?;
-            }
+            shard.save_bin(&shards_dir.join(format!("{i:04}.bin")))?;
         }
         Ok(())
     }
@@ -370,7 +402,6 @@ impl ShardedMihIndex {
     /// Load a directory written by [`save_dir`]. Rebuilds MIH tables from
     /// the compact key/owner arrays.
     pub fn load_dir(path: &std::path::Path) -> std::io::Result<Self> {
-        use std::io::Read;
         let meta_bytes = std::fs::read(path.join("meta.json"))?;
         let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -403,26 +434,7 @@ impl ShardedMihIndex {
         let mut idx = Self::new(shard_bits);
         let shards_dir = path.join("shards");
         for sid in 0..idx.shard_count() {
-            let fname = format!("{sid:04}.bin");
-            let mut f = std::fs::File::open(shards_dir.join(fname))?;
-            let mut nbuf = [0u8; 8];
-            f.read_exact(&mut nbuf)?;
-            let n = u64::from_le_bytes(nbuf) as usize;
-            let mut key_buf = [0u8; 8];
-            let mut owner_buf = [0u8; 4];
-            let mut keys = Vec::with_capacity(n);
-            for _ in 0..n {
-                f.read_exact(&mut key_buf)?;
-                keys.push(u64::from_le_bytes(key_buf));
-            }
-            let mut owners = Vec::with_capacity(n);
-            for _ in 0..n {
-                f.read_exact(&mut owner_buf)?;
-                owners.push(u32::from_le_bytes(owner_buf));
-            }
-            for (&k, &o) in keys.iter().zip(&owners) {
-                idx.shards[sid].insert(k, o);
-            }
+            idx.shards[sid] = MihIndex::load_bin(&shards_dir.join(format!("{sid:04}.bin")))?;
         }
         Ok(idx)
     }
@@ -924,6 +936,53 @@ pub fn dedup_candidates(entries: &[DedupKeys], radius: u32, min_votes: u32) -> V
     out
 }
 
+/// Dev/test knob: `ITRACE_MIH_NODES=N` (N > 1) makes the **non-persistent**
+/// candidate scan run on an in-process [`crate::ownership::MultiNodeMihIndex`]
+/// — same recall contract, exercised through shard-ownership routing +
+/// scatter/gather. Default/unset/invalid = 1 → plain `ShardedMihIndex`.
+/// Persistent project bundles (`dedup_candidates_sharded_cached` with a dir)
+/// always use the single-node `ITMIHP1` format.
+fn mih_node_count() -> u32 {
+    std::env::var("ITRACE_MIH_NODES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Gate-index used by the in-memory candidate scan: monolithic by default,
+/// multi-node when `ITRACE_MIH_NODES` > 1. Both expose identical
+/// insert/query semantics — `MultiNodeMihIndex` parity is property-tested
+/// against `ShardedMihIndex` in `crate::ownership`.
+enum GateIndex {
+    Mono(ShardedMihIndex),
+    Multi(crate::ownership::MultiNodeMihIndex),
+}
+
+impl GateIndex {
+    fn new(shard_bits: u32, nodes: u32) -> Self {
+        if nodes > 1 {
+            Self::Multi(crate::ownership::MultiNodeMihIndex::even(shard_bits, nodes))
+        } else {
+            Self::Mono(ShardedMihIndex::new(shard_bits))
+        }
+    }
+
+    fn insert(&mut self, key: u64, owner: u32) {
+        match self {
+            Self::Mono(i) => i.insert(key, owner),
+            Self::Multi(i) => i.insert(key, owner),
+        }
+    }
+
+    fn query_into(&self, key: u64, radius: u32, out: &mut Vec<u32>) {
+        match self {
+            Self::Mono(i) => i.query_into(key, radius, out),
+            Self::Multi(i) => i.query_into(key, radius, out),
+        }
+    }
+}
+
 /// Same contract as [`dedup_candidates`] but each per-algo index is a
 /// [`ShardedMihIndex`]. Server `/dedup` and CLI `dedup` use this path
 /// (via `resolve_shard_bits` / `dedup_confirmed`).
@@ -937,10 +996,11 @@ pub fn dedup_candidates_sharded(
         return Vec::new();
     }
     let m = entries[0].variant_keys.len();
-    let indexes: Vec<ShardedMihIndex> = (0..m)
+    let nodes = mih_node_count();
+    let indexes: Vec<GateIndex> = (0..m)
         .into_par_iter()
         .map(|a| {
-            let mut idx = ShardedMihIndex::new(shard_bits);
+            let mut idx = GateIndex::new(shard_bits, nodes);
             let mut uniq: Vec<u64> = Vec::new();
             for (i, e) in entries.iter().enumerate() {
                 uniq.clear();
@@ -1489,6 +1549,25 @@ mod tests {
         let (_n, conf0) = dedup_confirmed(&entries, 7, 0.5, 2, 0);
         let (_n, conf5) = dedup_confirmed(&entries, 7, 0.5, 2, 5);
         assert_eq!(conf0, conf5);
+    }
+
+    /// `ITRACE_MIH_NODES>1` routes the in-memory scan through
+    /// `MultiNodeMihIndex`; candidate pairs must be identical to the
+    /// single-node path.
+    #[test]
+    fn dedup_candidates_sharded_multi_node_env_parity() {
+        let entries = sample_entries(40);
+        let want = dedup_candidates_sharded(&entries, 7, 2, 5); // env unset → mono
+        std::env::set_var("ITRACE_MIH_NODES", "4");
+        let got = dedup_candidates_sharded(&entries, 7, 2, 5);
+        std::env::remove_var("ITRACE_MIH_NODES");
+        assert_eq!(want, got);
+        // explicit 1 = mono; invalid values fall back to mono too
+        std::env::set_var("ITRACE_MIH_NODES", "bogus");
+        assert_eq!(want, dedup_candidates_sharded(&entries, 7, 2, 5));
+        std::env::set_var("ITRACE_MIH_NODES", "1");
+        assert_eq!(want, dedup_candidates_sharded(&entries, 7, 2, 5));
+        std::env::remove_var("ITRACE_MIH_NODES");
     }
 
     #[test]

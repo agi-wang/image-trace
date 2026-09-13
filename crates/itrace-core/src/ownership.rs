@@ -281,11 +281,210 @@ impl MultiNodeMihIndex {
         self.query_with_nodes(key, radius).0
     }
 
+    /// `ShardedMihIndex`-compatible `query_into`: clears `out` and appends
+    /// the sorted, deduplicated owner set.
+    pub fn query_into(&self, key: u64, radius: u32, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend_from_slice(&self.query(key, radius));
+    }
+
     /// Insert `key` for `owner`; return prior owners within `radius`.
     pub fn insert_query(&mut self, key: u64, owner: u32, radius: u32) -> Vec<u32> {
         let hits = self.query(key, radius);
         self.insert(key, owner);
         hits
+    }
+
+    /// Persist the whole cluster under `path/` — top-level `meta.json`
+    /// (`ITMIHN1`: shard_bits + ownership ranges) plus one `node_N/`
+    /// directory per node, each written by [`NodeIndex::save_dir`].
+    pub fn save_dir(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if path.exists() {
+            std::fs::remove_dir_all(path)?;
+        }
+        std::fs::create_dir_all(path)?;
+        let meta = serde_json::json!({
+            "magic": NODE_MIH_MAGIC,
+            "version": 1,
+            "shard_bits": self.shard_bits(),
+            "key_count": self.len(),
+            "ranges": self
+                .ownership
+                .ranges()
+                .iter()
+                .map(|r| serde_json::json!({"start": r.start, "end": r.end}))
+                .collect::<Vec<_>>(),
+        });
+        write_meta(&path.join("meta.json"), &meta)?;
+        for (node_id, node) in self.nodes.iter().enumerate() {
+            node.save_dir(
+                &path.join(node_dir_name(node_id as u32)),
+                node_id as u32,
+                self.shard_bits(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Load a cluster written by [`save_dir`](Self::save_dir).
+    pub fn load_dir(path: &std::path::Path) -> std::io::Result<Self> {
+        let meta = read_meta(&path.join("meta.json"))?;
+        let shard_bits = check_meta(&meta, path)?;
+        let ranges: Vec<ShardRange> = meta
+            .get("ranges")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad_data("missing ranges"))?
+            .iter()
+            .map(|r| {
+                let get = |k: &str| -> std::io::Result<u32> {
+                    r.get(k)
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32)
+                        .ok_or_else(|| bad_data("range missing start/end"))
+                };
+                Ok(ShardRange {
+                    start: get("start")?,
+                    end: get("end")?,
+                })
+            })
+            .collect::<std::io::Result<_>>()?;
+        let ownership = ShardOwnership::from_ranges(shard_bits, ranges).map_err(bad_data)?;
+        let mut nodes = Vec::with_capacity(ownership.node_count() as usize);
+        for node_id in 0..ownership.node_count() {
+            nodes.push(NodeIndex::load_dir(
+                &path.join(node_dir_name(node_id)),
+                node_id,
+                shard_bits,
+            )?);
+        }
+        Ok(Self { ownership, nodes })
+    }
+
+    /// Persist just `node_id`'s owned shards (the per-node unit a real
+    /// deployment would write on each host).
+    pub fn save_node_dir(&self, node_id: u32, path: &std::path::Path) -> std::io::Result<()> {
+        self.nodes[node_id as usize].save_dir(path, node_id, self.shard_bits())
+    }
+}
+
+/// Magic for multi-node index bundles (top-level + per-node meta).
+const NODE_MIH_MAGIC: &str = "ITMIHN1";
+
+fn node_dir_name(node_id: u32) -> String {
+    format!("node_{node_id}")
+}
+
+fn bad_data(msg: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
+}
+
+fn write_meta(path: &std::path::Path, meta: &serde_json::Value) -> std::io::Result<()> {
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(meta).map_err(bad_data)?,
+    )
+}
+
+fn read_meta(path: &std::path::Path) -> std::io::Result<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(path)?).map_err(bad_data)
+}
+
+/// Validate magic/version, return `shard_bits`.
+fn check_meta(meta: &serde_json::Value, path: &std::path::Path) -> std::io::Result<u32> {
+    let magic = meta.get("magic").and_then(|v| v.as_str()).unwrap_or("");
+    if magic != NODE_MIH_MAGIC {
+        return Err(bad_data(format!("bad mih-node magic in {path:?}: {magic}")));
+    }
+    if meta.get("version").and_then(|v| v.as_u64()).unwrap_or(0) != 1 {
+        return Err(bad_data("unsupported mih-node version"));
+    }
+    let bits = meta
+        .get("shard_bits")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| bad_data("missing shard_bits"))? as u32;
+    if bits > 16 {
+        return Err(bad_data(format!("shard_bits {bits} > 16")));
+    }
+    Ok(bits)
+}
+
+impl NodeIndex {
+    /// Node-local layout: `meta.json` (magic `ITMIHN1`, `node_id`, owned
+    /// `shard_ids` — only non-empty shards are listed) + `shards/NNNN.bin`
+    /// in the same compact format as `ShardedMihIndex` (`u64 n`, `n×u64`
+    /// keys, `n×u32` owners, LE).
+    fn save_dir(
+        &self,
+        path: &std::path::Path,
+        node_id: u32,
+        shard_bits: u32,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(path.join("shards"))?;
+        let mut shard_ids = Vec::new();
+        let mut key_count = 0usize;
+        for (i, shard) in self.shards.iter().enumerate() {
+            if shard.is_empty() {
+                continue;
+            }
+            let sid = self.range.start + i as u32;
+            shard.save_bin(&path.join("shards").join(format!("{sid:04}.bin")))?;
+            shard_ids.push(sid);
+            key_count += shard.len();
+        }
+        let meta = serde_json::json!({
+            "magic": NODE_MIH_MAGIC,
+            "version": 1,
+            "shard_bits": shard_bits,
+            "node_id": node_id,
+            "range": {"start": self.range.start, "end": self.range.end},
+            "shard_ids": shard_ids,
+            "key_count": key_count,
+        });
+        write_meta(&path.join("meta.json"), &meta)
+    }
+
+    fn load_dir(path: &std::path::Path, node_id: u32, shard_bits: u32) -> std::io::Result<Self> {
+        let meta = read_meta(&path.join("meta.json"))?;
+        let stored_bits = check_meta(&meta, path)?;
+        let range_v = meta
+            .get("range")
+            .ok_or_else(|| bad_data("missing range"))?;
+        let get = |k: &str| -> std::io::Result<u32> {
+            range_v
+                .get(k)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .ok_or_else(|| bad_data("range missing start/end"))
+        };
+        let range = ShardRange {
+            start: get("start")?,
+            end: get("end")?,
+        };
+        if meta.get("node_id").and_then(|v| v.as_u64()) != Some(node_id as u64) {
+            return Err(bad_data(format!(
+                "node dir {path:?} does not hold node {node_id}"
+            )));
+        }
+        let mut shards: Vec<MihIndex> =
+            (0..range.len()).map(|_| MihIndex::new()).collect();
+        for v in meta
+            .get("shard_ids")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad_data("missing shard_ids"))?
+        {
+            let sid = v.as_u64().ok_or_else(|| bad_data("bad shard_ids"))? as u32;
+            if !range.contains(sid) {
+                return Err(bad_data(format!("shard {sid} outside node range {range:?}")));
+            }
+            shards[(sid - range.start) as usize] =
+                MihIndex::load_bin(&path.join("shards").join(format!("{sid:04}.bin")))?;
+        }
+        if stored_bits != shard_bits {
+            return Err(bad_data(format!(
+                "node {node_id} shard_bits {stored_bits} != cluster {shard_bits}"
+            )));
+        }
+        Ok(Self { range, shards })
     }
 }
 
@@ -463,6 +662,104 @@ mod tests {
         // full-radius query legitimately contacts every node
         let (_, contacted) = multi8.query_with_nodes(key8, 16);
         assert_eq!(contacted, (0..8).collect::<Vec<u32>>());
+    }
+
+    /// Crop-channel shape: many keys per owner (window slots × variants),
+    /// a single index, small radius — the workload `crophash_keys` feeds.
+    #[test]
+    fn multi_node_parity_crop_like_many_keys_per_owner() {
+        let shard_bits = 5;
+        let mut rng = Rng(0x00c0_ffee);
+        let mut mono = ShardedMihIndex::new(shard_bits);
+        let mut multi = MultiNodeMihIndex::even(shard_bits, 4);
+        // 200 owners × ~30 keys each, clustered like per-image variants
+        for owner in 0..200u32 {
+            let base = rng.next();
+            for _ in 0..30 {
+                let k = base ^ (rng.next() & 0xffff); // low-bit variants
+                mono.insert(k, owner);
+                multi.insert(k, owner);
+            }
+        }
+        for radius in [0u32, 2, 4, 8] {
+            for _ in 0..300 {
+                let q = rng.next();
+                assert_eq!(multi.query(q, radius), mono.query(q, radius));
+            }
+        }
+    }
+
+    /// Round-trip: save each node to disk, reload the cluster, and require
+    /// query parity against both the live multi-node index and a monolithic
+    /// `ShardedMihIndex` built from the same keys.
+    #[test]
+    fn multi_node_persist_roundtrip_parity() {
+        let shard_bits = 4;
+        let node_count = 4;
+        let dir = std::env::temp_dir().join(format!(
+            "itrace-mnode-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut rng = Rng(42);
+        let mut mono = ShardedMihIndex::new(shard_bits);
+        let mut multi = MultiNodeMihIndex::even(shard_bits, node_count);
+        for owner in 0..500u32 {
+            let k = rng.next();
+            mono.insert(k, owner);
+            multi.insert(k, owner);
+        }
+
+        // Per-node save (what a real deployment writes on each host)…
+        for node in 0..node_count {
+            multi
+                .save_node_dir(node, &dir.join(format!("node_{node}")))
+                .expect("save node");
+        }
+        // …but shard ids are only reassembled through the cluster meta, so
+        // write a full cluster bundle too and load through it.
+        multi.save_dir(&dir).expect("save cluster");
+        let loaded = MultiNodeMihIndex::load_dir(&dir).expect("load cluster");
+        assert_eq!(loaded.len(), multi.len());
+        assert_eq!(
+            loaded.ownership().ranges(),
+            multi.ownership().ranges()
+        );
+
+        for radius in [0u32, 1, 3, 10] {
+            for _ in 0..200 {
+                let q = rng.next();
+                let want = mono.query(q, radius);
+                assert_eq!(loaded.query(q, radius), want, "radius={radius}");
+                assert_eq!(multi.query(q, radius), want);
+            }
+        }
+        // Node dirs only contain their own shard files — check ownership
+        // boundaries held on disk (node 0 owns shards 0..4 at bits=4).
+        let node0_shards = std::fs::read_dir(dir.join("node_0/shards"))
+            .unwrap()
+            .count();
+        let total_shards: usize = (0..node_count)
+            .map(|n| {
+                std::fs::read_dir(dir.join(format!("node_{n}/shards")))
+                    .unwrap()
+                    .count()
+            })
+            .sum();
+        assert!(node0_shards <= 4);
+        assert!(total_shards <= 16);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_node_persist_rejects_wrong_magic() {
+        let dir = std::env::temp_dir().join(format!("itrace-mnode-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), br#"{"magic":"ITMIH1","version":1}"#).unwrap();
+        assert!(MultiNodeMihIndex::load_dir(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
