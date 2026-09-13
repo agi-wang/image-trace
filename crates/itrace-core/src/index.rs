@@ -1019,9 +1019,12 @@ fn confirm_pairs(
     confirmed
 }
 
+/// Confirmed duplicate pairs: `(entry_i, entry_j, score)` with `i < j`
+/// indexing into the caller's `entries` slice.
+pub type ConfirmedPairs = Vec<(usize, usize, f64)>;
+
 /// MIH candidate recall then cross-variant max score verification.
-/// Returns `(candidate_pair_count, confirmed)` where each confirmed entry is
-/// `(entry_i, entry_j, score)` with `i < j` indexing into `entries`.
+/// Returns `(candidate_pair_count, confirmed)`.
 ///
 /// Uses [`dedup_candidates_sharded`] with `shard_bits` (`0` = one shard).
 pub fn dedup_confirmed(
@@ -1030,7 +1033,7 @@ pub fn dedup_confirmed(
     threshold: f64,
     min_votes: u32,
     shard_bits: u32,
-) -> (usize, Vec<(usize, usize, f64)>) {
+) -> (usize, ConfirmedPairs) {
     let pairs = dedup_candidates_sharded(entries, radius, min_votes, shard_bits);
     let confirmed = confirm_pairs(entries, &pairs, threshold);
     (pairs.len(), confirmed)
@@ -1045,7 +1048,7 @@ pub fn dedup_confirmed_cached(
     min_votes: u32,
     shard_bits: u32,
     project_index_dir: Option<&std::path::Path>,
-) -> std::io::Result<(usize, Vec<(usize, usize, f64)>, bool)> {
+) -> std::io::Result<(usize, ConfirmedPairs, bool)> {
     let (pairs, loaded) =
         dedup_candidates_sharded_cached(entries, radius, min_votes, shard_bits, project_index_dir)?;
     let confirmed = confirm_pairs(entries, &pairs, threshold);
