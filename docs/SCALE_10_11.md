@@ -285,14 +285,50 @@ Parity vs monolithic `ShardedMihIndex` is property-tested (random keys,
 radii 0..shard_bits+4, 2- and 4-node layouts plus `shard_bits=0`); a
 dedicated test proves `radius < shard_bits` queries skip whole nodes.
 
+**Persisting owned shards (`ITMIHN1`).** `MultiNodeMihIndex::save_dir`
+writes a cluster bundle; `save_node_dir(node_id, dir)` writes just one
+node's share — the unit a real deployment persists per host:
+
+```text
+<dir>/
+  meta.json      {"magic":"ITMIHN1","version":1,"shard_bits":N,
+                  "key_count":K,"ranges":[{"start":S,"end":E}, ...]}
+  node_0/
+    meta.json    {"magic":"ITMIHN1","version":1,"shard_bits":N,
+                  "node_id":0,"range":{...},
+                  "shard_ids":[...non-empty owned shards...],
+                  "key_count":Ki}
+    shards/
+      NNNN.bin   only owned, non-empty shards; same LE payload as
+                 ITMIH1 (u64 n | n×u64 keys | n×u32 owners)
+  node_1/ ...
+```
+
+`load_dir` rebuilds `ShardOwnership` from the stored ranges (validated
+for exact coverage) and replays each node's bins — empty owned shards
+stay in memory only. Round-trip parity vs the live index and a
+monolithic `ShardedMihIndex` is tested.
+
+**Simulating N nodes.** `ITRACE_MIH_NODES=N` (N > 1) routes the
+non-persistent gate scan (`dedup_candidates_sharded`, used by
+`dedup_confirmed` when no index dir is set) through a
+`MultiNodeMihIndex` — inserts routed by ownership, queries
+scatter/gathered. Default/unset/invalid = 1 → unchanged
+`ShardedMihIndex`. Persistent `ITMIHP1`/`ITMIHC1` bundles always stay
+single-node. Example:
+
+```bash
+ITRACE_MIH_NODES=4 itrace-cli dedup 7   # 4 logical nodes in-process
+```
+
 **RPC seam:** a networked deployment keeps `ShardOwnership` on a
 coordinator, replaces each `NodeIndex` with a transport stub
 implementing `insert(shard_id, key, owner)` /
 `query_shards(key, radius, &[shard_ids])`, and merges replies exactly
 as `query_with_nodes` does — no semantic change to probe sets, recall,
 or the downstream `dedup_confirmed` re-scoring. Real transport, service
-discovery, and per-node `ITMIH1` persistence of owned shards are
-follow-up work.
+discovery, and wiring the `ITMIHN1` per-node dirs into the persistent
+project bundle flow are follow-up work.
 
 ## Microbench
 
