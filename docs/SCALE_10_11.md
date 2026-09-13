@@ -172,6 +172,7 @@ verification cost is bounded by `min_hits` + radius, not pair count.
 | `ITRACE_MIH_SHARD_BITS` | Default shard bit-width when body/CLI omit override |
 | `ITRACE_MIH_INDEX_DIR` | If set, dedup load-or-builds `{DIR}/project_{id}/` gate-index bundle. Unset → identical in-memory rebuild behaviour as before. |
 | `ITRACE_CROP_MIN_HITS` | Distinct probe-key hits required for a crop-channel candidate (default 2) |
+| `ITRACE_SEMANTIC*` | Semantic channel knobs — see Phase 4 table below |
 
 ### Example
 
@@ -210,7 +211,7 @@ still forces a rebuild.
 | 1 | `ImageStore` trait extraction + feature-fingerprint MIH invalidation | **done** |
 | 2 | `PostgresStore` backend behind the `ImageStore` trait | **done** |
 | 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
-| 4 | Semantic DINOv2/HNSW recall channel | planned |
+| 4 | Semantic DINOv2/HNSW recall channel | **in progress — R1: embedder trait + in-memory ANN** |
 
 ### Phase 1 delivered
 
@@ -329,6 +330,48 @@ as `query_with_nodes` does — no semantic change to probe sets, recall,
 or the downstream `dedup_confirmed` re-scoring. Real transport, service
 discovery, and wiring the `ITMIHN1` per-node dirs into the persistent
 project bundle flow are follow-up work.
+
+### Phase 4 (in progress) — semantic recall channel
+
+`itrace_core::semantic` adds the third recall channel's foundation —
+dense-embedding ANN retrieval for pairs whose images share scene semantics
+but diverge beyond every hash radius (heavy recolor/composite transforms):
+
+- **`SemanticEmbedder`** — object-safe pluggable backend
+  (`dim` / `embed_bytes` / `embed_path`). Production target is a DINOv2
+  ONNX model loaded from a weights path (`ort` + `ITRACE_SEMANTIC_MODEL`);
+  **that download is a follow-up and never happens in CI** — tests and
+  wiring use in-crate stubs.
+- **`HnswIndex`** — in-memory HNSW ANN index over cosine-normalized `f32`
+  vectors (`insert` + `query(k)`, deterministic seeded level draws, no new
+  deps). Unit-tested on synthetic clusters: same-cluster members fill top-k
+  and far clusters stay out; recall@k is checked against exact brute force.
+- **`semantic_candidates` / `semantic_candidates_with_index`** emit
+  `(entry_i, entry_j)` pairs under the same dense-owner contract as the
+  gate/crop channels; `union_candidate_pairs` merges them into the MIH
+  candidate list before verification.
+
+**Wiring sketch (default off):** with `ITRACE_SEMANTIC=1`, a dedup run that
+has stored embeddings builds the index over the same `entries` as the gate
+scan, then `union_candidate_pairs(&mut pairs, semantic_candidates(...))`
+ahead of `confirm_pairs` / smart re-scoring. Semantic hits are *candidates
+only* — a pair still needs downstream confirmation (strict cosine + the
+existing hash/crop gates), so the channel can add recall without silently
+widening merges. `embedder_from_env()` is the production seam; it returns
+`None` today, so the flag is inert until a real backend and the
+`feature_store` embedding column land.
+
+**Follow-ups:** DINOv2 ONNX weights + `ort` backend; persisted
+`project_{id}_sem/` bundle (`image_ids.bin` + serialized graph) with the
+same feature-fingerprint invalidation as `ITMIHP1`/`ITMIHC1`; sharding the
+graph across nodes (per-shard HNSW or per-node full graph) once the
+`ITMIHN1` transport seam is real.
+
+| Variable | Effect |
+|----------|--------|
+| `ITRACE_SEMANTIC` | `1`/`true`/`on` arms the semantic channel (no-op until an embedder + embeddings exist; unset/`0`/`false`/`off` = off) |
+| `ITRACE_SEMANTIC_K` | Per-image ANN probe width (default 32) |
+| `ITRACE_SEMANTIC_MIN_COS` | Cosine floor for a semantic candidate (default 0.75) |
 
 ## Microbench
 
