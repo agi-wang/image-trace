@@ -373,34 +373,42 @@ fn run_cli_dedup(
     // Entries that fail to read/embed get a zero vector (cosine 0 to
     // everything → never a candidate), keeping `sem_entries` index-aligned
     // with `entries`.
-    let sem_pairs: Vec<(u32, u32)> = if semantic::semantic_channel_enabled() {
-        match semantic::embedder_from_env() {
-            Some(embedder) => {
-                let sem_entries: Vec<semantic::SemanticVecs> = entries
-                    .par_iter()
-                    .map(|e| {
-                        let vector = ready_by_id
-                            .get(&e.image_id)
-                            .and_then(|m| store.read_file(&m.file_path).ok())
-                            .and_then(|b| embedder.embed_bytes(&b).ok())
-                            .unwrap_or_else(|| vec![0.0; embedder.dim()]);
-                        semantic::SemanticVecs {
-                            image_id: e.image_id,
-                            vector,
-                        }
-                    })
-                    .collect();
-                semantic::semantic_candidates(
-                    &sem_entries,
-                    semantic::resolve_semantic_k(None),
-                    semantic::resolve_semantic_min_cosine(None),
-                )
+    // With ITRACE_MIH_INDEX_DIR set, vectors persist in a
+    // `project_{id}_sem/` bundle (embedder-fingerprint + image-set
+    // invalidated — stale vectors are never reused); a matching bundle
+    // skips model inference entirely.
+    let (sem_pairs, sem_index_loaded): (Vec<(u32, u32)>, bool) =
+        if semantic::semantic_channel_enabled() {
+            match semantic::embedder_from_env() {
+                Some(embedder) => {
+                    let image_ids: Vec<i64> = entries.iter().map(|e| e.image_id).collect();
+                    let sem_dir = index::resolve_mih_index_dir()
+                        .map(|base| semantic::project_sem_index_path(&base, project_id));
+                    let (sem_entries, loaded) = semantic::load_or_build_project_sem_index(
+                        sem_dir.as_deref(),
+                        &image_ids,
+                        &*embedder,
+                        |id| {
+                            ready_by_id
+                                .get(&id)
+                                .and_then(|m| store.read_file(&m.file_path).ok())
+                                .and_then(|b| embedder.embed_bytes(&b).ok())
+                        },
+                    )?;
+                    (
+                        semantic::semantic_candidates(
+                            &sem_entries,
+                            semantic::resolve_semantic_k(None),
+                            semantic::resolve_semantic_min_cosine(None),
+                        ),
+                        loaded,
+                    )
+                }
+                None => (Vec::new(), false),
             }
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
+        } else {
+            (Vec::new(), false)
+        };
 
     let (cand_n, confirmed, index_loaded) = index::dedup_confirmed_cached_with_extra(
         &entries,
@@ -527,7 +535,11 @@ fn run_cli_dedup(
     // Per-channel contribution note appears only when the channel is
     // armed, keeping default output byte-identical.
     let sem_note = if semantic::semantic_channel_enabled() {
-        format!(" +{} sem", sem_pairs.len())
+        format!(
+            " +{} sem{}",
+            sem_pairs.len(),
+            if sem_index_loaded { " (cached)" } else { "" }
+        )
     } else {
         String::new()
     };
