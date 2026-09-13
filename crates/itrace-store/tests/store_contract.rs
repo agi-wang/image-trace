@@ -126,21 +126,28 @@ fn contract_suite(store: &Arc<dyn ImageStore>) {
     assert!(store.features_ready(&[]).unwrap());
 
     // ----- pair cache (ordered-pair canonicalization + overwrite) -----
-    assert!(store.get_pair_score("x", "y", "phash", false).unwrap().is_none());
-    store.put_pair_score("x", "y", "phash", false, 0.75).unwrap();
+    // pair_cache keys are global (not project-scoped) — nonce them so
+    // reruns against a shared Postgres don't see stale rows.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let (ka, kb) = (format!("x-{nonce}"), format!("y-{nonce}"));
+    assert!(store.get_pair_score(&ka, &kb, "phash", false).unwrap().is_none());
+    store.put_pair_score(&ka, &kb, "phash", false, 0.75).unwrap();
     // reversed arg order reads the same canonical row
     assert_eq!(
-        store.get_pair_score("y", "x", "phash", false).unwrap(),
+        store.get_pair_score(&kb, &ka, "phash", false).unwrap(),
         Some(0.75)
     );
-    store.put_pair_score("x", "y", "phash", false, 0.9).unwrap();
+    store.put_pair_score(&ka, &kb, "phash", false, 0.9).unwrap();
     assert_eq!(
-        store.get_pair_score("x", "y", "phash", false).unwrap(),
+        store.get_pair_score(&ka, &kb, "phash", false).unwrap(),
         Some(0.9)
     );
     // rotation_invariant is part of the key
     assert!(store
-        .get_pair_score("x", "y", "phash", true)
+        .get_pair_score(&ka, &kb, "phash", true)
         .unwrap()
         .is_none());
 

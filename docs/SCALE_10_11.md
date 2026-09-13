@@ -258,6 +258,11 @@ contract suite against both backends — sqlite always, postgres when
 `ITRACE_TEST_DATABASE_URL` is set (CI provides a `postgres:16` service
 container on the `build-test` job).
 
+Selection precedence: `itrace-cli --store` flag > `ITRACE_STORE` >
+sqlite default; URL via `ITRACE_DATABASE_URL`/`DATABASE_URL`.
+Switching backends and what does **not** auto-migrate (sqlite file →
+pg needs re-ingest or a future dump tool): `docs/POSTGRES.md`.
+
 ## Microbench
 
 ```bash
