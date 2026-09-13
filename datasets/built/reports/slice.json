@@ -1,0 +1,41 @@
+{
+  "rows": 2,
+  "cols": 2,
+  "cells": [
+    {
+      "row": 0,
+      "col": 0,
+      "score": 1.0,
+      "best_x": 0,
+      "best_y": 0,
+      "rotation": 0
+    },
+    {
+      "row": 0,
+      "col": 1,
+      "score": 1.0,
+      "best_x": 64,
+      "best_y": 0,
+      "rotation": 0
+    },
+    {
+      "row": 1,
+      "col": 0,
+      "score": 1.0,
+      "best_x": 0,
+      "best_y": 64,
+      "rotation": 0
+    },
+    {
+      "row": 1,
+      "col": 1,
+      "score": 1.0,
+      "best_x": 64,
+      "best_y": 64,
+      "rotation": 0
+    }
+  ],
+  "coverage": 1.0,
+  "mean_score": 1.0,
+  "is_slice_of_a": true
+}

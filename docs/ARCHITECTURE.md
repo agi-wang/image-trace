@@ -26,10 +26,15 @@ crates/
   itrace-cli     clap 命令行：init/add/compare/smart/report/serve
 ```
 
-## 存储后端（BlobStore）
+## 存储后端（ImageStore / BlobStore）
+
+**元数据与特征向量**（projects/images/features/pair_cache/analysis_runs）走后端无关的
+`ImageStore` trait：`SqliteStore`（rusqlite）是默认实现，`pub type Store = SqliteStore`
+保持旧调用方兼容；CLI 与 server 均以 `&dyn ImageStore` / `Arc<dyn ImageStore>` 持握，
+未来 `PostgresStore`/`TiKV` 后端只需实现同一 trait 即可插入，调用点不改。
 
 文件负载（uploads/extracted/thumbnails/visualizations）走 `BlobStore` trait 抽象，
-元数据与特征向量始终在 SQLite。`ITRACE_STORAGE` 选择后端：
+由 `ImageStore::blobs()` 委托。`ITRACE_STORAGE` 选择后端：
 
 - `fs`（默认）：与原版一致，`data/` 目录直存，`local_path()` 直通文件系统。
 - `s3`：MinIO 或任意 S3 兼容端点（`object_store::aws`）。env：`S3_ENDPOINT`

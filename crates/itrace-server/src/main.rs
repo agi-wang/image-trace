@@ -23,13 +23,13 @@ use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
 use itrace_core::{self as core, DESCRIPTOR_ALGOS};
-use itrace_store::{ImageRecord, Store};
+use itrace_store::{ImageRecord, ImageStore, SqliteStore};
 
 // ---------- state ----------
 
 #[derive(Clone)]
 struct AppState {
-    store: Arc<Store>,
+    store: Arc<dyn ImageStore>,
     /// Small decoded-gray cache (≤64 entries, keyed by image id) shared by
     /// the match/slice endpoints — they re-decode the same blobs per call.
     gray_cache:
@@ -161,6 +161,9 @@ struct DedupRequest {
     /// Gate hashes that must flag a pair for it to be verified.
     #[serde(default = "default_dedup_votes")]
     min_votes: u32,
+    /// Optional MIH shard bit-width (0..=16). Omitted => env ITRACE_MIH_SHARD_BITS or 8.
+    #[serde(default)]
+    shard_bits: Option<u32>,
 }
 fn default_dedup_radius() -> u32 {
     10
@@ -266,7 +269,7 @@ fn enqueue_precompute(state: &AppState, image_id: i64, key: String) {
 }
 
 fn run_precompute(
-    store: &Arc<itrace_store::Store>,
+    store: &Arc<dyn ImageStore>,
     image_id: i64,
     get_img: impl FnOnce() -> anyhow::Result<image::DynamicImage>,
 ) {
@@ -309,7 +312,7 @@ fn sanitize_filename(name: &str) -> ApiResult<String> {
 }
 
 /// Unique blob key under a prefix ("uploads", "extracted", "thumbnails").
-fn unique_key(store: &Store, prefix: &str, name: &str) -> String {
+fn unique_key(store: &dyn ImageStore, prefix: &str, name: &str) -> String {
     let candidate = format!("{prefix}/{name}");
     if !store.file_exists(&candidate) {
         return candidate;
@@ -527,13 +530,17 @@ async fn recompute_features(
     let pending = blocking(move || {
         st.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
         let images = st.store.list_image_meta(id)?;
-        // file_exists is a syscall per image — run the pending filter in
-        // parallel; the Option collect preserves list order (and thus the
-        // enqueue order) identically to the old sequential filter.
+        // Also recompute `ready` images missing newly registered feature
+        // algorithms (e.g. crophash backfill); file_exists is a syscall per
+        // image — run the filter in parallel; the Option collect preserves
+        // list order (and thus the enqueue order) identically.
+        let want = itrace_core::features::EXTRACTORS.len() as i64;
         Ok(images
             .into_par_iter()
             .map(|i| {
-                (i.feature_status != "ready" && st.store.file_exists(&i.file_path)).then_some(i)
+                let needs = i.feature_status != "ready"
+                    || st.store.feature_algorithm_count(i.id).unwrap_or(0) < want;
+                (needs && st.store.file_exists(&i.file_path)).then_some(i)
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -599,12 +606,14 @@ async fn dedup(
         radius: default_dedup_radius(),
         threshold: default_threshold(),
         min_votes: default_dedup_votes(),
+        shard_bits: None,
     });
     let (radius, threshold, min_votes) = (body.radius, body.threshold, body.min_votes);
+    let shard_bits = itrace_core::index::resolve_shard_bits(body.shard_bits);
     blocking(move || {
         s.store.ensure_project(id).map_err(|_| ApiError::not_found("项目不存在"))?;
         let images = s.store.list_image_meta(id)?;
-        Ok(Json(service::run_dedup_scan(&s, &images, radius, threshold, min_votes)?))
+        Ok(Json(service::run_dedup_scan(&s, id, &images, radius, threshold, min_votes, shard_bits)?))
     })
     .await
 }
@@ -751,7 +760,7 @@ async fn main() -> anyhow::Result<()> {
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8000);
 
-    let store = Store::open(std::path::Path::new(&data_dir))?;
+    let store = SqliteStore::open(std::path::Path::new(&data_dir))?;
     let _ = APP_STORAGE.set(store.storage_kind());
     tracing::info!("storage backend: {}", store.storage_kind());
     let state = AppState {

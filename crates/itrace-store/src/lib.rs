@@ -1,5 +1,10 @@
 //! SQLite store: projects / images / feature vectors / pair cache / runs.
 //! File payloads go through `blob::BlobStore` — local fs or MinIO/S3.
+//!
+//! `ImageStore` is the backend seam every consumer (CLI, server) codes
+//! against; `SqliteStore` is the default implementation. A future
+//! Postgres backend implements the same trait — blob storage stays
+//! delegated to `BlobStore` either way.
 
 pub mod blob;
 
@@ -147,15 +152,116 @@ pub struct AnalysisRunRecord {
     pub created_at: String,
 }
 
+/// Metadata + file facade used by the CLI and server. Every method the
+/// dedup/precompute/compare paths need is here so a non-SQLite backend
+/// (e.g. Postgres) can plug in behind `Arc<dyn ImageStore>` without
+/// rewriting call sites. All methods are object-safe.
+pub trait ImageStore: Send + Sync {
+    // ---------- blob facade ----------
+    fn blobs(&self) -> &Arc<dyn BlobStore>;
+    fn storage_kind(&self) -> &'static str;
+    fn write_file(&self, key: &str, data: &[u8]) -> anyhow::Result<()>;
+    fn read_file(&self, key: &str) -> anyhow::Result<Vec<u8>>;
+    fn delete_file(&self, key: &str) -> anyhow::Result<()>;
+    fn file_exists(&self, key: &str) -> bool;
+    fn data_dir(&self) -> &std::path::Path;
+    fn upload_dir(&self) -> PathBuf;
+    fn extract_dir(&self) -> PathBuf;
+    fn resolve(&self, rel: &str) -> Option<PathBuf>;
+
+    // ---------- projects ----------
+    fn create_project(&self, name: &str, description: Option<&str>) -> anyhow::Result<Project>;
+    fn get_project(&self, id: i64) -> anyhow::Result<Project>;
+    fn list_projects(&self, skip: i64, limit: i64) -> anyhow::Result<Vec<Project>>;
+    fn ensure_project(&self, id: i64) -> anyhow::Result<()>;
+    fn delete_project(&self, id: i64) -> anyhow::Result<Vec<ImageRecord>>;
+
+    // ---------- images ----------
+    fn insert_image(&self, rec: &NewImage) -> anyhow::Result<ImageRecord>;
+    fn get_image(&self, id: i64) -> anyhow::Result<ImageRecord>;
+    fn list_images(
+        &self,
+        project_id: i64,
+        skip: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ImageRecord>>;
+    fn list_image_meta(&self, project_id: i64) -> anyhow::Result<Vec<ImageMeta>>;
+    fn get_image_path(&self, id: i64) -> anyhow::Result<String>;
+    fn delete_image(&self, id: i64) -> anyhow::Result<ImageRecord>;
+
+    // ---------- feature store ----------
+    fn set_feature_status(&self, image_id: i64, status: &str) -> anyhow::Result<()>;
+    fn put_feature(
+        &self,
+        image_id: i64,
+        variant_idx: u8,
+        algorithm: &str,
+        vector: &[u8],
+        dims: usize,
+    ) -> anyhow::Result<()>;
+    fn put_features(&self, image_id: i64, rows: &[(u8, &str, &[u8], usize)]) -> anyhow::Result<()>;
+    fn load_feature_map(
+        &self,
+        image_ids: &[i64],
+        feature: &str,
+        variants: &[u8],
+    ) -> anyhow::Result<FeatureMap>;
+    fn load_feature_maps(
+        &self,
+        image_ids: &[i64],
+        features: &[&str],
+        variants: &[u8],
+    ) -> anyhow::Result<Vec<FeatureMap>>;
+    fn feature_algorithm_count(&self, image_id: i64) -> anyhow::Result<i64>;
+    fn features_ready(&self, ids: &[i64]) -> anyhow::Result<bool>;
+
+    // ---------- pair cache ----------
+    fn get_pair_score(
+        &self,
+        hash_a: &str,
+        hash_b: &str,
+        algo: &str,
+        rot_inv: bool,
+    ) -> anyhow::Result<Option<f64>>;
+    fn put_pair_score(
+        &self,
+        hash_a: &str,
+        hash_b: &str,
+        algo: &str,
+        rot_inv: bool,
+        score: f64,
+    ) -> anyhow::Result<()>;
+
+    // ---------- analysis runs ----------
+    fn insert_run(&self, run: &NewRun) -> anyhow::Result<i64>;
+    fn list_runs(
+        &self,
+        project_id: i64,
+        skip: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<AnalysisRunRecord>>;
+    fn get_run(&self, run_id: i64) -> anyhow::Result<AnalysisRunRecord>;
+    fn latest_run(
+        &self,
+        project_id: i64,
+        algorithm: &str,
+        threshold: f64,
+    ) -> anyhow::Result<Option<AnalysisRunRecord>>;
+}
+
 /// Thread-safe store. SQLite serializes writers anyway; a Mutex'd single
 /// connection in WAL mode is the right shape for a local-first tool.
-pub struct Store {
+pub struct SqliteStore {
     conn: Mutex<Connection>,
     data_dir: PathBuf,
     blobs: Arc<dyn BlobStore>,
 }
 
-impl Store {
+/// Back-compat alias — new code should name `SqliteStore` (concrete) or
+/// `dyn ImageStore` (backend-agnostic) explicitly.
+pub type Store = SqliteStore;
+
+impl SqliteStore {
     pub fn open(data_dir: &std::path::Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let conn = Connection::open(data_dir.join("image-trace.db"))?;
@@ -172,229 +278,6 @@ impl Store {
     pub fn with_blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
         self.blobs = blobs;
         self
-    }
-
-    pub fn blobs(&self) -> &Arc<dyn BlobStore> {
-        &self.blobs
-    }
-    pub fn storage_kind(&self) -> &'static str {
-        self.blobs.kind()
-    }
-    pub fn write_file(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
-        self.blobs.put(key, data)
-    }
-    pub fn read_file(&self, key: &str) -> anyhow::Result<Vec<u8>> {
-        self.blobs.get(key)
-    }
-    pub fn delete_file(&self, key: &str) -> anyhow::Result<()> {
-        self.blobs.delete(key)
-    }
-    pub fn file_exists(&self, key: &str) -> bool {
-        self.blobs.exists(key)
-    }
-
-    pub fn data_dir(&self) -> &std::path::Path {
-        &self.data_dir
-    }
-    pub fn upload_dir(&self) -> PathBuf {
-        self.data_dir.join("uploads")
-    }
-    pub fn extract_dir(&self) -> PathBuf {
-        self.data_dir.join("extracted")
-    }
-
-    /// Resolve a stored key (e.g. "uploads/x.jpg") to a real fs path when the
-    /// blob backend is local; None under object storage — use read_file instead.
-    pub fn resolve(&self, rel: &str) -> Option<PathBuf> {
-        let rel = rel.strip_prefix("data/").unwrap_or(rel);
-        self.blobs.local_path(rel)
-    }
-
-    // ---------- projects ----------
-
-    pub fn create_project(&self, name: &str, description: Option<&str>) -> anyhow::Result<Project> {
-        let conn = self.conn.lock().unwrap();
-        conn.prepare_cached("INSERT INTO projects(name, description) VALUES(?1, ?2)")?
-            .execute(params![name, description])?;
-        let id = conn.last_insert_rowid();
-        drop(conn);
-        self.get_project(id)
-    }
-
-    pub fn get_project(&self, id: i64) -> anyhow::Result<Project> {
-        let conn = self.conn.lock().unwrap();
-        let found = conn
-            .prepare_cached(
-                "SELECT p.id, p.name, p.description, p.created_at, COUNT(i.id)
-                 FROM projects p LEFT JOIN images i ON i.project_id = p.id
-                 WHERE p.id = ?1
-                 GROUP BY p.id",
-            )?
-            .query_row(params![id], |r| {
-                Ok(Project {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    description: r.get(2)?,
-                    created_at: r.get(3)?,
-                    image_count: r.get(4)?,
-                })
-            })
-            .optional()?;
-        found.with_context(|| format!("项目不存在: {id}"))
-    }
-
-    pub fn list_projects(&self, skip: i64, limit: i64) -> anyhow::Result<Vec<Project>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT p.id, p.name, p.description, p.created_at, COUNT(i.id)
-             FROM projects p LEFT JOIN images i ON i.project_id = p.id
-             GROUP BY p.id ORDER BY p.id LIMIT ?1 OFFSET ?2",
-        )?;
-        let rows = stmt
-            .query_map(params![limit, skip], |r| {
-                Ok(Project {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    description: r.get(2)?,
-                    created_at: r.get(3)?,
-                    image_count: r.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Existence probe only — `get_project` costs a LEFT JOIN + COUNT over
-    /// the project's image index; handlers that never read the row fields
-    /// pay O(1) instead of O(#images) per request.
-    pub fn ensure_project(&self, id: i64) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let found = conn
-            .prepare_cached("SELECT 1 FROM projects WHERE id = ?1")?
-            .query_row(params![id], |r| r.get::<_, i64>(0))
-            .optional()?;
-        if found.is_none() {
-            anyhow::bail!("项目不存在: {id}");
-        }
-        Ok(())
-    }
-
-    /// Delete project row (CASCADE removes images/runs/features);
-    /// caller removes files. Errors when the project does not exist.
-    pub fn delete_project(&self, id: i64) -> anyhow::Result<Vec<ImageRecord>> {
-        let images = self.list_images(id, 0, i64::MAX)?;
-        let conn = self.conn.lock().unwrap();
-        let n = conn
-            .prepare_cached("DELETE FROM projects WHERE id = ?1")?
-            .execute(params![id])?;
-        if n == 0 {
-            anyhow::bail!("项目不存在: {id}");
-        }
-        Ok(images)
-    }
-
-    // ---------- images ----------
-
-    pub fn insert_image(&self, rec: &NewImage) -> anyhow::Result<ImageRecord> {
-        let conn = self.conn.lock().unwrap();
-        // RETURNING reads back only the DB-generated columns — every other
-        // field is exactly what was bound above, so no 16-column re-select.
-        let (id, created_at, feature_status) = conn
-            .prepare_cached(
-                "INSERT INTO images(project_id, filename, file_path, file_hash,
-                    phash, dhash, ahash, whash, colorhash, extracted_from,
-                    file_size, width, height, feature_status)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending')
-                 RETURNING id, created_at, feature_status",
-            )?
-            .query_row(
-                params![
-                    rec.project_id, rec.filename, rec.file_path, rec.file_hash,
-                    rec.phash, rec.dhash, rec.ahash, rec.whash, rec.colorhash,
-                    rec.extracted_from, rec.file_size, rec.width, rec.height,
-                ],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                },
-            )?;
-        Ok(ImageRecord {
-            id,
-            project_id: rec.project_id,
-            filename: rec.filename.clone(),
-            file_path: rec.file_path.clone(),
-            file_hash: rec.file_hash.clone(),
-            phash: rec.phash.clone(),
-            dhash: rec.dhash.clone(),
-            ahash: rec.ahash.clone(),
-            whash: rec.whash.clone(),
-            colorhash: rec.colorhash.clone(),
-            extracted_from: rec.extracted_from.clone(),
-            file_size: rec.file_size,
-            width: rec.width,
-            height: rec.height,
-            feature_status,
-            created_at,
-        })
-    }
-
-    pub fn get_image(&self, id: i64) -> anyhow::Result<ImageRecord> {
-        let conn = self.conn.lock().unwrap();
-        Self::row_to_image(&conn, "WHERE i.id = ?1", params![id])?
-            .into_iter()
-            .next()
-            .with_context(|| format!("图像不存在: {id}"))
-    }
-
-    pub fn list_images(&self, project_id: i64, skip: i64, limit: i64) -> anyhow::Result<Vec<ImageRecord>> {
-        let conn = self.conn.lock().unwrap();
-        Self::row_to_image(
-            &conn,
-            "WHERE i.project_id = ?1 ORDER BY i.id LIMIT ?2 OFFSET ?3",
-            params![project_id, limit, skip],
-        )
-    }
-
-    /// `list_images` minus the hash-hex/`file_hash`/`extracted_from`/
-    /// `created_at` columns — the analysis endpoints consume only this
-    /// projection, so they skip decoding those strings on every row.
-    /// Same `ORDER BY id` as `list_images` so positional callers see the
-    /// identical sequence.
-    pub fn list_image_meta(&self, project_id: i64) -> anyhow::Result<Vec<ImageMeta>> {
-        let conn = self.conn.lock().unwrap();
-        let rows = conn
-            .prepare_cached(
-                "SELECT id, filename, file_path, feature_status,
-                        file_size, width, height
-                 FROM images WHERE project_id = ?1 ORDER BY id",
-            )?
-            .query_map(params![project_id], |r| {
-                Ok(ImageMeta {
-                    id: r.get(0)?,
-                    filename: r.get(1)?,
-                    file_path: r.get(2)?,
-                    feature_status: r.get(3)?,
-                    file_size: r.get(4)?,
-                    width: r.get(5)?,
-                    height: r.get(6)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// `file_path` only — for handlers that resolve a row id to its blob
-    /// key and never touch the other 15 columns.
-    pub fn get_image_path(&self, id: i64) -> anyhow::Result<String> {
-        let conn = self.conn.lock().unwrap();
-        let path = conn
-            .prepare_cached("SELECT file_path FROM images WHERE id = ?1")?
-            .query_row(params![id], |r| r.get(0))
-            .optional()?;
-        path.with_context(|| format!("图像不存在: {id}"))
     }
 
     fn row_to_image(
@@ -437,107 +320,6 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn delete_image(&self, id: i64) -> anyhow::Result<ImageRecord> {
-        let rec = self.get_image(id)?;
-        let conn = self.conn.lock().unwrap();
-        conn.prepare_cached("DELETE FROM pair_cache WHERE hash_a = ?1 OR hash_b = ?1")?
-            .execute(params![rec.file_hash])?;
-        conn.prepare_cached("DELETE FROM images WHERE id = ?1")?
-            .execute(params![id])?;
-        Ok(rec)
-    }
-
-    // ---------- feature store ----------
-
-    pub fn set_feature_status(&self, image_id: i64, status: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.prepare_cached("UPDATE images SET feature_status = ?1 WHERE id = ?2")?
-            .execute(params![status, image_id])?;
-        Ok(())
-    }
-
-    pub fn put_feature(
-        &self,
-        image_id: i64,
-        variant_idx: u8,
-        algorithm: &str,
-        vector: &[u8],
-        dims: usize,
-    ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.prepare_cached(
-            "INSERT INTO feature_store(image_id, variant_idx, algorithm, vector, dims)
-             VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(image_id, variant_idx, algorithm) DO UPDATE SET
-               vector = excluded.vector, dims = excluded.dims",
-        )?
-        .execute(params![image_id, variant_idx as i64, algorithm, vector, dims as i64])?;
-        Ok(())
-    }
-
-    /// Batch-upsert all feature rows for one image in ONE transaction.
-    ///
-    /// `rows`: `(variant_idx, algorithm, vector, dims)` — one prepared
-    /// upsert is reused for the whole batch, so a variant×algorithm
-    /// matrix lands in a single commit instead of one commit per row.
-    pub fn put_features(
-        &self,
-        image_id: i64,
-        rows: &[(u8, &str, &[u8], usize)],
-    ) -> anyhow::Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT INTO feature_store(image_id, variant_idx, algorithm, vector, dims)
-                 VALUES(?1,?2,?3,?4,?5)
-                 ON CONFLICT(image_id, variant_idx, algorithm) DO UPDATE SET
-                   vector = excluded.vector, dims = excluded.dims",
-            )?;
-            for &(variant_idx, algorithm, vector, dims) in rows {
-                stmt.execute(params![
-                    image_id,
-                    variant_idx as i64,
-                    algorithm,
-                    vector,
-                    dims as i64,
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// vectors[image_id][variant_idx] = raw bytes for `feature`.
-    pub fn load_feature_map(
-        &self,
-        image_ids: &[i64],
-        feature: &str,
-        variants: &[u8],
-    ) -> anyhow::Result<FeatureMap> {
-        let conn = self.conn.lock().unwrap();
-        Self::load_feature_map_conn(&conn, image_ids, feature, variants)
-    }
-
-    /// Like `load_feature_map` but for several algorithms in one lock
-    /// acquisition. Returns one FeatureMap per requested feature name,
-    /// in the same order as `features`.
-    pub fn load_feature_maps(
-        &self,
-        image_ids: &[i64],
-        features: &[&str],
-        variants: &[u8],
-    ) -> anyhow::Result<Vec<FeatureMap>> {
-        let conn = self.conn.lock().unwrap();
-        features
-            .iter()
-            .map(|f| Self::load_feature_map_conn(&conn, image_ids, f, variants))
-            .collect()
-    }
-
     /// Shared body for the feature-map loaders. `IN` lists are bound
     /// `?N` placeholders (values as params, not interpolated text) and
     /// id lists are chunked so total bound variables stay under
@@ -568,7 +350,11 @@ impl Store {
             bind.extend(variants.iter().map(|&v| v.into()));
             let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map(params_from_iter(bind), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u8, r.get::<_, Vec<u8>>(2)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)? as u8,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
             })?;
             for row in rows {
                 let (id, v, vec) = row?;
@@ -577,9 +363,366 @@ impl Store {
         }
         Ok(map)
     }
+}
+
+impl ImageStore for SqliteStore {
+    fn blobs(&self) -> &Arc<dyn BlobStore> {
+        &self.blobs
+    }
+    fn storage_kind(&self) -> &'static str {
+        self.blobs.kind()
+    }
+    fn write_file(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.blobs.put(key, data)
+    }
+    fn read_file(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+        self.blobs.get(key)
+    }
+    fn delete_file(&self, key: &str) -> anyhow::Result<()> {
+        self.blobs.delete(key)
+    }
+    fn file_exists(&self, key: &str) -> bool {
+        self.blobs.exists(key)
+    }
+
+    fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+    fn upload_dir(&self) -> PathBuf {
+        self.data_dir.join("uploads")
+    }
+    fn extract_dir(&self) -> PathBuf {
+        self.data_dir.join("extracted")
+    }
+
+    /// Resolve a stored key (e.g. "uploads/x.jpg") to a real fs path when the
+    /// blob backend is local; None under object storage — use read_file instead.
+    fn resolve(&self, rel: &str) -> Option<PathBuf> {
+        let rel = rel.strip_prefix("data/").unwrap_or(rel);
+        self.blobs.local_path(rel)
+    }
+
+    // ---------- projects ----------
+
+    fn create_project(&self, name: &str, description: Option<&str>) -> anyhow::Result<Project> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached("INSERT INTO projects(name, description) VALUES(?1, ?2)")?
+            .execute(params![name, description])?;
+        let id = conn.last_insert_rowid();
+        drop(conn);
+        self.get_project(id)
+    }
+
+    fn get_project(&self, id: i64) -> anyhow::Result<Project> {
+        let conn = self.conn.lock().unwrap();
+        let found = conn
+            .prepare_cached(
+                "SELECT p.id, p.name, p.description, p.created_at, COUNT(i.id)
+                 FROM projects p LEFT JOIN images i ON i.project_id = p.id
+                 WHERE p.id = ?1
+                 GROUP BY p.id",
+            )?
+            .query_row(params![id], |r| {
+                Ok(Project {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    description: r.get(2)?,
+                    created_at: r.get(3)?,
+                    image_count: r.get(4)?,
+                })
+            })
+            .optional()?;
+        found.with_context(|| format!("项目不存在: {id}"))
+    }
+
+    fn list_projects(&self, skip: i64, limit: i64) -> anyhow::Result<Vec<Project>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT p.id, p.name, p.description, p.created_at, COUNT(i.id)
+             FROM projects p LEFT JOIN images i ON i.project_id = p.id
+             GROUP BY p.id ORDER BY p.id LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![limit, skip], |r| {
+                Ok(Project {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    description: r.get(2)?,
+                    created_at: r.get(3)?,
+                    image_count: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Existence probe only — `get_project` costs a LEFT JOIN + COUNT over
+    /// the project's image index; handlers that never read the row fields
+    /// pay O(1) instead of O(#images) per request.
+    fn ensure_project(&self, id: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let found = conn
+            .prepare_cached("SELECT 1 FROM projects WHERE id = ?1")?
+            .query_row(params![id], |r| r.get::<_, i64>(0))
+            .optional()?;
+        if found.is_none() {
+            anyhow::bail!("项目不存在: {id}");
+        }
+        Ok(())
+    }
+
+    /// Delete project row (CASCADE removes images/runs/features);
+    /// caller removes files. Errors when the project does not exist.
+    fn delete_project(&self, id: i64) -> anyhow::Result<Vec<ImageRecord>> {
+        let images = self.list_images(id, 0, i64::MAX)?;
+        let conn = self.conn.lock().unwrap();
+        let n = conn
+            .prepare_cached("DELETE FROM projects WHERE id = ?1")?
+            .execute(params![id])?;
+        if n == 0 {
+            anyhow::bail!("项目不存在: {id}");
+        }
+        Ok(images)
+    }
+
+    // ---------- images ----------
+
+    fn insert_image(&self, rec: &NewImage) -> anyhow::Result<ImageRecord> {
+        let conn = self.conn.lock().unwrap();
+        // RETURNING reads back only the DB-generated columns — every other
+        // field is exactly what was bound above, so no 16-column re-select.
+        let (id, created_at, feature_status) = conn
+            .prepare_cached(
+                "INSERT INTO images(project_id, filename, file_path, file_hash,
+                    phash, dhash, ahash, whash, colorhash, extracted_from,
+                    file_size, width, height, feature_status)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending')
+                 RETURNING id, created_at, feature_status",
+            )?
+            .query_row(
+                params![
+                    rec.project_id,
+                    rec.filename,
+                    rec.file_path,
+                    rec.file_hash,
+                    rec.phash,
+                    rec.dhash,
+                    rec.ahash,
+                    rec.whash,
+                    rec.colorhash,
+                    rec.extracted_from,
+                    rec.file_size,
+                    rec.width,
+                    rec.height,
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )?;
+        Ok(ImageRecord {
+            id,
+            project_id: rec.project_id,
+            filename: rec.filename.clone(),
+            file_path: rec.file_path.clone(),
+            file_hash: rec.file_hash.clone(),
+            phash: rec.phash.clone(),
+            dhash: rec.dhash.clone(),
+            ahash: rec.ahash.clone(),
+            whash: rec.whash.clone(),
+            colorhash: rec.colorhash.clone(),
+            extracted_from: rec.extracted_from.clone(),
+            file_size: rec.file_size,
+            width: rec.width,
+            height: rec.height,
+            feature_status,
+            created_at,
+        })
+    }
+
+    fn get_image(&self, id: i64) -> anyhow::Result<ImageRecord> {
+        let conn = self.conn.lock().unwrap();
+        Self::row_to_image(&conn, "WHERE i.id = ?1", params![id])?
+            .into_iter()
+            .next()
+            .with_context(|| format!("图像不存在: {id}"))
+    }
+
+    fn list_images(
+        &self,
+        project_id: i64,
+        skip: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ImageRecord>> {
+        let conn = self.conn.lock().unwrap();
+        Self::row_to_image(
+            &conn,
+            "WHERE i.project_id = ?1 ORDER BY i.id LIMIT ?2 OFFSET ?3",
+            params![project_id, limit, skip],
+        )
+    }
+
+    /// `list_images` minus the hash-hex/`file_hash`/`extracted_from`/
+    /// `created_at` columns — the analysis endpoints consume only this
+    /// projection, so they skip decoding those strings on every row.
+    /// Same `ORDER BY id` as `list_images` so positional callers see the
+    /// identical sequence.
+    fn list_image_meta(&self, project_id: i64) -> anyhow::Result<Vec<ImageMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn
+            .prepare_cached(
+                "SELECT id, filename, file_path, feature_status,
+                        file_size, width, height
+                 FROM images WHERE project_id = ?1 ORDER BY id",
+            )?
+            .query_map(params![project_id], |r| {
+                Ok(ImageMeta {
+                    id: r.get(0)?,
+                    filename: r.get(1)?,
+                    file_path: r.get(2)?,
+                    feature_status: r.get(3)?,
+                    file_size: r.get(4)?,
+                    width: r.get(5)?,
+                    height: r.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `file_path` only — for handlers that resolve a row id to its blob
+    /// key and never touch the other 15 columns.
+    fn get_image_path(&self, id: i64) -> anyhow::Result<String> {
+        let conn = self.conn.lock().unwrap();
+        let path = conn
+            .prepare_cached("SELECT file_path FROM images WHERE id = ?1")?
+            .query_row(params![id], |r| r.get(0))
+            .optional()?;
+        path.with_context(|| format!("图像不存在: {id}"))
+    }
+
+    fn delete_image(&self, id: i64) -> anyhow::Result<ImageRecord> {
+        let rec = self.get_image(id)?;
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached("DELETE FROM pair_cache WHERE hash_a = ?1 OR hash_b = ?1")?
+            .execute(params![rec.file_hash])?;
+        conn.prepare_cached("DELETE FROM images WHERE id = ?1")?
+            .execute(params![id])?;
+        Ok(rec)
+    }
+
+    // ---------- feature store ----------
+
+    fn set_feature_status(&self, image_id: i64, status: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached("UPDATE images SET feature_status = ?1 WHERE id = ?2")?
+            .execute(params![status, image_id])?;
+        Ok(())
+    }
+
+    fn put_feature(
+        &self,
+        image_id: i64,
+        variant_idx: u8,
+        algorithm: &str,
+        vector: &[u8],
+        dims: usize,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.prepare_cached(
+            "INSERT INTO feature_store(image_id, variant_idx, algorithm, vector, dims)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(image_id, variant_idx, algorithm) DO UPDATE SET
+               vector = excluded.vector, dims = excluded.dims",
+        )?
+        .execute(params![
+            image_id,
+            variant_idx as i64,
+            algorithm,
+            vector,
+            dims as i64
+        ])?;
+        Ok(())
+    }
+
+    /// Batch-upsert all feature rows for one image in ONE transaction.
+    ///
+    /// `rows`: `(variant_idx, algorithm, vector, dims)` — one prepared
+    /// upsert is reused for the whole batch, so a variant×algorithm
+    /// matrix lands in a single commit instead of one commit per row.
+    fn put_features(&self, image_id: i64, rows: &[(u8, &str, &[u8], usize)]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO feature_store(image_id, variant_idx, algorithm, vector, dims)
+                 VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(image_id, variant_idx, algorithm) DO UPDATE SET
+                   vector = excluded.vector, dims = excluded.dims",
+            )?;
+            for &(variant_idx, algorithm, vector, dims) in rows {
+                stmt.execute(params![
+                    image_id,
+                    variant_idx as i64,
+                    algorithm,
+                    vector,
+                    dims as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// vectors[image_id][variant_idx] = raw bytes for `feature`.
+    fn load_feature_map(
+        &self,
+        image_ids: &[i64],
+        feature: &str,
+        variants: &[u8],
+    ) -> anyhow::Result<FeatureMap> {
+        let conn = self.conn.lock().unwrap();
+        Self::load_feature_map_conn(&conn, image_ids, feature, variants)
+    }
+
+    /// Like `load_feature_map` but for several algorithms in one lock
+    /// acquisition. Returns one FeatureMap per requested feature name,
+    /// in the same order as `features`.
+    fn load_feature_maps(
+        &self,
+        image_ids: &[i64],
+        features: &[&str],
+        variants: &[u8],
+    ) -> anyhow::Result<Vec<FeatureMap>> {
+        let conn = self.conn.lock().unwrap();
+        features
+            .iter()
+            .map(|f| Self::load_feature_map_conn(&conn, image_ids, f, variants))
+            .collect()
+    }
+
+    /// Distinct feature algorithms stored for an image at variant 0 —
+    /// a cheap completeness probe so `precompute` can backfill images
+    /// marked `ready` before a newly registered extractor existed.
+    fn feature_algorithm_count(&self, image_id: i64) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(DISTINCT algorithm) FROM feature_store
+                 WHERE image_id = ?1 AND variant_idx = 0",
+            )?
+            .query_row(params![image_id], |r| r.get(0))?;
+        Ok(n)
+    }
 
     /// Count images in `ids` whose feature_status = 'ready'.
-    pub fn features_ready(&self, ids: &[i64]) -> anyhow::Result<bool> {
+    fn features_ready(&self, ids: &[i64]) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         for chunk in ids.chunks(900) {
             let ph = placeholders(1, chunk.len());
@@ -597,7 +740,7 @@ impl Store {
 
     // ---------- pair cache ----------
 
-    pub fn get_pair_score(
+    fn get_pair_score(
         &self,
         hash_a: &str,
         hash_b: &str,
@@ -616,7 +759,7 @@ impl Store {
         Ok(score)
     }
 
-    pub fn put_pair_score(
+    fn put_pair_score(
         &self,
         hash_a: &str,
         hash_b: &str,
@@ -636,7 +779,7 @@ impl Store {
 
     // ---------- analysis runs ----------
 
-    pub fn insert_run(&self, run: &NewRun) -> anyhow::Result<i64> {
+    fn insert_run(&self, run: &NewRun) -> anyhow::Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.prepare_cached(
             "INSERT INTO analysis_runs(project_id, algorithm, threshold,
@@ -644,13 +787,23 @@ impl Store {
              VALUES(?1,?2,?3,?4,?5,?6,?7)",
         )?
         .execute(params![
-            run.project_id, run.algorithm, run.threshold, run.total_images,
-            run.groups_count, run.unique_count, run.summary
+            run.project_id,
+            run.algorithm,
+            run.threshold,
+            run.total_images,
+            run.groups_count,
+            run.unique_count,
+            run.summary
         ])?;
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn list_runs(&self, project_id: i64, skip: i64, limit: i64) -> anyhow::Result<Vec<AnalysisRunRecord>> {
+    fn list_runs(
+        &self,
+        project_id: i64,
+        skip: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<AnalysisRunRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT id, project_id, algorithm, threshold, total_images,
@@ -675,7 +828,7 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn get_run(&self, run_id: i64) -> anyhow::Result<AnalysisRunRecord> {
+    fn get_run(&self, run_id: i64) -> anyhow::Result<AnalysisRunRecord> {
         let conn = self.conn.lock().unwrap();
         let found = conn
             .prepare_cached(
@@ -700,7 +853,7 @@ impl Store {
         found.with_context(|| format!("分析记录不存在: {run_id}"))
     }
 
-    pub fn latest_run(
+    fn latest_run(
         &self,
         project_id: i64,
         algorithm: &str,
@@ -829,7 +982,8 @@ mod tests {
             ],
         )
         .unwrap();
-        s.put_features(a.id, &[(0, "phash", &[9u8; 8][..], 64)]).unwrap();
+        s.put_features(a.id, &[(0, "phash", &[9u8; 8][..], 64)])
+            .unwrap();
 
         let ids = vec![a.id, b.id];
         let variants = vec![0u8, 1u8];
@@ -842,7 +996,10 @@ mod tests {
         assert_eq!(maps[1][&a.id][&0], vec![3u8; 8]);
         assert!(!maps[0].contains_key(&b.id));
         // empty id/variant lists return an empty map, not an error
-        assert!(s.load_feature_map(&[], "phash", &variants).unwrap().is_empty());
+        assert!(s
+            .load_feature_map(&[], "phash", &variants)
+            .unwrap()
+            .is_empty());
         assert!(s.load_feature_map(&ids, "phash", &[]).unwrap().is_empty());
 
         assert!(!s.features_ready(&ids).unwrap()); // 'pending' by default

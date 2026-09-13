@@ -11,8 +11,9 @@ use clap::{Parser, Subcommand};
 use rayon::prelude::*;
 
 use itrace_core::compare::{self, Prepared};
-use itrace_core::{documents, hashes, image_io, features};
-use itrace_store::{NewImage, Store};
+use itrace_core::{documents, hashes, image_io, features, index, slice};
+use itrace_core::HASH_GATE_ALGOS;
+use itrace_store::{ImageStore, NewImage, SqliteStore};
 
 #[derive(Parser)]
 #[command(name = "itrace", version, about = "Image Trace — 图像比对与查重")]
@@ -55,6 +56,21 @@ enum Cmd {
         #[arg(long, default_value = "3")]
         min_agree: usize,
     },
+    /// 索引查重（MIH 候选召回 + 门控哈希复核；对齐 server /dedup 默认）
+    Dedup {
+        project_id: i64,
+        /// Hamming radius for MIH recall (server default 10)
+        #[arg(long, default_value = "10")]
+        radius: u32,
+        #[arg(long, default_value = "0.85")]
+        threshold: f64,
+        /// Distinct gate algorithms that must flag a pair (server default 2)
+        #[arg(long, default_value = "2")]
+        min_votes: u32,
+        /// MIH shard bits (0..=16). Default: env ITRACE_MIH_SHARD_BITS or 8.
+        #[arg(long)]
+        shard_bits: Option<u32>,
+    },
     /// 重复图片报告
     Report {
         project_id: i64,
@@ -76,7 +92,7 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let store = Store::open(&cli.data_dir).context("打开数据目录失败")?;
+    let store = SqliteStore::open(&cli.data_dir).context("打开数据目录失败")?;
 
     match cli.cmd {
         Cmd::Create { name, description } => {
@@ -97,10 +113,15 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Precompute { project_id } => {
             let images = store.list_image_meta(project_id)?;
-            // decode + feature compute in parallel; DB writes stay sequential
+            // Backfill when `ready` predates newly registered extractors
+            // (e.g. crophash): stored algorithm coverage < EXTRACTORS.len().
+            let want = features::EXTRACTORS.len() as i64;
             let computed: Vec<_> = images
                 .par_iter()
-                .filter(|i| i.feature_status != "ready")
+                .filter(|i| {
+                    i.feature_status != "ready"
+                        || store.feature_algorithm_count(i.id).unwrap_or(0) < want
+                })
                 .map(|i| (i.id, compute_rows(&store, &i.file_path)))
                 .collect();
             for (id, rows) in computed {
@@ -183,8 +204,10 @@ fn main() -> anyhow::Result<()> {
             let confirmed: Vec<(usize, usize)> = pair_hits
                 .iter()
                 .filter(|(_, hits)| {
-                    hits.len() >= min_agree
-                        && hits.iter().any(|a| itrace_core::HASH_GATE_ALGOS.contains(&a.as_str()))
+                    itrace_core::smart_pair_confirmed(
+                        hits.iter().map(|s| s.as_str()),
+                        min_agree,
+                    )
                 })
                 .map(|(&k, _)| k)
                 .collect();
@@ -201,6 +224,9 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             println!("scan: {:.2}s, {} dup groups", t0.elapsed().as_secs_f64(), shown);
+        }
+        Cmd::Dedup { project_id, radius, threshold, min_votes, shard_bits } => {
+            run_cli_dedup(&store, project_id, radius, threshold, min_votes, shard_bits)?;
         }
         Cmd::Report { project_id, algorithm, threshold } => {
             let images = store.list_image_meta(project_id)?;
@@ -232,7 +258,225 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()> {
+
+/// CLI path mirroring server `run_dedup_scan`: load gate-hash variant keys
+/// from the store, MIH recall via `dedup_confirmed`, print groups like smart.
+fn run_cli_dedup(
+    store: &dyn ImageStore,
+    project_id: i64,
+    radius: u32,
+    threshold: f64,
+    min_votes: u32,
+    shard_bits_opt: Option<u32>,
+) -> anyhow::Result<()> {
+    let shard_bits = index::resolve_shard_bits(shard_bits_opt);
+    let images = store.list_image_meta(project_id)?;
+    let n = images.len();
+    if n < 2 {
+        println!("图片不足");
+        return Ok(());
+    }
+    let ready: Vec<&itrace_store::ImageMeta> = images
+        .iter()
+        .filter(|i| i.feature_status == "ready")
+        .collect();
+    if ready.len() < 2 {
+        eprintln!("特征尚未就绪，先运行 `itrace precompute {project_id}`");
+        return Ok(());
+    }
+    let ids: Vec<i64> = ready.iter().map(|i| i.id).collect();
+    let variants: Vec<u8> = (0..features::NUM_VARIANTS).collect();
+    let mut feat_names: Vec<&'static str> = Vec::new();
+    let gate_feats: Vec<usize> = HASH_GATE_ALGOS
+        .iter()
+        .filter_map(|a| {
+            features::algo_to_feature(a).map(|f| {
+                match feat_names.iter().position(|&x| x == f) {
+                    Some(i) => i,
+                    None => {
+                        feat_names.push(f);
+                        feat_names.len() - 1
+                    }
+                }
+            })
+        })
+        .collect();
+    // Crop-recall channel feature rides the same batched load.
+    let crop_fi = features::algo_to_feature("crophash").map(|f| {
+        feat_names.push(f);
+        feat_names.len() - 1
+    });
+    let maps = store.load_feature_maps(&ids, &feat_names, &variants)?;
+    let entries: Vec<index::DedupKeys> = ready
+        .iter()
+        .filter_map(|img| {
+            let variant_keys: Vec<Vec<u64>> = gate_feats
+                .iter()
+                .map(|&fi| {
+                    variants
+                        .iter()
+                        .filter_map(|v| maps[fi].get(&img.id).and_then(|vm| vm.get(v)))
+                        .map(|b| features::unpack_bits(b))
+                        .collect()
+                })
+                .collect();
+            if variant_keys.iter().all(|k| k.len() == variants.len()) {
+                Some(index::DedupKeys {
+                    image_id: img.id,
+                    variant_keys,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    if entries.len() < 2 {
+        println!("可索引图片不足（需要完整 gate 特征）");
+        return Ok(());
+    }
+
+    let t0 = std::time::Instant::now();
+    let index_dir = index::resolve_mih_index_dir()
+        .map(|base| index::project_mih_index_path(&base, project_id));
+    let (cand_n, confirmed, index_loaded) = index::dedup_confirmed_cached(
+        &entries,
+        radius,
+        threshold,
+        min_votes,
+        shard_bits,
+        index_dir.as_deref(),
+    )?;
+
+    // Crop/slice recall channel: windowed-phash keys → hit-counted
+    // candidates verified by NCC containment on the decoded images.
+    let crop_entries: Vec<index::CropKeys> = match crop_fi.filter(|&fi| !maps[fi].is_empty()) {
+        Some(fi) => ready
+            .par_iter()
+            .filter_map(|img| {
+                let vm = maps[fi].get(&img.id)?;
+                let mut keys =
+                    Vec::with_capacity(features::crophash::N_KEYS * variants.len());
+                for &v in &variants {
+                    keys.extend_from_slice(&features::crophash::payload_keys(vm.get(&v)?)?);
+                }
+                keys.sort_unstable();
+                keys.dedup();
+                Some(index::CropKeys {
+                    image_id: img.id,
+                    keys,
+                })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let (crop_pairs, crop_index_loaded) = if crop_entries.len() >= 2 {
+        let crop_dir = index::resolve_mih_index_dir()
+            .map(|base| index::project_crop_mih_index_path(&base, project_id));
+        index::crop_candidates_cached(
+            &crop_entries,
+            radius,
+            index::resolve_crop_min_hits(None),
+            shard_bits,
+            crop_dir.as_deref(),
+        )?
+    } else {
+        (Vec::new(), false)
+    };
+    let ready_by_id: std::collections::HashMap<i64, &itrace_store::ImageMeta> =
+        ready.iter().map(|r| (r.id, *r)).collect();
+    let crop_confirmed: Vec<(i64, i64, f64)> = crop_pairs
+        .par_iter()
+        .filter_map(|&(i, j)| {
+            let ia = crop_entries[i as usize].image_id;
+            let ib = crop_entries[j as usize].image_id;
+            let (Some(ra), Some(rb)) = (ready_by_id.get(&ia), ready_by_id.get(&ib)) else {
+                return None;
+            };
+            let ga = image_io::to_gray(&image_io::decode(&store.read_file(&ra.file_path).ok()?).ok()?);
+            let gb = image_io::to_gray(&image_io::decode(&store.read_file(&rb.file_path).ok()?).ok()?);
+            let (s, contained) = slice::contains_rot4(&ga, &gb);
+            if contained && s >= threshold {
+                Some((ia, ib, s))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let pos: std::collections::HashMap<i64, usize> =
+        ready.iter().enumerate().map(|(p, r)| (r.id, p)).collect();
+    let mut pairs: Vec<(usize, usize)> = confirmed
+        .iter()
+        .filter_map(|&(i, j, _)| {
+            let ia = entries[i].image_id;
+            let ib = entries[j].image_id;
+            let pi = *pos.get(&ia)?;
+            let pj = *pos.get(&ib)?;
+            Some((pi.min(pj), pi.max(pj)))
+        })
+        .collect();
+    for &(ia, ib, _) in &crop_confirmed {
+        if let (Some(&pi), Some(&pj)) = (pos.get(&ia), pos.get(&ib)) {
+            pairs.push((pi.min(pj), pi.max(pj)));
+        }
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    // Build score lookup for group confidence
+    let mut score_cache: std::collections::HashMap<(i64, i64), f64> =
+        std::collections::HashMap::new();
+    for &(i, j, s) in &confirmed {
+        let ia = entries[i].image_id;
+        let ib = entries[j].image_id;
+        score_cache.insert((ia.min(ib), ia.max(ib)), s);
+    }
+    for &(ia, ib, s) in &crop_confirmed {
+        score_cache
+            .entry((ia.min(ib), ia.max(ib)))
+            .and_modify(|e| *e = e.max(s))
+            .or_insert(s);
+    }
+    let groups = compare::components_from_pairs(ready.len(), &pairs);
+    let mut shown = 0;
+    let mut grouped = 0usize;
+    for members in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        shown += 1;
+        grouped += members.len();
+        let mut best = 0.0f64;
+        for a in 0..members.len() {
+            for b in (a + 1)..members.len() {
+                let ia = ready[members[a]].id;
+                let ib = ready[members[b]].id;
+                if let Some(&s) = score_cache.get(&(ia.min(ib), ia.max(ib))) {
+                    best = best.max(s);
+                }
+            }
+        }
+        println!("duplicate group {shown} (confidence {best:.4}):");
+        for &m in &members {
+            println!("  - {} ({})", ready[m].filename, ready[m].id);
+        }
+    }
+    let naive = (n as u64) * (n as u64 - 1) / 2;
+    println!(
+        "indexed {}, candidates {} (+{} crop), naive {}, {} dup groups / {} images, scan {:.3}s, index_loaded={}, crop_index_loaded={}",
+        entries.len(),
+        cand_n,
+        crop_pairs.len(),
+        naive,
+        shown,
+        grouped,
+        t0.elapsed().as_secs_f64(),
+        index_loaded,
+        crop_index_loaded
+    );
+    Ok(())
+}
+
+fn add_file(store: &dyn ImageStore, project_id: i64, path: &PathBuf) -> anyhow::Result<()> {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     if image_io::is_supported_image(name) {
         let data = std::fs::read(path)?;
@@ -319,13 +563,13 @@ fn add_file(store: &Store, project_id: i64, path: &PathBuf) -> anyhow::Result<()
 type FeatureRows = Vec<(u8, String, Vec<u8>, usize)>;
 
 /// Decode `key` and compute all feature rows (CPU-heavy; no DB access).
-fn compute_rows(store: &Store, key: &str) -> anyhow::Result<FeatureRows> {
+fn compute_rows(store: &dyn ImageStore, key: &str) -> anyhow::Result<FeatureRows> {
     Ok(features::compute_all_variants(&image_io::decode(&store.read_file(key)?)?))
 }
 
 /// Status protocol: computing → batched write → ready / pending.
 fn write_features(
-    store: &Store,
+    store: &dyn ImageStore,
     image_id: i64,
     rows: anyhow::Result<FeatureRows>,
 ) -> anyhow::Result<()> {
@@ -347,14 +591,14 @@ fn write_features(
 /// Feature rows from an already-decoded image (the `add` path decoded it
 /// for the insert-time hashes — no second decode, no blob re-read).
 fn precompute_decoded(
-    store: &Store,
+    store: &dyn ImageStore,
     image_id: i64,
     img: &image::DynamicImage,
 ) -> anyhow::Result<()> {
     write_features(store, image_id, Ok(features::compute_all_variants(img)))
 }
 
-fn unique_key(store: &Store, prefix: &str, name: &str) -> String {
+fn unique_key(store: &dyn ImageStore, prefix: &str, name: &str) -> String {
     let c = format!("{prefix}/{name}");
     if !store.file_exists(&c) {
         return c;
