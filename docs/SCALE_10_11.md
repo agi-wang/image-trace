@@ -209,7 +209,7 @@ still forces a rebuild.
 |-------|-------|--------|
 | 1 | `ImageStore` trait extraction + feature-fingerprint MIH invalidation | **done** |
 | 2 | `PostgresStore` backend behind the `ImageStore` trait | **done** |
-| 3 | Multi-node shard ownership + scatter/gather (design above) | planned |
+| 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
 | 4 | Semantic DINOv2/HNSW recall channel | planned |
 
 ### Phase 1 delivered
@@ -262,6 +262,37 @@ Selection precedence: `itrace-cli --store` flag > `ITRACE_STORE` >
 sqlite default; URL via `ITRACE_DATABASE_URL`/`DATABASE_URL`.
 Switching backends and what does **not** auto-migrate (sqlite file →
 pg needs re-ingest or a future dump tool): `docs/POSTGRES.md`.
+
+### Phase 3 delivered (foundation) — shard ownership + scatter/gather
+
+`itrace_core::ownership` implements the "Multi-node ownership by shard
+id" design above, in-process:
+
+- **`ShardOwnership`** — contiguous `ShardRange` per node covering
+  `0 .. 2^shard_bits` exactly once (`even()` balanced split or
+  `from_ranges()` custom partition, validated for gaps/overlaps;
+  empty ranges allowed for staged drain/join). `owner_of(shard_id)`
+  resolves via `partition_point` over the sorted ranges.
+- **`MultiNodeMihIndex`** — N logical nodes; each `NodeIndex` stores
+  `MihIndex`es for *only its owned shards* (no memory spent on remote
+  shards). `insert` routes via `owner_of(shard_id_for(key))`;
+  `query_with_nodes` applies the same Hamming-ball probe filter as
+  `ShardedMihIndex::query_into` (prefix distance ≤ radius), fans out
+  to only the nodes owning probe-set shards, and returns the merged
+  owner set plus the contacted-node list for fan-out inspection.
+
+Parity vs monolithic `ShardedMihIndex` is property-tested (random keys,
+radii 0..shard_bits+4, 2- and 4-node layouts plus `shard_bits=0`); a
+dedicated test proves `radius < shard_bits` queries skip whole nodes.
+
+**RPC seam:** a networked deployment keeps `ShardOwnership` on a
+coordinator, replaces each `NodeIndex` with a transport stub
+implementing `insert(shard_id, key, owner)` /
+`query_shards(key, radius, &[shard_ids])`, and merges replies exactly
+as `query_with_nodes` does — no semantic change to probe sets, recall,
+or the downstream `dedup_confirmed` re-scoring. Real transport, service
+discovery, and per-node `ITMIH1` persistence of owned shards are
+follow-up work.
 
 ## Microbench
 
