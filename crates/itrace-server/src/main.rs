@@ -253,7 +253,7 @@ fn validate_algorithm(a: &str) -> ApiResult<()> {
 fn enqueue_precompute_decoded(state: &AppState, image_id: i64, img: image::DynamicImage) {
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
-        run_precompute(&store, image_id, || Ok(img))
+        run_precompute(&*store, image_id, || Ok(img))
     });
 }
 
@@ -262,14 +262,14 @@ fn enqueue_precompute_decoded(state: &AppState, image_id: i64, img: image::Dynam
 fn enqueue_precompute(state: &AppState, image_id: i64, key: String) {
     let store = state.store.clone();
     tokio::task::spawn_blocking(move || {
-        run_precompute(&store, image_id, || {
+        run_precompute(&*store, image_id, || {
             core::image_io::decode(&store.read_file(&key)?)
         })
     });
 }
 
 fn run_precompute(
-    store: &Arc<dyn ImageStore>,
+    store: &dyn ImageStore,
     image_id: i64,
     get_img: impl FnOnce() -> anyhow::Result<image::DynamicImage>,
 ) {

@@ -22,8 +22,28 @@ struct Cli {
     #[arg(long, global = true, default_value = "data")]
     data_dir: PathBuf,
 
+    /// 元数据后端：sqlite（默认）| postgres（需 ITRACE_DATABASE_URL）。
+    /// 优先级：--store > $ITRACE_STORE > sqlite。
+    #[arg(long, global = true, value_enum)]
+    store: Option<StoreKind>,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum StoreKind {
+    Sqlite,
+    Postgres,
+}
+
+impl StoreKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -92,7 +112,11 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let store = itrace_store::open_image_store(&cli.data_dir).context("打开数据目录失败")?;
+    let store = itrace_store::open_image_store_as(
+        &cli.data_dir,
+        cli.store.map(StoreKind::as_str),
+    )
+    .context("打开数据目录失败")?;
 
     match cli.cmd {
         Cmd::Create { name, description } => {

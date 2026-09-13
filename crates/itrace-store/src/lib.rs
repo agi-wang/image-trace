@@ -300,15 +300,34 @@ impl StoreBase {
 /// - `ITRACE_STORE` = `postgres` → `PostgresStore` at `ITRACE_DATABASE_URL`
 ///   (or `DATABASE_URL`); `data_dir` still anchors the local `BlobStore`
 ///   when `ITRACE_STORAGE=fs`.
+///
+/// An unrecognized `ITRACE_STORE` value is an error (see
+/// [`open_image_store_as`]) — typos must not silently select sqlite.
 pub fn open_image_store(data_dir: &std::path::Path) -> anyhow::Result<Arc<dyn ImageStore>> {
-    match std::env::var("ITRACE_STORE").as_deref() {
-        Ok("postgres") | Ok("pg") => {
+    open_image_store_as(data_dir, None)
+}
+
+/// Like [`open_image_store`] but `backend` (`"sqlite"`/`"postgres"`,
+/// e.g. a CLI `--store` flag) overrides `ITRACE_STORE`.
+/// Precedence: explicit arg > env > sqlite default. Unknown backend
+/// names are an error, not a silent fallback to sqlite.
+pub fn open_image_store_as(
+    data_dir: &std::path::Path,
+    backend: Option<&str>,
+) -> anyhow::Result<Arc<dyn ImageStore>> {
+    let env = std::env::var("ITRACE_STORE").ok();
+    match backend.or(env.as_deref()).unwrap_or("sqlite") {
+        "sqlite" => Ok(Arc::new(SqliteStore::open(data_dir)?)),
+        "postgres" | "pg" => {
             let url = std::env::var("ITRACE_DATABASE_URL")
                 .or_else(|_| std::env::var("DATABASE_URL"))
-                .context("ITRACE_STORE=postgres requires ITRACE_DATABASE_URL (or DATABASE_URL)")?;
+                .context(
+                    "postgres store selected: set ITRACE_DATABASE_URL (or DATABASE_URL), \
+                     e.g. postgres://itrace:itrace@localhost:5432/itrace",
+                )?;
             Ok(Arc::new(pg::PostgresStore::connect(&url, data_dir)?))
         }
-        _ => Ok(Arc::new(SqliteStore::open(data_dir)?)),
+        other => anyhow::bail!("unknown store backend {other:?} — expected \"sqlite\" or \"postgres\""),
     }
 }
 
