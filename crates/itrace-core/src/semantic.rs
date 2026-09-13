@@ -29,9 +29,11 @@
 //!    vectors persist in a `project_{id}_sem/` bundle (see
 //!    [`load_or_build_project_sem_index`]) so repeat scans skip the
 //!    model entirely; otherwise they're recomputed per scan.
-//! 2. Recall: [`semantic_candidates`] builds an in-memory [`HnswIndex`]
-//!    over those vectors and emits `(entry_i, entry_j)` candidate pairs
-//!    at `resolve_semantic_k` / `resolve_semantic_min_cosine`.
+//! 2. Recall: an [`HnswIndex`] over those vectors emits `(entry_i,
+//!    entry_j)` candidate pairs at `resolve_semantic_k` /
+//!    `resolve_semantic_min_cosine`. The graph itself persists in
+//!    `project_{id}_sem/hnsw.bin` (`ITSEMH1`), fingerprint-bound to the
+//!    verified vectors — a full bundle hit skips the rebuild too.
 //! 3. Union + verify: [`union_candidate_pairs`] folds them into the MIH
 //!    candidate set **before** `confirm_pairs` / the variant-max hash
 //!    re-score. Semantic hits are *candidates only* — a pair still needs
@@ -728,10 +730,12 @@ pub fn union_candidate_pairs(
 ///   image_ids.bin  K × i64 LE — owner slots, sorted ascending
 ///   vectors.bin    K × D × f32 LE — row i is the vector of
 ///                  image_ids.bin[i]
+///   hnsw.bin       ITSEMH1 graph — see the layout block below
 /// ```
 ///
-/// Only the embedding vectors are persisted — the in-memory
-/// [`HnswIndex`] is rebuilt per scan (cheap next to model inference).
+/// `hnsw.bin` persists the [`HnswIndex`] itself so a cache hit skips the
+/// graph rebuild too; it is fingerprint-bound to `vectors.bin` and a
+/// miss rebuilds the graph from the verified vectors.
 /// Invalidation mirrors the MIH bundles: magic/version, embedder
 /// fingerprint, dim, the exact image_id set, and a BLAKE3
 /// `feature_fingerprint` over the stored payload; any mismatch rebuilds
@@ -742,6 +746,20 @@ pub fn project_sem_index_path(base: &std::path::Path, project_id: i64) -> std::p
 
 const PROJECT_SEM_MAGIC: &str = "ITSEMP1";
 const PROJECT_SEM_VERSION: u64 = 1;
+
+/// `(sorted image_ids, flattened vectors)` — the stored order the bundle
+/// and `hnsw.bin` both hash over.
+fn sorted_flat(entries: &[SemanticVecs]) -> (Vec<i64>, Vec<f32>) {
+    let mut sorted: Vec<&SemanticVecs> = entries.iter().collect();
+    sorted.sort_unstable_by_key(|e| e.image_id);
+    let dim = entries.first().map(|e| e.vector.len()).unwrap_or(0);
+    let image_ids: Vec<i64> = sorted.iter().map(|e| e.image_id).collect();
+    let mut flat = Vec::with_capacity(image_ids.len() * dim);
+    for e in sorted {
+        flat.extend_from_slice(&e.vector);
+    }
+    (image_ids, flat)
+}
 
 /// BLAKE3 hex over the bundle payload in stored (sorted-by-image_id)
 /// order — catches corrupted or recomputed vectors, not just image-set
@@ -768,20 +786,13 @@ pub fn save_project_sem_index(
     embedder_fingerprint: &str,
 ) -> std::io::Result<()> {
     let dim = entries.first().map(|e| e.vector.len()).unwrap_or(0);
-    let mut sorted: Vec<&SemanticVecs> = entries.iter().collect();
-    sorted.sort_unstable_by_key(|e| e.image_id);
-    let bad = std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "semantic vectors with mismatched dims",
-    );
-    let image_ids: Vec<i64> = sorted.iter().map(|e| e.image_id).collect();
-    let mut flat = Vec::with_capacity(image_ids.len() * dim);
-    for e in &sorted {
-        if e.vector.len() != dim {
-            return Err(bad);
-        }
-        flat.extend_from_slice(&e.vector);
+    if entries.iter().any(|e| e.vector.len() != dim) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "semantic vectors with mismatched dims",
+        ));
     }
+    let (image_ids, flat) = sorted_flat(entries);
     if dir.exists() {
         std::fs::remove_dir_all(dir)?;
     }
@@ -886,26 +897,283 @@ pub fn try_load_project_sem_index(
     ))
 }
 
-/// Embeddings for a project's `image_ids`: reuse the persisted
+// ---------- persisted HNSW graph (`project_{id}_sem/hnsw.bin`) ----------
+//
+// Sibling-magic choice: the graph lives in its own `hnsw.bin` under
+// `ITSEMH1` rather than extending `ITSEMP1`/`meta.json`. The vectors
+// bundle stays a pure `(image_ids, vectors)` payload that older readers
+// still understand, and the graph validates independently — a missing or
+// corrupt `hnsw.bin` degrades to a graph rebuild off the verified
+// vectors, never a full re-embed. The header embeds the same BLAKE3
+// `feature_fingerprint` as `meta.json`, so a stale graph can never be
+// paired with rebuilt/mismatched vectors.
+//
+// ```text
+// hnsw.bin
+//   magic       7B  "ITSEMH1"
+//   version     u64 LE = 1
+//   fingerprint 64B ASCII hex (zero-padded; == meta feature_fingerprint)
+//   dim, m, ef_construction, ef_search, rng, max_level   u64 LE each
+//   entry       u64 LE — entry-point node idx, u64::MAX = empty graph
+//   node_count  u64 LE — must equal the bundle's image_count
+//   per node:
+//     id        u32 LE — owner slot into image_ids.bin
+//     n_layers  u64 LE — node level + 1 (≤ MAX_LEVEL + 1)
+//     vec       dim × f32 LE — the stored L2-normalized vector
+//     per layer: u64 LE count, then count × u32 LE neighbour node idxs
+// ```
+const PROJECT_SEM_HNSW_MAGIC: &[u8; 7] = b"ITSEMH1";
+const PROJECT_SEM_HNSW_VERSION: u64 = 1;
+const HNSW_FILE: &str = "hnsw.bin";
+
+/// Cursor over `hnsw.bin` — every read is bounds-checked; any overrun or
+/// structural violation returns `None` (caller rebuilds, never panics).
+struct Rd<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Rd<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let s = self.b.get(self.pos..end)?;
+        self.pos = end;
+        Some(s)
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn f32(&mut self) -> Option<f32> {
+        Some(f32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+}
+
+/// Persist `idx` as `dir/hnsw.bin`, bound to `feature_fingerprint` (the
+/// bundle's recomputed `meta.json` value — see [`sem_fingerprint`]).
+fn save_project_sem_hnsw(
+    dir: &std::path::Path,
+    idx: &HnswIndex,
+    feature_fingerprint: &str,
+) -> std::io::Result<()> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(PROJECT_SEM_HNSW_MAGIC);
+    buf.extend_from_slice(&PROJECT_SEM_HNSW_VERSION.to_le_bytes());
+    let mut fp = [0u8; 64];
+    let fb = feature_fingerprint.as_bytes();
+    fp[..fb.len().min(64)].copy_from_slice(&fb[..fb.len().min(64)]);
+    buf.extend_from_slice(&fp);
+    for v in [
+        idx.dim as u64,
+        idx.m as u64,
+        idx.ef_construction as u64,
+        idx.ef_search as u64,
+        idx.rng,
+        idx.max_level as u64,
+        idx.entry.map(u64::from).unwrap_or(u64::MAX),
+        idx.nodes.len() as u64,
+    ] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for n in &idx.nodes {
+        buf.extend_from_slice(&n.id.to_le_bytes());
+        buf.extend_from_slice(&(n.neighbors.len() as u64).to_le_bytes());
+        for &x in &n.vec {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        for layer in &n.neighbors {
+            buf.extend_from_slice(&(layer.len() as u64).to_le_bytes());
+            for &nb in layer {
+                buf.extend_from_slice(&nb.to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(dir.join(HNSW_FILE), buf)
+}
+
+/// Load `dir/hnsw.bin` iff it parses cleanly and binds to the verified
+/// vectors: magic/version, `feature_fingerprint` equal to the bundle's
+/// recomputed value, `node_count == expected_nodes`, `dim` sane, entry
+/// and every neighbour reference in range. Returns `None` on any
+/// mismatch/corruption — the caller rebuilds the graph from vectors.
+fn try_load_project_sem_hnsw(
+    dir: &std::path::Path,
+    feature_fingerprint: &str,
+    expected_nodes: usize,
+) -> std::io::Result<Option<HnswIndex>> {
+    let bytes = match std::fs::read(dir.join(HNSW_FILE)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut r = Rd { b: &bytes, pos: 0 };
+    if r.take(7) != Some(PROJECT_SEM_HNSW_MAGIC.as_slice()) {
+        return Ok(None);
+    }
+    if r.u64() != Some(PROJECT_SEM_HNSW_VERSION) {
+        return Ok(None);
+    }
+    let fp_stored = match r.take(64) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let fp_want = feature_fingerprint.as_bytes();
+    if fp_stored[..fp_want.len().min(64)] != fp_want[..fp_want.len().min(64)]
+        || fp_stored[fp_want.len().min(64)..].iter().any(|&b| b != 0)
+    {
+        return Ok(None);
+    }
+    let (dim, m, efc, efs, rng, max_level, entry, node_count) = match (
+        r.u64(),
+        r.u64(),
+        r.u64(),
+        r.u64(),
+        r.u64(),
+        r.u64(),
+        r.u64(),
+        r.u64(),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f), Some(g), Some(h)) => {
+            (a, b, c, d, e, f, g, h)
+        }
+        _ => return Ok(None),
+    };
+    if dim == 0 || dim > u32::MAX as u64 || node_count != expected_nodes as u64 {
+        return Ok(None);
+    }
+    if m == 0 || m > 1024 || max_level > MAX_LEVEL as u64 {
+        return Ok(None);
+    }
+    let mut idx = HnswIndex::with_params(
+        dim as usize,
+        m as usize,
+        efc as usize,
+        efs as usize,
+        DEFAULT_SEED,
+    );
+    idx.rng = rng;
+    idx.max_level = max_level as u32;
+    idx.entry = match entry {
+        u64::MAX => None,
+        e if e < node_count => Some(e as u32),
+        _ => return Ok(None),
+    };
+    for _ in 0..node_count {
+        let (id, n_layers) = match (r.u32(), r.u64()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Ok(None),
+        };
+        if n_layers == 0 || n_layers > MAX_LEVEL as u64 + 1 {
+            return Ok(None);
+        }
+        let mut vec = Vec::with_capacity(dim as usize);
+        for _ in 0..dim {
+            match r.f32() {
+                Some(x) => vec.push(x),
+                None => return Ok(None),
+            }
+        }
+        let mut neighbors = Vec::with_capacity(n_layers as usize);
+        for _ in 0..n_layers {
+            let n_nb = match r.u64() {
+                Some(n) if n <= node_count => n,
+                _ => return Ok(None),
+            };
+            let mut layer = Vec::with_capacity(n_nb as usize);
+            for _ in 0..n_nb {
+                match r.u32() {
+                    Some(nb) if (nb as u64) < node_count => layer.push(nb),
+                    _ => return Ok(None),
+                }
+            }
+            neighbors.push(layer);
+        }
+        idx.nodes.push(Node { id, vec, neighbors });
+    }
+    if r.pos != bytes.len() || idx.entry.is_none() != idx.nodes.is_empty() {
+        return Ok(None);
+    }
+    if idx.nodes.iter().any(|n| n.vec.len() != idx.dim) {
+        return Ok(None);
+    }
+    Ok(Some(idx))
+}
+
+/// Build the in-memory HNSW over `entries` — the same owner-slot plan
+/// [`semantic_candidates`] uses — and return it with the sorted owner
+/// ids the graph labels refer to.
+fn build_sem_hnsw(entries: &[SemanticVecs]) -> (HnswIndex, Vec<i64>) {
+    let (image_ids, owner_for_entry) = owner_plan(entries);
+    let dim = entries.first().map(|e| e.vector.len()).unwrap_or(0).max(1);
+    let mut idx = HnswIndex::new(dim);
+    for (i, e) in entries.iter().enumerate() {
+        idx.insert(owner_for_entry[i], &e.vector);
+    }
+    (idx, image_ids)
+}
+
+/// Result of [`load_or_build_project_sem_index`]: embedding entries plus
+/// a ready-to-query [`HnswIndex`] over the owner slots in `owner_ids`.
+pub struct ProjectSemIndex {
+    /// Per-image vectors in the caller's `image_ids` order.
+    pub entries: Vec<SemanticVecs>,
+    /// Sorted image ids — the dense owner slots `index` labels map to,
+    /// for [`semantic_candidates_with_index`].
+    pub owner_ids: Vec<i64>,
+    /// Queryable ANN index over the owner slots (rebuilt or restored).
+    pub index: HnswIndex,
+    /// `vectors.bin`/`meta.json` hit — model inference skipped.
+    pub vecs_loaded: bool,
+    /// `hnsw.bin` hit — graph rebuild skipped too.
+    pub graph_loaded: bool,
+}
+
+/// Embeddings + HNSW for a project's `image_ids`: reuse the persisted
 /// `project_{id}_sem/` bundle when `dir` is set and valid, else embed
-/// each id via `embed` and (when `dir` is set) save for the next scan.
-/// `embed` maps an image_id to its vector; `None`/wrong-dim results
-/// degrade to the zero vector (cosine 0 → never a candidate), matching
-/// the in-memory path. Returns `(entries, index_loaded)` — entries in
-/// `image_ids` order.
+/// each id via `embed`, rebuild the graph, and (when `dir` is set) save
+/// both for the next scan. `embed` maps an image_id to its vector;
+/// `None`/wrong-dim results degrade to the zero vector (cosine 0 →
+/// never a candidate), matching the in-memory path.
+///
+/// A valid `hnsw.bin` (fingerprint-bound to the verified vectors)
+/// restores the graph without re-inserting; a missing/stale graph
+/// rebuilds from the loaded vectors and overwrites `hnsw.bin`.
 pub fn load_or_build_project_sem_index<F>(
     dir: Option<&std::path::Path>,
     image_ids: &[i64],
     embedder: &dyn SemanticEmbedder,
     embed: F,
-) -> std::io::Result<(Vec<SemanticVecs>, bool)>
+) -> std::io::Result<ProjectSemIndex>
 where
     F: Fn(i64) -> Option<Vec<f32>> + Sync,
 {
     let fp = embedder.fingerprint();
     if let Some(d) = dir {
         if let Some(v) = try_load_project_sem_index(d, image_ids, &fp, embedder.dim())? {
-            return Ok((v, true));
+            let (sorted_ids, flat) = sorted_flat(&v);
+            let dim = v.first().map(|e| e.vector.len()).unwrap_or(0);
+            let sem_fp = sem_fingerprint(&sorted_ids, &flat, dim);
+            if let Some(index) = try_load_project_sem_hnsw(d, &sem_fp, v.len())? {
+                return Ok(ProjectSemIndex {
+                    entries: v,
+                    owner_ids: sorted_ids,
+                    index,
+                    vecs_loaded: true,
+                    graph_loaded: true,
+                });
+            }
+            // Vectors valid but graph missing/stale — rebuild + persist.
+            let (index, owner_ids) = build_sem_hnsw(&v);
+            save_project_sem_hnsw(d, &index, &sem_fp)?;
+            return Ok(ProjectSemIndex {
+                entries: v,
+                owner_ids,
+                index,
+                vecs_loaded: true,
+                graph_loaded: false,
+            });
         }
     }
     // Backends may learn their dim on first embed (ONNX dynamic output);
@@ -927,10 +1195,19 @@ where
             e.vector = vec![0.0; dim];
         }
     }
+    let (index, owner_ids) = build_sem_hnsw(&entries);
     if let Some(d) = dir {
         save_project_sem_index(d, &entries, &fp)?;
+        let (sorted_ids, flat) = sorted_flat(&entries);
+        save_project_sem_hnsw(d, &index, &sem_fingerprint(&sorted_ids, &flat, dim))?;
     }
-    Ok((entries, false))
+    Ok(ProjectSemIndex {
+        entries,
+        owner_ids,
+        index,
+        vecs_loaded: false,
+        graph_loaded: false,
+    })
 }
 
 #[cfg(test)]
@@ -1569,31 +1846,172 @@ mod tests {
                 Some(v)
             }
         };
-        let (v, loaded) =
+        let s =
             load_or_build_project_sem_index(Some(&dir), &ids, &embedder, mk_embed(&calls)).unwrap();
-        assert!(!loaded && calls.load(AOrd::Relaxed) == 3);
-        assert_eq!(v.len(), 3);
+        assert!(!s.vecs_loaded && !s.graph_loaded && calls.load(AOrd::Relaxed) == 3);
+        assert_eq!(s.entries.len(), 3);
         // second call: bundle hit, no embedding
         calls.store(0, AOrd::Relaxed);
-        let (v2, loaded2) =
+        let s2 =
             load_or_build_project_sem_index(Some(&dir), &ids, &embedder, mk_embed(&calls)).unwrap();
-        assert!(loaded2 && calls.load(AOrd::Relaxed) == 0);
+        assert!(s2.vecs_loaded && s2.graph_loaded && calls.load(AOrd::Relaxed) == 0);
         let tup = |vv: &[SemanticVecs]| {
             vv.iter()
                 .map(|e| (e.image_id, e.vector.clone()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(tup(&v), tup(&v2));
+        assert_eq!(tup(&s.entries), tup(&s2.entries));
         // embedder identity change → rebuild (different stub grid)
         let other = StubEmbedder::with_grid(8);
         calls.store(0, AOrd::Relaxed);
-        let (_, loaded3) =
+        let s3 =
             load_or_build_project_sem_index(Some(&dir), &ids, &other, mk_embed(&calls)).unwrap();
-        assert!(!loaded3 && calls.load(AOrd::Relaxed) == 3);
+        assert!(!s3.vecs_loaded && calls.load(AOrd::Relaxed) == 3);
         // no dir → pure in-memory path, nothing persisted
-        let (v3, loaded4) =
-            load_or_build_project_sem_index(None, &ids, &embedder, mk_embed(&calls)).unwrap();
-        assert!(!loaded4 && v3.len() == 3);
+        let s4 = load_or_build_project_sem_index(None, &ids, &embedder, mk_embed(&calls)).unwrap();
+        assert!(!s4.vecs_loaded && !s4.graph_loaded && s4.entries.len() == 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// hnsw.bin round-trip: a restored graph answers queries identically
+    /// to the freshly built index over the same vectors (deterministic —
+    /// same nodes, same neighbour lists, same entry point).
+    #[test]
+    fn hnsw_bin_roundtrip_query_parity() {
+        let dir = tmp_dir("hnsw").join("project_7_sem");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (vecs, _cluster) = clustered(32, 4, 12, 0.05, 7);
+        let entries: Vec<SemanticVecs> = vecs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| SemanticVecs {
+                image_id: i as i64,
+                vector: v.clone(),
+            })
+            .collect();
+        let (idx, _ids) = build_sem_hnsw(&entries);
+        let fp = "deadbeef";
+        save_project_sem_hnsw(&dir, &idx, fp).unwrap();
+        let back = try_load_project_sem_hnsw(&dir, fp, entries.len())
+            .unwrap()
+            .expect("graph should load");
+        for q in vecs.iter().step_by(3) {
+            assert_eq!(idx.query(q, 5), back.query(q, 5));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every staleness axis on hnsw.bin must refuse the graph — the
+    /// caller then rebuilds from verified vectors, never reuses a graph
+    /// bound to other data.
+    #[test]
+    fn hnsw_bin_rejects_stale_or_corrupt() {
+        let dir = tmp_dir("hnsw-inv").join("project_7_sem");
+        std::fs::create_dir_all(&dir).unwrap();
+        let entries: Vec<SemanticVecs> = (0..6)
+            .map(|i| SemanticVecs {
+                image_id: i as i64,
+                vector: vec![i as f32 + 1.0, 1.0, 0.5],
+            })
+            .collect();
+        let (idx, _ids) = build_sem_hnsw(&entries);
+        save_project_sem_hnsw(&dir, &idx, "fp-a").unwrap();
+        // fingerprint mismatch (vectors were rebuilt) → miss
+        assert!(try_load_project_sem_hnsw(&dir, "fp-b", entries.len())
+            .unwrap()
+            .is_none());
+        // node-count mismatch (different image set) → miss
+        assert!(try_load_project_sem_hnsw(&dir, "fp-a", entries.len() + 1)
+            .unwrap()
+            .is_none());
+        // missing file → miss
+        assert!(
+            try_load_project_sem_hnsw(&dir.join("nope"), "fp-a", entries.len())
+                .unwrap()
+                .is_none()
+        );
+        // corrupt magic → miss
+        let f = dir.join("hnsw.bin");
+        let mut b = std::fs::read(&f).unwrap();
+        b[0] ^= 0xff;
+        std::fs::write(&f, &b).unwrap();
+        assert!(try_load_project_sem_hnsw(&dir, "fp-a", entries.len())
+            .unwrap()
+            .is_none());
+        // truncated tail → miss
+        let mut b = std::fs::read(&f).unwrap();
+        b.truncate(b.len() / 2);
+        // restore magic so the failure is structural, not the magic check
+        b[0] = b'I';
+        std::fs::write(&f, &b).unwrap();
+        assert!(try_load_project_sem_hnsw(&dir, "fp-a", entries.len())
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end persist path: first armed scan embeds + builds + saves;
+    /// second scan hits both vectors.bin and hnsw.bin (zero embed calls)
+    /// and emits the same candidate pairs as a fresh in-memory build.
+    /// A corrupted hnsw.bin degrades to a graph rebuild off the verified
+    /// vectors (vecs hit, graph rebuilt), still with zero embed calls.
+    #[test]
+    fn load_or_build_sem_index_persists_hnsw() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        use std::sync::Arc;
+        let dir = tmp_dir("hnsw-lob").join("project_7_sem");
+        let embedder = StubEmbedder::default();
+        let dim = embedder.dim();
+        // One-hot-ish deterministic vectors; ids 1 and 9 share a base
+        // direction so a real near-cosine pair is emitted (non-trivial
+        // parity — the loaded graph must actually answer queries).
+        let mk_embed = move |calls: &Arc<AtomicUsize>| {
+            let c = Arc::clone(calls);
+            move |id: i64| {
+                c.fetch_add(1, AOrd::Relaxed);
+                let mut v = vec![0.0; dim];
+                let slot = if id == 9 {
+                    1
+                } else {
+                    id.unsigned_abs() as usize
+                } % dim;
+                v[slot] = 10.0;
+                v[2] += id as f32 * 0.001;
+                Some(v)
+            }
+        };
+        let ids = [5i64, 1, 9, 2, 7, 3];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let s1 =
+            load_or_build_project_sem_index(Some(&dir), &ids, &embedder, mk_embed(&calls)).unwrap();
+        assert!(!s1.vecs_loaded && !s1.graph_loaded);
+        assert_eq!(calls.load(AOrd::Relaxed), ids.len());
+        assert!(dir.join("hnsw.bin").is_file());
+        let pairs1 = semantic_candidates_with_index(&s1.entries, &s1.index, &s1.owner_ids, 8, 0.5);
+        assert!(!pairs1.is_empty(), "expected a real near pair (1,9)");
+
+        // Second call: full cache hit — vectors AND graph restored.
+        calls.store(0, AOrd::Relaxed);
+        let s2 =
+            load_or_build_project_sem_index(Some(&dir), &ids, &embedder, mk_embed(&calls)).unwrap();
+        assert!(s2.vecs_loaded && s2.graph_loaded);
+        assert_eq!(calls.load(AOrd::Relaxed), 0);
+        let pairs2 = semantic_candidates_with_index(&s2.entries, &s2.index, &s2.owner_ids, 8, 0.5);
+        assert_eq!(pairs1, pairs2);
+        // parity with the plain in-memory build
+        assert_eq!(pairs1, semantic_candidates(&s1.entries, 8, 0.5));
+
+        // Corrupt the graph → vectors still hit, graph rebuilt, same pairs.
+        let mut b = std::fs::read(dir.join("hnsw.bin")).unwrap();
+        b[0] ^= 0xff;
+        std::fs::write(dir.join("hnsw.bin"), &b).unwrap();
+        calls.store(0, AOrd::Relaxed);
+        let s3 =
+            load_or_build_project_sem_index(Some(&dir), &ids, &embedder, mk_embed(&calls)).unwrap();
+        assert!(s3.vecs_loaded && !s3.graph_loaded);
+        assert_eq!(calls.load(AOrd::Relaxed), 0);
+        let pairs3 = semantic_candidates_with_index(&s3.entries, &s3.index, &s3.owner_ids, 8, 0.5);
+        assert_eq!(pairs1, pairs3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
