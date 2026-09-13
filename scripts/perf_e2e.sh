@@ -110,6 +110,25 @@ ls "$CORPUS"/*.png | xargs -P "$CONC" -I{} \
 t1=$(elapsed_s)
 echo "upload concurrent x$CONC ${N}x: $(ms "$(python3 -c "print($t1-$t0)")") total"
 
+# ---- semantic check: every dup family must land in one group ----
+curl -sf -X POST "$BASE/projects/$PID/smart-compare" $J \
+  -d '{"threshold":0.8,"min_agree":2}' > /tmp/itrace-perf-smart.json
+python3 - <<'PY'
+import json, re, sys
+d = json.load(open('/tmp/itrace-perf-smart.json'))
+groups = d.get('duplicate_groups', [])
+fams = {}
+for g in groups:
+    for im in g.get('images', []):
+        fam = re.sub(r'_.*', '', im['filename'])
+        fams.setdefault(fam, 0)
+        # flag a group mixing two families
+    fs = {re.sub(r'_.*', '', i['filename']) for i in g.get('images', [])}
+    if len(fs) > 1:
+        print(f'WARN cross-family group: {fs}', file=sys.stderr)
+print(f'smart-compare: {len(groups)} dup groups covering families: {sorted(fams)}')
+PY
+
 echo
 echo "================ results ================"
 printf '%s\n' "${RESULTS[@]}"
