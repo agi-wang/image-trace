@@ -212,7 +212,7 @@ still forces a rebuild.
 | 2 | `PostgresStore` backend behind the `ImageStore` trait | **done** |
 | 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
 | 4 | Semantic DINOv2/HNSW recall channel | **done — foundation** (stub + HNSW + wiring; R3 double regression) |
-| 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **in progress — R2: `project_{id}_sem/` persist + fingerprint** |
+| 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **done — R1 ONNX skeleton + R2 `project_{id}_sem/` persist/fingerprint; R3 double regression** |
 
 ### Phase 1 delivered
 
@@ -376,12 +376,14 @@ and dedup output is bit-identical to the pre-R2 baseline.
 
 **Follow-ups:** real DINOv2 weights + calibration (Phase 5; the
 `semantic-onnx` backend skeleton is in — see below); persisted
-`project_{id}_sem/` bundle (`image_ids.bin` + serialized graph) with the
-same feature-fingerprint invalidation as `ITMIHP1`/`ITMIHC1`; sharding the
+`project_{id}_sem/` bundle (**shipped Phase 5 R2** — `image_ids.bin` +
+`vectors.bin`, `SemanticEmbedder::fingerprint` + BLAKE3 payload
+invalidation like `ITMIHP1`/`ITMIHC1`; the in-memory HNSW still
+rebuilds per scan); sharding the
 graph across nodes (per-shard HNSW or per-node full graph) once the
 `ITMIHN1` transport seam is real.
 
-### Phase 5 (in progress) — ONNX semantic backend
+### Phase 5 (done — R1+R2; R3 evidence gathered) — ONNX semantic backend
 
 `itrace_core::semantic_onnx` (R1, behind the opt-in `semantic-onnx`
 cargo feature) provides **`OnnxSemanticEmbedder`**: a `SemanticEmbedder`
@@ -436,6 +438,13 @@ Wiring: `load_or_build_project_sem_index` is called by both
 `run_cli_dedup` and `run_dedup_scan` when armed; CLI prints
 `+N sem (cached)` on a bundle hit, the `/dedup` JSON gains
 `sem_index_loaded`. Flag off → everything skipped as before.
+
+**R3 evidence:** `scripts/smoke_semantic_persist.sh` dedups one project
+three times on a shared index dir — flag-off baseline, then armed twice:
+run 1 builds `project_{id}_sem/` (`+N sem`), run 2 reports
+`+N sem (cached)` with `index_loaded=true`, and confirmed-group
+membership is asserted identical across all three scans. See
+`datasets/built/reports/PHASE5_R3_DOUBLE_REGRESSION.md`.
 
 Remaining follow-ups: real `dinov2_vits14`/`vitb14` weights + recall
 calibration on transformed-image fixtures; persisting the HNSW graph

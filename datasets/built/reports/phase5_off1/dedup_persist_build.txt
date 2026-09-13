@@ -1,17 +1,17 @@
 duplicate group 1 (confidence 1.0000):
-  - skimage_ihc__orig.png (31)
-  - skimage_ihc__rot90.png (32)
-  - skimage_ihc__hflip.png (33)
-  - skimage_ihc__crop70.png (34)
-  - skimage_ihc__slice_r0c0.png (35)
-  - skimage_ihc__slice_r1c1.png (36)
-duplicate group 2 (confidence 1.0000):
   - histo_synth_1__orig.png (25)
   - histo_synth_1__rot90.png (26)
   - histo_synth_1__hflip.png (27)
   - histo_synth_1__crop70.png (28)
   - histo_synth_1__slice_r0c0.png (29)
   - histo_synth_1__slice_r1c1.png (30)
+duplicate group 2 (confidence 1.0000):
+  - skimage_ihc__orig.png (31)
+  - skimage_ihc__rot90.png (32)
+  - skimage_ihc__hflip.png (33)
+  - skimage_ihc__crop70.png (34)
+  - skimage_ihc__slice_r0c0.png (35)
+  - skimage_ihc__slice_r1c1.png (36)
 duplicate group 3 (confidence 1.0000):
   - sem_pollen_wiki__orig.png (7)
   - sem_pollen_wiki__rot90.png (8)
@@ -20,24 +20,24 @@ duplicate group 3 (confidence 1.0000):
   - sem_pollen_wiki__slice_r0c0.png (11)
   - sem_pollen_wiki__slice_r1c1.png (12)
 duplicate group 4 (confidence 1.0000):
-  - fluor_cells__orig.png (19)
-  - fluor_cells__rot90.png (20)
-  - fluor_cells__hflip.png (21)
-  - fluor_cells__crop70.png (22)
-  - fluor_cells__slice_r0c0.png (23)
-  - fluor_cells__slice_r1c1.png (24)
-duplicate group 5 (confidence 1.0000):
   - fluor_synth_1__orig.png (13)
   - fluor_synth_1__rot90.png (14)
   - fluor_synth_1__hflip.png (15)
   - fluor_synth_1__crop70.png (16)
   - fluor_synth_1__slice_r0c0.png (17)
   - fluor_synth_1__slice_r1c1.png (18)
-duplicate group 6 (confidence 1.0000):
+duplicate group 5 (confidence 1.0000):
   - sem_synth_1__orig.png (1)
   - sem_synth_1__rot90.png (2)
   - sem_synth_1__hflip.png (3)
   - sem_synth_1__crop70.png (4)
   - sem_synth_1__slice_r0c0.png (5)
   - sem_synth_1__slice_r1c1.png (6)
-indexed 36, candidates 18 (+74 crop), naive 630, 6 dup groups / 36 images, scan 2.857s, index_loaded=true, crop_index_loaded=true
+duplicate group 6 (confidence 1.0000):
+  - fluor_cells__orig.png (19)
+  - fluor_cells__rot90.png (20)
+  - fluor_cells__hflip.png (21)
+  - fluor_cells__crop70.png (22)
+  - fluor_cells__slice_r0c0.png (23)
+  - fluor_cells__slice_r1c1.png (24)
+indexed 36, candidates 18 (+74 crop), naive 630, 6 dup groups / 36 images, scan 2.824s, index_loaded=false, crop_index_loaded=false
