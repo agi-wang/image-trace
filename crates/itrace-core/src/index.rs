@@ -532,7 +532,7 @@ fn owner_plan_crop(entries: &[CropKeys]) -> (Vec<i64>, Vec<u32>) {
     (image_ids, owner_for_entry)
 }
 
-fn write_image_ids_bin(path: &std::path::Path, image_ids: &[i64]) -> std::io::Result<()> {
+pub(crate) fn write_image_ids_bin(path: &std::path::Path, image_ids: &[i64]) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::File::create(path)?;
     for &id in image_ids {
@@ -541,7 +541,7 @@ fn write_image_ids_bin(path: &std::path::Path, image_ids: &[i64]) -> std::io::Re
     Ok(())
 }
 
-fn read_image_ids_bin(path: &std::path::Path, expected: usize) -> std::io::Result<Vec<i64>> {
+pub(crate) fn read_image_ids_bin(path: &std::path::Path, expected: usize) -> std::io::Result<Vec<i64>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut out = Vec::with_capacity(expected);
@@ -570,7 +570,7 @@ fn read_image_ids_bin(path: &std::path::Path, expected: usize) -> std::io::Resul
     Ok(out)
 }
 
-fn image_id_sets_equal(persisted: &[i64], mut current: Vec<i64>) -> bool {
+pub(crate) fn image_id_sets_equal(persisted: &[i64], mut current: Vec<i64>) -> bool {
     if persisted.len() != current.len() {
         return false;
     }

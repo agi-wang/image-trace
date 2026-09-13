@@ -63,6 +63,9 @@ pub struct OnnxSemanticEmbedder {
     /// first successful `embed_bytes` (`0` = unknown until then — the
     /// callers' zero-vector fallback handles that gracefully).
     dim: AtomicUsize,
+    /// `onnx:{path}:{blake3-of-weights}` — changing the model path or the
+    /// weights bytes invalidates a persisted `project_{id}_sem/` bundle.
+    fingerprint: String,
 }
 
 impl OnnxSemanticEmbedder {
@@ -88,6 +91,10 @@ impl OnnxSemanticEmbedder {
             _ => ort::init().commit(),
         }
         .map_err(|e| anyhow!("onnxruntime init: {e}"))?;
+        let mut h = blake3::Hasher::new();
+        h.update_reader(std::fs::File::open(model_path)?)
+            .with_context(|| format!("hash {}", model_path.display()))?;
+        let fingerprint = format!("onnx:{}:{}", model_path.display(), h.finalize().to_hex());
         let session = ort::session::Session::builder()
             .map_err(|e| anyhow!("ort session builder: {e}"))?
             .commit_from_file(model_path)
@@ -115,6 +122,7 @@ impl OnnxSemanticEmbedder {
             session: Mutex::new(session),
             input_name,
             dim: AtomicUsize::new(dim),
+            fingerprint,
         })
     }
 }
@@ -178,6 +186,10 @@ impl SemanticEmbedder for OnnxSemanticEmbedder {
         };
         self.dim.store(vec.len(), Ordering::Relaxed);
         Ok(vec)
+    }
+
+    fn fingerprint(&self) -> String {
+        self.fingerprint.clone()
     }
 }
 

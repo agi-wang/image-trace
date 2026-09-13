@@ -25,9 +25,10 @@
 //! (`itrace-cli dedup` and the server's `/dedup` scan) run it:
 //!
 //! 1. Embed: each image in the gate scan's `entries` is embedded via
-//!    `embedder.embed_bytes(blob)` — per-scan decoding today (R2 dev
-//!    path); a persisted feature/`project_{id}_sem/` bundle mirroring
-//!    `ITMIHP1` is the follow-up.
+//!    `embedder.embed_bytes(blob)`. With `ITRACE_MIH_INDEX_DIR` set the
+//!    vectors persist in a `project_{id}_sem/` bundle (see
+//!    [`load_or_build_project_sem_index`]) so repeat scans skip the
+//!    model entirely; otherwise they're recomputed per scan.
 //! 2. Recall: [`semantic_candidates`] builds an in-memory [`HnswIndex`]
 //!    over those vectors and emits `(entry_i, entry_j)` candidate pairs
 //!    at `resolve_semantic_k` / `resolve_semantic_min_cosine`.
@@ -67,6 +68,11 @@ pub trait SemanticEmbedder: Send + Sync {
     fn embed_path(&self, path: &std::path::Path) -> anyhow::Result<Vec<f32>> {
         self.embed_bytes(&std::fs::read(path)?)
     }
+    /// Backend identity for the persisted `project_{id}_sem/` bundle: any
+    /// change that alters emitted vectors — different model path or
+    /// weights bytes, stub config, backend swap — **must** change this
+    /// string so stale vectors are never silently reused.
+    fn fingerprint(&self) -> String;
 }
 
 /// Production embedder seam: resolves the configured embedding backend.
@@ -279,6 +285,10 @@ impl SemanticEmbedder for StubEmbedder {
             Ok(img) => Ok(self.embed_gray(&crate::image_io::to_gray(&img))),
             Err(_) => Ok(hash_embed(self.dim(), bytes)),
         }
+    }
+
+    fn fingerprint(&self) -> String {
+        format!("stub:g{}", self.grid)
     }
 }
 
@@ -703,6 +713,226 @@ pub fn union_candidate_pairs(
     base.dedup();
 }
 
+// ---------- persisted semantic bundle (`project_{id}_sem/`) ----------
+
+/// `{base}/project_{id}_sem` — project-scoped semantic bundle root,
+/// alongside the `project_{id}` gate / `project_{id}_crop` bundles under
+/// `ITRACE_MIH_INDEX_DIR`.
+///
+/// ```text
+/// project_{id}_sem/
+///   meta.json      {"magic":"ITSEMP1","version":1,
+///                   "embedder":"<SemanticEmbedder::fingerprint>",
+///                   "dim":D,"image_count":K,
+///                   "feature_fingerprint":"<blake3 hex>"}
+///   image_ids.bin  K × i64 LE — owner slots, sorted ascending
+///   vectors.bin    K × D × f32 LE — row i is the vector of
+///                  image_ids.bin[i]
+/// ```
+///
+/// Only the embedding vectors are persisted — the in-memory
+/// [`HnswIndex`] is rebuilt per scan (cheap next to model inference).
+/// Invalidation mirrors the MIH bundles: magic/version, embedder
+/// fingerprint, dim, the exact image_id set, and a BLAKE3
+/// `feature_fingerprint` over the stored payload; any mismatch rebuilds
+/// and overwrites — a stale bundle is never silently reused.
+pub fn project_sem_index_path(base: &std::path::Path, project_id: i64) -> std::path::PathBuf {
+    base.join(format!("project_{project_id}_sem"))
+}
+
+const PROJECT_SEM_MAGIC: &str = "ITSEMP1";
+const PROJECT_SEM_VERSION: u64 = 1;
+
+/// BLAKE3 hex over the bundle payload in stored (sorted-by-image_id)
+/// order — catches corrupted or recomputed vectors, not just image-set
+/// changes.
+fn sem_fingerprint(image_ids: &[i64], flat: &[f32], dim: usize) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(&(image_ids.len() as u64).to_le_bytes());
+    h.update(&(dim as u64).to_le_bytes());
+    for (i, &id) in image_ids.iter().enumerate() {
+        h.update(&id.to_le_bytes());
+        for &x in &flat[i * dim..(i + 1) * dim] {
+            h.update(&x.to_le_bytes());
+        }
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// Save a `project_{id}_sem/` bundle (layout above). Overwrites `dir`.
+/// `entries` are stored in sorted-by-image_id order; all vectors must
+/// share `dim`.
+pub fn save_project_sem_index(
+    dir: &std::path::Path,
+    entries: &[SemanticVecs],
+    embedder_fingerprint: &str,
+) -> std::io::Result<()> {
+    let dim = entries.first().map(|e| e.vector.len()).unwrap_or(0);
+    let mut sorted: Vec<&SemanticVecs> = entries.iter().collect();
+    sorted.sort_unstable_by_key(|e| e.image_id);
+    let bad = std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "semantic vectors with mismatched dims",
+    );
+    let image_ids: Vec<i64> = sorted.iter().map(|e| e.image_id).collect();
+    let mut flat = Vec::with_capacity(image_ids.len() * dim);
+    for e in &sorted {
+        if e.vector.len() != dim {
+            return Err(bad);
+        }
+        flat.extend_from_slice(&e.vector);
+    }
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    let meta = serde_json::json!({
+        "magic": PROJECT_SEM_MAGIC,
+        "version": PROJECT_SEM_VERSION,
+        "embedder": embedder_fingerprint,
+        "dim": dim,
+        "image_count": image_ids.len(),
+        "feature_fingerprint": sem_fingerprint(&image_ids, &flat, dim),
+    });
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_vec_pretty(&meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+    )?;
+    crate::index::write_image_ids_bin(&dir.join("image_ids.bin"), &image_ids)?;
+    let mut f = std::fs::File::create(dir.join("vectors.bin"))?;
+    use std::io::Write;
+    for &x in &flat {
+        f.write_all(&x.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// Load a `project_{id}_sem/` bundle iff it is fully compatible:
+/// magic/version, `embedder_fingerprint` and `dim` match the live
+/// backend, the stored image_id set equals `image_ids` (any order), and
+/// the stored `feature_fingerprint` recomputes over the payload on disk.
+/// Returns `None` on any mismatch/corruption (caller rebuilds); vectors
+/// come back in `image_ids` order.
+pub fn try_load_project_sem_index(
+    dir: &std::path::Path,
+    image_ids: &[i64],
+    embedder_fingerprint: &str,
+    dim: usize,
+) -> std::io::Result<Option<Vec<SemanticVecs>>> {
+    let meta_path = dir.join("meta.json");
+    if image_ids.is_empty() || !meta_path.is_file() {
+        return Ok(None);
+    }
+    let meta_bytes = std::fs::read(&meta_path)?;
+    let meta: serde_json::Value = serde_json::from_slice(&meta_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // `dim == 0` means "backend hasn't embedded yet / dynamic output" —
+    // accept the stored width (returned vectors self-describe it).
+    if meta.get("magic").and_then(|v| v.as_str()) != Some(PROJECT_SEM_MAGIC)
+        || meta.get("version").and_then(|v| v.as_u64()) != Some(PROJECT_SEM_VERSION)
+        || meta.get("embedder").and_then(|v| v.as_str()) != Some(embedder_fingerprint)
+        || (dim != 0 && meta.get("dim").and_then(|v| v.as_u64()) != Some(dim as u64))
+    {
+        return Ok(None);
+    }
+    let dim = meta.get("dim").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    if dim == 0 {
+        return Ok(None);
+    }
+    let image_count = meta
+        .get("image_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let stored_ids = match crate::index::read_image_ids_bin(&dir.join("image_ids.bin"), image_count)
+    {
+        Ok(ids) => ids,
+        Err(_) => return Ok(None),
+    };
+    if !crate::index::image_id_sets_equal(&stored_ids, image_ids.to_vec()) {
+        return Ok(None);
+    }
+    let bytes = match std::fs::read(dir.join("vectors.bin")) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    if bytes.len() != image_count * dim * 4 {
+        return Ok(None);
+    }
+    let flat: Vec<f32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| f32::from_le_bytes(c))
+        .collect();
+    let stored_fp = meta.get("feature_fingerprint").and_then(|v| v.as_str());
+    if stored_fp != Some(sem_fingerprint(&stored_ids, &flat, dim).as_str()) {
+        return Ok(None);
+    }
+    // stored order (sorted) → caller's `image_ids` order
+    let pos: HashMap<i64, usize> = stored_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
+    Ok(Some(
+        image_ids
+            .iter()
+            .map(|&id| SemanticVecs {
+                image_id: id,
+                vector: flat[pos[&id] * dim..(pos[&id] + 1) * dim].to_vec(),
+            })
+            .collect(),
+    ))
+}
+
+/// Embeddings for a project's `image_ids`: reuse the persisted
+/// `project_{id}_sem/` bundle when `dir` is set and valid, else embed
+/// each id via `embed` and (when `dir` is set) save for the next scan.
+/// `embed` maps an image_id to its vector; `None`/wrong-dim results
+/// degrade to the zero vector (cosine 0 → never a candidate), matching
+/// the in-memory path. Returns `(entries, index_loaded)` — entries in
+/// `image_ids` order.
+pub fn load_or_build_project_sem_index<F>(
+    dir: Option<&std::path::Path>,
+    image_ids: &[i64],
+    embedder: &dyn SemanticEmbedder,
+    embed: F,
+) -> std::io::Result<(Vec<SemanticVecs>, bool)>
+where
+    F: Fn(i64) -> Option<Vec<f32>> + Sync,
+{
+    let fp = embedder.fingerprint();
+    if let Some(d) = dir {
+        if let Some(v) = try_load_project_sem_index(d, image_ids, &fp, embedder.dim())? {
+            return Ok((v, true));
+        }
+    }
+    // Backends may learn their dim on first embed (ONNX dynamic output);
+    // take the width of the first successful vector as canonical.
+    let mut entries: Vec<SemanticVecs> = image_ids
+        .par_iter()
+        .map(|&id| SemanticVecs {
+            image_id: id,
+            vector: embed(id).unwrap_or_default(),
+        })
+        .collect();
+    let dim = entries
+        .iter()
+        .find(|e| !e.vector.is_empty())
+        .map(|e| e.vector.len())
+        .unwrap_or_else(|| embedder.dim());
+    for e in &mut entries {
+        if e.vector.len() != dim {
+            e.vector = vec![0.0; dim];
+        }
+    }
+    if let Some(d) = dir {
+        save_project_sem_index(d, &entries, &fp)?;
+    }
+    Ok((entries, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,6 +1225,9 @@ mod tests {
             fn dim(&self) -> usize {
                 4
             }
+            fn fingerprint(&self) -> String {
+                "stub:test".to_string()
+            }
             fn embed_bytes(&self, bytes: &[u8]) -> anyhow::Result<Vec<f32>> {
                 // deterministic pseudo-embedding from bytes
                 Ok(vec![
@@ -1215,6 +1448,159 @@ mod tests {
         let pairs = semantic_candidates(&entries, 8, DEFAULT_SEMANTIC_MIN_COSINE);
         assert!(pairs.contains(&(0, 1)), "near-dup pair missing: {pairs:?}");
         assert!(!pairs.iter().any(|&(a, b)| a == 2 || b == 2));
+    }
+
+    /// Unique temp dir per test (pid + counter) — no external crate.
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "itrace-sem-persist-{}-{}-{tag}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn sem_bundle_roundtrip_preserves_caller_order() {
+        let dir = tmp_dir("rt").join("project_7_sem");
+        let entries = vec![
+            SemanticVecs {
+                image_id: 9,
+                vector: vec![1.0, 2.0],
+            },
+            SemanticVecs {
+                image_id: 5,
+                vector: vec![0.0, 1.0],
+            },
+            SemanticVecs {
+                image_id: 2,
+                vector: vec![3.5, -4.0],
+            },
+        ];
+        save_project_sem_index(&dir, &entries, "stub:g2").unwrap();
+        assert!(dir.join("meta.json").is_file());
+        assert!(dir.join("image_ids.bin").is_file());
+        assert!(dir.join("vectors.bin").is_file());
+        // Caller asks in a different order — vectors follow the caller.
+        let want = vec![5i64, 9, 2];
+        let v = try_load_project_sem_index(&dir, &want, "stub:g2", 2)
+            .unwrap()
+            .expect("bundle should load");
+        assert_eq!(v.iter().map(|e| e.image_id).collect::<Vec<_>>(), want);
+        assert_eq!(v[0].vector, vec![0.0, 1.0]);
+        assert_eq!(v[1].vector, vec![1.0, 2.0]);
+        assert_eq!(v[2].vector, vec![3.5, -4.0]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every invalidation axis must refuse a stale bundle — never reuse.
+    #[test]
+    fn sem_bundle_fingerprint_invalidation() {
+        let dir = tmp_dir("inv").join("project_7_sem");
+        let ids = [1i64, 2];
+        let entries: Vec<SemanticVecs> = ids
+            .iter()
+            .map(|&image_id| SemanticVecs {
+                image_id,
+                vector: vec![image_id as f32, 1.0],
+            })
+            .collect();
+        save_project_sem_index(&dir, &entries, "stub:g2").unwrap();
+        let fp = "stub:g2";
+        // baseline loads
+        assert!(try_load_project_sem_index(&dir, &ids, fp, 2)
+            .unwrap()
+            .is_some());
+        // embedder fingerprint change (e.g. different model path) → miss
+        assert!(
+            try_load_project_sem_index(&dir, &ids, "onnx:/other.onnx", 2)
+                .unwrap()
+                .is_none()
+        );
+        // dim mismatch → miss
+        assert!(try_load_project_sem_index(&dir, &ids, fp, 4)
+            .unwrap()
+            .is_none());
+        // image set change → miss
+        assert!(try_load_project_sem_index(&dir, &[1, 2, 3], fp, 2)
+            .unwrap()
+            .is_none());
+        // corrupted vectors.bin → fingerprint recompute fails → miss
+        let vb = dir.join("vectors.bin");
+        let mut bytes = std::fs::read(&vb).unwrap();
+        bytes[0] ^= 0xff;
+        std::fs::write(&vb, bytes).unwrap();
+        assert!(try_load_project_sem_index(&dir, &ids, fp, 2)
+            .unwrap()
+            .is_none());
+        // schema version bump → miss even with pristine payload
+        save_project_sem_index(&dir, &entries, fp).unwrap();
+        let meta_path = dir.join("meta.json");
+        let meta_txt = std::fs::read_to_string(&meta_path)
+            .unwrap()
+            .replace("\"version\": 1", "\"version\": 2");
+        std::fs::write(&meta_path, meta_txt).unwrap();
+        assert!(try_load_project_sem_index(&dir, &ids, fp, 2)
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// load_or_build caches: first call embeds every image, second call
+    /// reuses the bundle with zero embed calls; an embedder-fingerprint
+    /// change forces a rebuild (embed called again), never a stale reuse.
+    #[test]
+    fn load_or_build_sem_index_caches_and_rebuilds() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        use std::sync::Arc;
+        let dir = tmp_dir("lob").join("project_7_sem");
+        let ids = [3i64, 1, 2];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder = StubEmbedder::default();
+        let dim = embedder.dim();
+        let mk_embed = move |calls: &Arc<AtomicUsize>| {
+            let c = Arc::clone(calls);
+            move |id: i64| {
+                c.fetch_add(1, AOrd::Relaxed);
+                let mut v = vec![0.0; dim];
+                v[0] = id as f32;
+                Some(v)
+            }
+        };
+        let (v, loaded) =
+            load_or_build_project_sem_index(Some(&dir), &ids, &embedder, mk_embed(&calls)).unwrap();
+        assert!(!loaded && calls.load(AOrd::Relaxed) == 3);
+        assert_eq!(v.len(), 3);
+        // second call: bundle hit, no embedding
+        calls.store(0, AOrd::Relaxed);
+        let (v2, loaded2) =
+            load_or_build_project_sem_index(Some(&dir), &ids, &embedder, mk_embed(&calls)).unwrap();
+        assert!(loaded2 && calls.load(AOrd::Relaxed) == 0);
+        let tup = |vv: &[SemanticVecs]| {
+            vv.iter()
+                .map(|e| (e.image_id, e.vector.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tup(&v), tup(&v2));
+        // embedder identity change → rebuild (different stub grid)
+        let other = StubEmbedder::with_grid(8);
+        calls.store(0, AOrd::Relaxed);
+        let (_, loaded3) =
+            load_or_build_project_sem_index(Some(&dir), &ids, &other, mk_embed(&calls)).unwrap();
+        assert!(!loaded3 && calls.load(AOrd::Relaxed) == 3);
+        // no dir → pure in-memory path, nothing persisted
+        let (v3, loaded4) =
+            load_or_build_project_sem_index(None, &ids, &embedder, mk_embed(&calls)).unwrap();
+        assert!(!loaded4 && v3.len() == 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_sem_index_path_layout() {
+        let p = project_sem_index_path(std::path::Path::new("/idx"), 42);
+        assert_eq!(p, std::path::Path::new("/idx/project_42_sem"));
     }
 
     #[test]

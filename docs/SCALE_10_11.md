@@ -170,7 +170,7 @@ verification cost is bounded by `min_hits` + radius, not pair count.
 | Variable | Effect |
 |----------|--------|
 | `ITRACE_MIH_SHARD_BITS` | Default shard bit-width when body/CLI omit override |
-| `ITRACE_MIH_INDEX_DIR` | If set, dedup load-or-builds `{DIR}/project_{id}/` gate-index bundle. Unset → identical in-memory rebuild behaviour as before. |
+| `ITRACE_MIH_INDEX_DIR` | If set, dedup load-or-builds `{DIR}/project_{id}/` gate, `project_{id}_crop/`, and (when armed) `project_{id}_sem/` bundles. Unset → identical in-memory rebuild behaviour as before. |
 | `ITRACE_CROP_MIN_HITS` | Distinct probe-key hits required for a crop-channel candidate (default 2) |
 | `ITRACE_SEMANTIC*` | Semantic channel knobs — see Phase 4 table below |
 
@@ -212,7 +212,7 @@ still forces a rebuild.
 | 2 | `PostgresStore` backend behind the `ImageStore` trait | **done** |
 | 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
 | 4 | Semantic DINOv2/HNSW recall channel | **done — foundation** (stub + HNSW + wiring; R3 double regression) |
-| 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **in progress — R1: `semantic-onnx` skeleton** |
+| 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **in progress — R2: `project_{id}_sem/` persist + fingerprint** |
 
 ### Phase 1 delivered
 
@@ -408,10 +408,38 @@ default builds and CI never see the dependency.
   (skipped on CI). **Real DINOv2 weights are never fetched by tests or
   CI.**
 
-R2 candidates: real `dinov2_vits14`/`vitb14` weights + recall
-calibration on transformed-image fixtures; persisted `project_{id}_sem/`
-bundle (`image_ids.bin` + serialized HNSW + feature fingerprint) so
-embeddings aren't recomputed per scan.
+**R2 — persisted `project_{id}_sem/` bundle.** When
+`ITRACE_MIH_INDEX_DIR` is set and the channel is armed, dedup
+load-or-builds `{DIR}/project_{id}_sem/` so repeat scans skip model
+inference (the in-memory HNSW is still rebuilt per scan — cheap next to
+embedding):
+
+```text
+project_{id}_sem/
+  meta.json      {"magic":"ITSEMP1","version":1,
+                  "embedder":"<SemanticEmbedder::fingerprint>",
+                  "dim":D,"image_count":K,
+                  "feature_fingerprint":"<blake3 hex>"}
+  image_ids.bin  K × i64 LE — owner slots, sorted ascending
+  vectors.bin    K × D × f32 LE — row i belongs to image_ids.bin[i]
+```
+
+`SemanticEmbedder::fingerprint()` is the invalidation key — `stub:g16`
+for the stub, `onnx:{path}:{blake3-of-weights}` for the ONNX backend —
+so a changed model path, changed weights bytes, or a backend swap
+refuses the stale bundle and rebuilds. `try_load_project_sem_index`
+additionally requires magic/version, `dim` (`0` = wildcard for
+dynamic-dim backends), the exact image_id set, and a recomputed BLAKE3
+`feature_fingerprint` over the stored payload; any mismatch or
+corruption returns `None` → rebuild + overwrite, never silent reuse.
+Wiring: `load_or_build_project_sem_index` is called by both
+`run_cli_dedup` and `run_dedup_scan` when armed; CLI prints
+`+N sem (cached)` on a bundle hit, the `/dedup` JSON gains
+`sem_index_loaded`. Flag off → everything skipped as before.
+
+Remaining follow-ups: real `dinov2_vits14`/`vitb14` weights + recall
+calibration on transformed-image fixtures; persisting the HNSW graph
+itself (`vectors.bin`-adjacent) if rebuild cost matters at scale.
 
 | Variable | Effect |
 |----------|--------|
