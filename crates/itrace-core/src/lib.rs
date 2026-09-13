@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust image similarity & deduplication primitives:
 //! perceptual hashes, pixel metrics, local feature descriptors,
-//! orientation / slice robustness, union-find grouping.
+//! orientation / slice robustness, union-find grouping, semantic ANN recall.
 
 pub mod compare;
 pub mod descriptors;
@@ -14,6 +14,7 @@ pub mod image_io;
 pub mod index;
 pub mod metrics;
 pub mod ownership;
+pub mod semantic;
 pub mod slice;
 
 use serde::{Deserialize, Serialize};
