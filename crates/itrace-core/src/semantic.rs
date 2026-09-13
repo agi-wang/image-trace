@@ -39,9 +39,12 @@
 //!    skipped entirely and dedup output is bit-identical.
 //!
 //! Backend resolution: `ITRACE_SEMANTIC_MODEL` names a DINOv2 ONNX
-//! weights path (runtime is a follow-up). While no real backend exists,
-//! arming the flag auto-selects [`StubEmbedder`] unless a model path is
-//! configured — `ITRACE_SEMANTIC_STUB=1` forces the stub even then.
+//! weights path — with the `semantic-onnx` cargo feature an
+//! `ort`-backed [`crate::semantic_onnx::OnnxSemanticEmbedder`] loads it
+//! (missing/invalid weights or a missing runtime dylib → inert, never
+//! silently the stub). Without the feature a configured model path stays
+//! inert too. The stub is used only when `ITRACE_SEMANTIC_STUB=1` or
+//! when the channel is armed with no model path.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
@@ -70,8 +73,10 @@ pub trait SemanticEmbedder: Send + Sync {
 ///
 /// - `ITRACE_SEMANTIC` unset/off → `None` (channel disarmed; default).
 /// - Armed + `ITRACE_SEMANTIC_MODEL` set + `ITRACE_SEMANTIC_STUB` unset →
-///   `None`: a configured production weights path never silently degrades
-///   to the stub (the ONNX backend itself is a follow-up).
+///   try the ONNX backend (`semantic-onnx` feature): a configured
+///   production weights path that fails to load — missing/invalid file,
+///   missing runtime dylib, or a build without the feature — resolves
+///   to `None` (inert), never silently to the stub.
 /// - Armed otherwise (no model path, or `ITRACE_SEMANTIC_STUB=1`) →
 ///   [`StubEmbedder`]. The stub is a deterministic dev/test stand-in —
 ///   **not** semantic DINOv2 embeddings.
@@ -79,22 +84,56 @@ pub fn embedder_from_env() -> Option<Box<dyn SemanticEmbedder>> {
     if !semantic_channel_enabled() {
         return None;
     }
-    let model_set = std::env::var(SEMANTIC_MODEL_ENV)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
+    let model = std::env::var(SEMANTIC_MODEL_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let stub_forced = std::env::var(SEMANTIC_STUB_ENV)
         .map(|v| semantic_flag_on(&v))
         .unwrap_or(false);
-    if model_set && !stub_forced {
-        return None;
+    resolve_embedder(model.as_deref(), stub_forced, onnx_load)
+}
+
+/// Backend precedence, separated from env reads so the load boundary is
+/// mockable in tests (CI has no ONNX weights or runtime dylib).
+fn resolve_embedder(
+    model: Option<&str>,
+    stub_forced: bool,
+    load_onnx: impl FnOnce(&std::path::Path) -> Option<Box<dyn SemanticEmbedder>>,
+) -> Option<Box<dyn SemanticEmbedder>> {
+    match (model, stub_forced) {
+        // Production path: attempt ONNX; on any load failure the loader
+        // returns `None` and the channel stays inert — never the stub.
+        (Some(path), false) => load_onnx(std::path::Path::new(path.trim())),
+        // `ITRACE_SEMANTIC_STUB=1` or armed with no model path.
+        _ => Some(Box::new(StubEmbedder::default())),
     }
-    Some(Box::new(StubEmbedder::default()))
+}
+
+/// `semantic-onnx` build: attempt the real ONNX backend; any failure
+/// logs a line and resolves to inert (`None`) — never the stub.
+#[cfg(feature = "semantic-onnx")]
+fn onnx_load(path: &std::path::Path) -> Option<Box<dyn SemanticEmbedder>> {
+    match crate::semantic_onnx::OnnxSemanticEmbedder::load(path) {
+        Ok(e) => Some(Box::new(e)),
+        Err(e) => {
+            eprintln!("itrace: semantic model load failed; channel inert ({e:#})");
+            None
+        }
+    }
+}
+
+/// Feature-off build: a configured model path stays inert (the backend
+/// doesn't exist in this build) — still never the stub.
+#[cfg(not(feature = "semantic-onnx"))]
+fn onnx_load(_path: &std::path::Path) -> Option<Box<dyn SemanticEmbedder>> {
+    None
 }
 
 /// Env flag arming the semantic recall channel.
 pub const SEMANTIC_ENV: &str = "ITRACE_SEMANTIC";
-/// Env var naming the production embedding weights file (DINOv2 ONNX —
-/// a follow-up; no runtime is wired yet).
+/// Env var naming the production embedding weights file (DINOv2 ONNX;
+/// loaded by `semantic_onnx::OnnxSemanticEmbedder` when built with the
+/// `semantic-onnx` feature).
 pub const SEMANTIC_MODEL_ENV: &str = "ITRACE_SEMANTIC_MODEL";
 /// Env var forcing [`StubEmbedder`] even when `ITRACE_SEMANTIC_MODEL` is
 /// configured.
@@ -1008,7 +1047,7 @@ mod tests {
         assert_eq!(e.dim(), DEFAULT_STUB_GRID * DEFAULT_STUB_GRID);
 
         // a configured model path without the stub override keeps the
-        // production seam inert — never silently stubs
+        // production seam inert (load fails → `None`) — never the stub
         std::env::set_var(SEMANTIC_MODEL_ENV, "/tmp/nonexistent-dinov2.onnx");
         assert!(embedder_from_env().is_none());
         // …unless the stub is explicitly forced
@@ -1022,6 +1061,38 @@ mod tests {
         for v in [SEMANTIC_ENV, SEMANTIC_STUB_ENV, SEMANTIC_MODEL_ENV] {
             std::env::remove_var(v);
         }
+    }
+
+    /// `resolve_embedder` precedence with a mock loader — the ONNX load
+    /// boundary is exercised without any weights or runtime dylib.
+    #[test]
+    fn resolve_embedder_precedence_with_mock_loader() {
+        use std::cell::Cell;
+        let attempted = Cell::new(false);
+        let loader = |_: &std::path::Path| -> Option<Box<dyn SemanticEmbedder>> {
+            attempted.set(true);
+            None
+        };
+        // armed + model path, stub unset → ONNX attempted; a failed load
+        // resolves to inert, never the stub
+        assert!(resolve_embedder(Some("/m.onnx"), false, loader).is_none());
+        assert!(attempted.get());
+        // a successful load surfaces the backend
+        assert!(resolve_embedder(Some("/m.onnx"), false, |_| Some(Box::new(
+            StubEmbedder::default()
+        )))
+        .is_some());
+        // STUB=1 wins over a configured model path — ONNX not attempted
+        let attempted = Cell::new(false);
+        let loader = |_: &std::path::Path| -> Option<Box<dyn SemanticEmbedder>> {
+            attempted.set(true);
+            None
+        };
+        assert!(resolve_embedder(Some("/m.onnx"), true, loader).is_some());
+        assert!(!attempted.get());
+        // no model path → stub, loader untouched
+        assert!(resolve_embedder(None, false, loader).is_some());
+        assert!(!attempted.get());
     }
 
     /// Synthetic PNG: gradient + per-seed channel offset — the same
