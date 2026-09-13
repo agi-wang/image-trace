@@ -13,6 +13,7 @@ pub mod hashes;
 pub mod image_io;
 pub mod index;
 pub mod metrics;
+pub mod ownership;
 pub mod slice;
 
 use serde::{Deserialize, Serialize};
