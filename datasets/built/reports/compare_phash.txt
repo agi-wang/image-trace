@@ -1,20 +1,20 @@
 36 images, 6 groups, 18 unique
 group 1:
-  - histo_synth_1__orig.png (25)
-  - histo_synth_1__rot90.png (26)
-  - histo_synth_1__hflip.png (27)
-group 2:
   - fluor_synth_1__orig.png (13)
   - fluor_synth_1__rot90.png (14)
   - fluor_synth_1__hflip.png (15)
+group 2:
+  - skimage_ihc__orig.png (31)
+  - skimage_ihc__rot90.png (32)
+  - skimage_ihc__hflip.png (33)
 group 3:
   - sem_pollen_wiki__orig.png (7)
   - sem_pollen_wiki__rot90.png (8)
   - sem_pollen_wiki__hflip.png (9)
 group 4:
-  - skimage_ihc__orig.png (31)
-  - skimage_ihc__rot90.png (32)
-  - skimage_ihc__hflip.png (33)
+  - histo_synth_1__orig.png (25)
+  - histo_synth_1__rot90.png (26)
+  - histo_synth_1__hflip.png (27)
 group 5:
   - sem_synth_1__orig.png (1)
   - sem_synth_1__rot90.png (2)
