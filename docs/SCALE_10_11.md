@@ -216,7 +216,7 @@ still forces a rebuild.
 | 6 | Persisted HNSW graph + sharded semantic recall | **done — R1 `hnsw.bin` + R2 harness + R3 double regression** |
 | 7 | `ITMIHN1` multi-node MIH project persist | **done — R1 wire + R2 harness + R3 double regression** |
 | 8 | Multi-node semantic/HNSW sharding | **done — R1 `project_{id}_sem_mn/` (`ITSEMN1`) + R2 harness + R3 double regression** |
-| 9 | Multi-node crop/slice MIH sharding | **in progress — R1 `project_{id}_crop_mn/` (`ITMIHCN1`) + R2 harness done** |
+| 9 | Multi-node crop/slice MIH sharding | **in progress — R1 `project_{id}_crop_mn/` (`ITMIHCN1`) + R2 harness + R3 double regression** |
 
 ### Phase 1 delivered
 
@@ -682,8 +682,16 @@ and fails unless `_crop_mn` has the ITMIHCN1 top meta + contiguous
 `ranges` + `node_{i}/` ITMIHC1 bundles, `project_{id}_crop/` keeps
 `ITMIHC1`, and all five scans emit identical sorted group membership.
 
-Remaining follow-ups: real RPC/service discovery (non-goal),
-double-regression evidence (R3).
+**R3 evidence:** flag-off `smoke_itrace_dataset.sh` ×2 reproduced the
+6/6/6/12 baseline; `smoke_crop_mn_persist.sh` ×2 (`r9c`, `r9d`) each
+showed the sn-build → `_crop_mn` build → `_crop_mn` hit → sn-hit →
+`_crop_mn`-hit transition with `ITMIHCN1`/`ITMIHC1` coexistence and
+identical membership; gate `smoke_mih_nodes_persist.sh`, semantic
+`smoke_semantic_mn_persist.sh`, and single-node
+`smoke_semantic_persist.sh` all green. See
+`datasets/built/reports/PHASE9_R3_DOUBLE_REGRESSION.md`.
+
+Remaining follow-ups: real RPC/service discovery (non-goal).
 
 | Variable | Effect |
 |----------|--------|

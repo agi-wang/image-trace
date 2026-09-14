@@ -1,0 +1,26 @@
+{
+  "feature_fingerprint": "7867f4b2c1157ad5aa1e476a461a016e78dff1edd5523eab4d9d147381b129af",
+  "image_count": 8,
+  "key_count": 893,
+  "magic": "ITMIHCN1",
+  "node_count": 3,
+  "ranges": [
+    {
+      "count": 2,
+      "end": 2,
+      "start": 1
+    },
+    {
+      "count": 3,
+      "end": 5,
+      "start": 3
+    },
+    {
+      "count": 3,
+      "end": 8,
+      "start": 6
+    }
+  ],
+  "shard_bits": 8,
+  "version": 1
+}
