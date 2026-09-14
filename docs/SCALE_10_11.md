@@ -215,7 +215,7 @@ still forces a rebuild.
 | 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **done — R1 ONNX skeleton + R2 `project_{id}_sem/` persist/fingerprint + R3 double regression** |
 | 6 | Persisted HNSW graph + sharded semantic recall | **done — R1 `hnsw.bin` + R2 harness + R3 double regression** |
 | 7 | `ITMIHN1` multi-node MIH project persist | **done — R1 wire + R2 harness + R3 double regression** |
-| 8 | Multi-node semantic/HNSW sharding | **in progress — R1 `project_{id}_sem_mn/` (`ITSEMN1`) + R2 harness done** |
+| 8 | Multi-node semantic/HNSW sharding | **in progress — R1 `project_{id}_sem_mn/` (`ITSEMN1`) + R2 harness + R3 double regression** |
 
 ### Phase 1 delivered
 
@@ -617,8 +617,15 @@ meta + contiguous `ranges` + `node_{i}/` ITSEMP1/ITSEMH1 layout,
 `project_{id}_sem/` keeps `ITSEMP1`, and all five scans emit identical
 sorted group membership (semantic stays candidates-only).
 
+**R3 evidence:** flag-off `smoke_itrace_dataset.sh` ×2 reproduced the
+6/6/6/12 baseline; `smoke_semantic_mn_persist.sh` ×2 (`r8c`, `r8d`)
+each showed the sn-build → `_sem_mn` build → `_sem_mn` hit → sn-hit →
+`_sem_mn`-hit transition with `ITSEMN1`/`ITSEMP1` coexistence and
+identical membership; `smoke_semantic_persist.sh` (`r8e`) green. See
+`datasets/built/reports/PHASE8_R3_DOUBLE_REGRESSION.md`.
+
 Remaining follow-ups: real RPC/service discovery (non-goal),
-`project_{id}_crop/` multi-node dedup, double-regression evidence (R3).
+`project_{id}_crop/` multi-node dedup.
 
 | Variable | Effect |
 |----------|--------|
