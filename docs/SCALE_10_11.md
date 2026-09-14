@@ -213,7 +213,7 @@ still forces a rebuild.
 | 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
 | 4 | Semantic DINOv2/HNSW recall channel | **done — foundation** (stub + HNSW + wiring; R3 double regression) |
 | 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **done — R1 ONNX skeleton + R2 `project_{id}_sem/` persist/fingerprint + R3 double regression** |
-| 6 | Persisted HNSW graph + sharded semantic recall | **in progress — R1 `hnsw.bin` persist done; R2: smoke asserts graph-loaded on cache hit** |
+| 6 | Persisted HNSW graph + sharded semantic recall | **in progress — R1 `hnsw.bin` + R2 harness done; R3 double regression** |
 
 ### Phase 1 delivered
 
@@ -451,7 +451,7 @@ membership is asserted identical across all three scans. See
 Remaining follow-ups: real `dinov2_vits14`/`vitb14` weights + recall
 calibration on transformed-image fixtures.
 
-### Phase 6 (in progress) — persisted HNSW graph
+### Phase 6 (done — R1+R2; R3 evidence gathered) — persisted HNSW graph
 
 **R1 — `project_{id}_sem/hnsw.bin` (`ITSEMH1` v1).** Sibling-file choice:
 the graph gets its own magic/version rather than extending `ITSEMP1`, so
@@ -490,6 +490,12 @@ the graph half, not just the vectors: armed run 1 must print
 hit would show `false`), `hnsw.bin` must exist in the bundle, and the
 flag-off run must show no sem fields at all. Confirmed-group membership
 is diffed identical across off/on1/on2.
+
+**R3 evidence:** flag-off `smoke_itrace_dataset.sh` ×2 reproduced the
+6/6/6/12 baseline; `smoke_semantic_persist.sh` ×2 (`r6b`, `r6c`) each
+showed the build → cached+graph-loaded transition
+(`sem_hnsw_loaded=false` → `true`) with identical confirmed groups. See
+`datasets/built/reports/PHASE6_R3_DOUBLE_REGRESSION.md`.
 
 Remaining follow-ups: multi-node semantic/HNSW sharding (per-shard graph
 or per-node full graph) once the `ITMIHN1` seam is real; graph format
