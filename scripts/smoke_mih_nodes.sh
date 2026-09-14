@@ -54,8 +54,11 @@ echo "mono groups=$mono_groups  multi groups=$multi_groups"
 [[ "$mono_groups" -eq 2 ]] || { echo "expected 2 mono groups" >&2; exit 1; }
 [[ "$multi_groups" -eq "$mono_groups" ]] || { echo "group count mismatch" >&2; exit 1; }
 # Same membership (member lines are `  - name (id)`; ignore timing).
-diff <(grep "^  - " "$BASE/mono.txt") \
-     <(grep "^  - " "$BASE/multi.txt") >/dev/null \
+# Group emission order is NOT part of the contract (multi-node
+# scatter/gather can emit components in a different order), so compare
+# the sorted member set.
+diff <(grep "^  - " "$BASE/mono.txt" | sort) \
+     <(grep "^  - " "$BASE/multi.txt" | sort) >/dev/null \
   || { echo "group membership mismatch" >&2; exit 1; }
 
 echo "MIH_NODES_SMOKE_OK"
