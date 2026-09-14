@@ -215,7 +215,8 @@ still forces a rebuild.
 | 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **done — R1 ONNX skeleton + R2 `project_{id}_sem/` persist/fingerprint + R3 double regression** |
 | 6 | Persisted HNSW graph + sharded semantic recall | **done — R1 `hnsw.bin` + R2 harness + R3 double regression** |
 | 7 | `ITMIHN1` multi-node MIH project persist | **done — R1 wire + R2 harness + R3 double regression** |
-| 8 | Multi-node semantic/HNSW sharding | **in progress — R1 `project_{id}_sem_mn/` (`ITSEMN1`) + R2 harness + R3 double regression** |
+| 8 | Multi-node semantic/HNSW sharding | **done — R1 `project_{id}_sem_mn/` (`ITSEMN1`) + R2 harness + R3 double regression** |
+| 9 | Multi-node crop/slice MIH sharding | **in progress — R1 `project_{id}_crop_mn/` (`ITMIHCN1`)** |
 
 ### Phase 1 delivered
 
@@ -556,7 +557,7 @@ Remaining follow-ups: real RPC transport + service discovery (non-goal
 for now), cross-node dedup of `project_{id}_crop/` under multi-node.
 Multi-node semantic/HNSW sharding landed in Phase 8 R1 below.
 
-### Phase 8 (in progress — R1+R2 done) — multi-node semantic/HNSW sharding
+### Phase 8 (done — R1–R3) — multi-node semantic/HNSW sharding
 
 **R1 — `project_{id}_sem_mn/` (`ITSEMN1` v1).** When `ITRACE_SEMANTIC`
 is armed *and* `ITRACE_MIH_NODES` > 1 *and* `ITRACE_MIH_INDEX_DIR` is
@@ -624,8 +625,56 @@ each showed the sn-build → `_sem_mn` build → `_sem_mn` hit → sn-hit →
 identical membership; `smoke_semantic_persist.sh` (`r8e`) green. See
 `datasets/built/reports/PHASE8_R3_DOUBLE_REGRESSION.md`.
 
+Remaining follow-ups: real RPC/service discovery (non-goal).
+Multi-node crop/slice sharding landed in Phase 9 R1 below.
+
+### Phase 9 (in progress — R1) — multi-node crop/slice MIH sharding
+
+**R1 — `project_{id}_crop_mn/` (`ITMIHCN1` v1).** When
+`ITRACE_MIH_NODES` > 1 *and* `ITRACE_MIH_INDEX_DIR` is set, the
+crop/slice channel shards its `ShardedMihIndex` across the same
+in-process node count — the ownership plan is the contiguous
+sorted-image-id partition used by `project_{id}_sem_mn/` (Phase 8), not
+the interleaved shard ownership of the gate `project_{id}_mn/`:
+
+```text
+project_{id}_crop_mn/
+  meta.json      {"magic":"ITMIHCN1","version":1,"shard_bits":N,
+                  "node_count":M,"image_count":K,"key_count":T,
+                  "feature_fingerprint":"<blake3 over all entries>",
+                  "ranges":[{"start":id,"end":id,"count":c}]}
+  node_{i}/      complete ITMIHC1 bundle over node i's owned range —
+                 meta.json + image_ids.bin + index/ shards
+```
+
+Load validates the top meta (`shard_bits`, `node_count`,
+`image_count`, global BLAKE3 `feature_fingerprint`, recomputed
+partition `ranges`), then runs each `node_{i}/` through the normal
+`ITMIHC1` loader against its expected chunk (per-node image set +
+fingerprint + shard geometry). Any miss → rebuild the whole bundle,
+never silent reuse; `crop_index_loaded=true` only on a full hit.
+
+Query: `crop_candidates_multi` scatters every probe key to **all** node
+indexes and maps node-local owner slots back through each node's
+`image_ids`. Because each image's keys were inserted into exactly one
+node index, the merged hit set is identical to the single-node global
+index — the candidate contract is **exact parity** (unlike the
+approximate superset caveat of `_sem_mn`'s per-node HNSW `k`).
+
+Wiring: the branch lives inside `crop_candidates_cached` (same spot as
+the gate `_mn` branch), so CLI and server get it with no caller
+changes. `project_{id}_crop/` (`ITMIHC1`) is a different directory:
+flipping `ITRACE_MIH_NODES` between 1 and N>1 never aliases formats.
+
+Tests: `crop_index_multi_roundtrip_parity` (build → `ITMIHCN1` layout →
+full cache hit → candidate parity vs single-node → single-node run on
+same dir builds `ITMIHC1` and leaves `_crop_mn` intact → `_crop_mn`
+still cache-hits) and `crop_index_multi_invalidation` (node_count /
+fingerprint / image-set / missing node dir / corrupt node meta /
+corrupt top meta → rebuild; rebuilt bundle cache-hits).
+
 Remaining follow-ups: real RPC/service discovery (non-goal),
-`project_{id}_crop/` multi-node dedup.
+crop-mn smoke harness + double-regression evidence (R2/R3).
 
 | Variable | Effect |
 |----------|--------|
