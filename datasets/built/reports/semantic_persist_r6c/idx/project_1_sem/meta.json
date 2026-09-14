@@ -1,0 +1,8 @@
+{
+  "dim": 256,
+  "embedder": "stub:g16",
+  "feature_fingerprint": "0168e09047f468337fe6d37d54a517b5915365a338409571dd1972855a6fcfe1",
+  "image_count": 9,
+  "magic": "ITSEMP1",
+  "version": 1
+}
