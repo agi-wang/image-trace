@@ -614,6 +614,9 @@ pub fn run_dedup_scan(
     // With ITRACE_MIH_INDEX_DIR set, vectors persist in a
     // `project_{id}_sem/` bundle (embedder-fingerprint + image-set
     // invalidated); a matching bundle skips model inference entirely.
+    // With ITRACE_MIH_NODES>1 the same holds per-node under
+    // `project_{id}_sem_mn/` (ITSEMN1) — probes scatter/gather across
+    // all node graphs.
     let (sem_pairs, sem_index_loaded, sem_hnsw_loaded): (Vec<(u32, u32)>, bool, bool) =
         if semantic::semantic_channel_enabled() {
             match semantic::embedder_from_env() {
@@ -621,30 +624,54 @@ pub fn run_dedup_scan(
                     let by_id: HashMap<i64, &ImageMeta> =
                         ready.iter().map(|r| (r.id, *r)).collect();
                     let image_ids: Vec<i64> = entries.iter().map(|e| e.image_id).collect();
-                    let sem_dir = index::resolve_mih_index_dir()
-                        .map(|base| semantic::project_sem_index_path(&base, project_id));
-                    let sem = semantic::load_or_build_project_sem_index(
-                        sem_dir.as_deref(),
-                        &image_ids,
-                        &*embedder,
-                        |id| {
-                            by_id
-                                .get(&id)
-                                .and_then(|m| store.read_file(&m.file_path).ok())
-                                .and_then(|b| embedder.embed_bytes(&b).ok())
-                        },
-                    )?;
-                    (
-                        semantic::semantic_candidates_with_index(
-                            &sem.entries,
-                            &sem.index,
-                            &sem.owner_ids,
-                            semantic::resolve_semantic_k(None),
-                            semantic::resolve_semantic_min_cosine(None),
-                        ),
-                        sem.vecs_loaded,
-                        sem.graph_loaded,
-                    )
+                    let nodes = index::mih_node_count();
+                    let embed_one = |id: i64| {
+                        by_id
+                            .get(&id)
+                            .and_then(|m| store.read_file(&m.file_path).ok())
+                            .and_then(|b| embedder.embed_bytes(&b).ok())
+                    };
+                    if nodes > 1 {
+                        let sem_dir = index::resolve_mih_index_dir()
+                            .map(|base| semantic::project_sem_multi_index_path(&base, project_id));
+                        let sem = semantic::load_or_build_project_sem_index_multi(
+                            sem_dir.as_deref(),
+                            &image_ids,
+                            nodes,
+                            &*embedder,
+                            embed_one,
+                        )?;
+                        (
+                            semantic::semantic_candidates_multi(
+                                &sem.entries,
+                                &sem.nodes,
+                                semantic::resolve_semantic_k(None),
+                                semantic::resolve_semantic_min_cosine(None),
+                            ),
+                            sem.vecs_loaded,
+                            sem.graphs_loaded,
+                        )
+                    } else {
+                        let sem_dir = index::resolve_mih_index_dir()
+                            .map(|base| semantic::project_sem_index_path(&base, project_id));
+                        let sem = semantic::load_or_build_project_sem_index(
+                            sem_dir.as_deref(),
+                            &image_ids,
+                            &*embedder,
+                            embed_one,
+                        )?;
+                        (
+                            semantic::semantic_candidates_with_index(
+                                &sem.entries,
+                                &sem.index,
+                                &sem.owner_ids,
+                                semantic::resolve_semantic_k(None),
+                                semantic::resolve_semantic_min_cosine(None),
+                            ),
+                            sem.vecs_loaded,
+                            sem.graph_loaded,
+                        )
+                    }
                 }
                 None => (Vec::new(), false, false),
             }

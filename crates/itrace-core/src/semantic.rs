@@ -34,6 +34,11 @@
 //!    `resolve_semantic_min_cosine`. The graph itself persists in
 //!    `project_{id}_sem/hnsw.bin` (`ITSEMH1`), fingerprint-bound to the
 //!    verified vectors — a full bundle hit skips the rebuild too.
+//!    With `ITRACE_MIH_NODES` > 1 the channel shards across the same
+//!    in-process ownership plan as gate MIH: `project_{id}_sem_mn/`
+//!    (`ITSEMN1`) holds one `ITSEMP1`/`ITSEMH1` bundle per sorted-id
+//!    range and probes scatter/gather across node graphs (see
+//!    [`load_or_build_project_sem_index_multi`]).
 //! 3. Union + verify: [`union_candidate_pairs`] folds them into the MIH
 //!    candidate set **before** `confirm_pairs` / the variant-max hash
 //!    re-score. Semantic hits are *candidates only* — a pair still needs
@@ -1210,6 +1215,374 @@ where
     })
 }
 
+// ---------- multi-node semantic bundle (`project_{id}_sem_mn/`) ----------
+
+/// `{base}/project_{id}_sem_mn` — multi-node sibling of
+/// `project_{id}_sem/`, used when `ITRACE_SEMANTIC` is armed AND
+/// `ITRACE_MIH_NODES` > 1. Ownership mirrors the gate-MIH model: the
+/// sorted image_id space is split into `node_count` contiguous ranges
+/// (the semantic analogue of `MultiNodeMihIndex::even`); each node owns
+/// its range's vectors and one `ITSEMP1`/`ITSEMH1` bundle of its own.
+/// Inserts route by ownership; queries scatter to every node graph and
+/// merge — a probe's own vector only lives in its owning node, so the
+/// owner node is probed with `k+1` and the rest with `k`, keeping the
+/// per-probe top-k contract of the single-node path (multi-node emits a
+/// superset of the single-node top-k when HNSW recall is approximate;
+/// identical when k covers each node's vectors).
+///
+/// ```text
+/// project_{id}_sem_mn/
+///   meta.json   {"magic":"ITSEMN1","version":1,"node_count":N,
+///                "embedder":"<fp>","dim":D,"image_count":K,
+///                "feature_fingerprint":"<blake3 over all sorted ids+vecs>",
+///                "ranges":[{"start":first_id,"end":last_id,"count":Ki},...]}
+///   node_0/ …   a complete `ITSEMP1` bundle over the node's owned ids
+///               (meta.json/image_ids.bin/vectors.bin + ITSEMH1 hnsw.bin)
+/// ```
+///
+/// Invalidation: top meta checks magic/version, `node_count`,
+/// `embedder`, `dim`, and `image_count`; each `node_{i}/` is loaded via
+/// `try_load_project_sem_index` (its own set/fingerprint validation)
+/// against the chunk the CURRENT image set maps to that node; finally
+/// the assembled payload must recompute to the top-level
+/// `feature_fingerprint`. Any miss → rebuild + overwrite, never silent
+/// reuse. Single-node `project_{id}_sem/` is a different directory and
+/// stays untouched either way.
+pub fn project_sem_multi_index_path(base: &std::path::Path, project_id: i64) -> std::path::PathBuf {
+    base.join(format!("project_{project_id}_sem_mn"))
+}
+
+const PROJECT_SEM_MN_MAGIC: &str = "ITSEMN1";
+const PROJECT_SEM_MN_VERSION: u64 = 1;
+
+/// One node's restored/built graph: `owner_ids` are the sorted image
+/// ids of that node's partition chunk; `index` owner slots label into
+/// `owner_ids` (same contract as the single-node bundle).
+pub struct NodeSemIndex {
+    pub owner_ids: Vec<i64>,
+    pub index: HnswIndex,
+}
+
+/// Result of [`load_or_build_project_sem_index_multi`]: all-image
+/// vectors for probing plus one queryable [`HnswIndex`] per node.
+pub struct MultiNodeProjectSemIndex {
+    /// Per-image vectors in the caller's `image_ids` order (all nodes).
+    pub entries: Vec<SemanticVecs>,
+    /// One index per ownership range, in node order.
+    pub nodes: Vec<NodeSemIndex>,
+    /// All node `vectors.bin`/`meta.json` hit — model inference skipped.
+    pub vecs_loaded: bool,
+    /// Every node's `hnsw.bin` hit — graph rebuilds skipped too.
+    pub graphs_loaded: bool,
+}
+
+/// Contiguous even partition of the sorted image_id space into
+/// `nodes` non-empty chunks (`nodes` is pre-clamped to ≤ len by the
+/// callers, so every chunk is non-empty unless `sorted` is empty).
+fn sem_partition(sorted: &[i64], nodes: u32) -> Vec<Vec<i64>> {
+    let n = (nodes as usize).min(sorted.len()).max(1);
+    (0..n)
+        .map(|i| sorted[i * sorted.len() / n..(i + 1) * sorted.len() / n].to_vec())
+        .collect()
+}
+
+/// Per-node graph build over the partition of `entries` — same
+/// owner-slot plan per node as [`build_sem_hnsw`]. Returns the indexes
+/// and each node's entries (sorted order) for persistence.
+fn build_multi_sem_nodes(
+    entries: &[SemanticVecs],
+    nodes: u32,
+) -> (Vec<NodeSemIndex>, Vec<Vec<SemanticVecs>>) {
+    let (image_ids, _) = owner_plan(entries);
+    let by_id: HashMap<i64, &SemanticVecs> = entries.iter().map(|e| (e.image_id, e)).collect();
+    sem_partition(&image_ids, nodes)
+        .into_iter()
+        .map(|chunk| {
+            let node_entries: Vec<SemanticVecs> =
+                chunk.iter().map(|id| (*by_id[id]).clone()).collect();
+            let (index, owner_ids) = build_sem_hnsw(&node_entries);
+            (NodeSemIndex { owner_ids, index }, node_entries)
+        })
+        .unzip()
+}
+
+/// Save a `project_{id}_sem_mn/` bundle (layout above). Overwrites `dir`.
+/// `node_entries[i]` is node i's owned subset; `all_entries` the full set.
+fn save_project_sem_index_multi(
+    dir: &std::path::Path,
+    node_entries: &[Vec<SemanticVecs>],
+    all_entries: &[SemanticVecs],
+    nodes: u32,
+    embedder_fingerprint: &str,
+) -> std::io::Result<()> {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    let (sorted_ids, flat) = sorted_flat(all_entries);
+    let dim = all_entries.first().map(|e| e.vector.len()).unwrap_or(0);
+    let ranges: Vec<serde_json::Value> = node_entries
+        .iter()
+        .map(|ne| {
+            serde_json::json!({
+                "start": ne.first().map(|e| e.image_id),
+                "end": ne.last().map(|e| e.image_id),
+                "count": ne.len(),
+            })
+        })
+        .collect();
+    let meta = serde_json::json!({
+        "magic": PROJECT_SEM_MN_MAGIC,
+        "version": PROJECT_SEM_MN_VERSION,
+        "node_count": nodes,
+        "embedder": embedder_fingerprint,
+        "dim": dim,
+        "image_count": sorted_ids.len(),
+        "feature_fingerprint": sem_fingerprint(&sorted_ids, &flat, dim),
+        "ranges": ranges,
+    });
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_vec_pretty(&meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+    )?;
+    for (i, ne) in node_entries.iter().enumerate() {
+        let nd = dir.join(format!("node_{i}"));
+        save_project_sem_index(&nd, ne, embedder_fingerprint)?;
+    }
+    Ok(())
+}
+
+/// Loaded `project_{id}_sem_mn/` payload: `all` vectors in the caller's
+/// `image_ids` order (probes), plus each node's owned vectors in node
+/// order (the data the per-node graphs bind to).
+struct MnSemVecs {
+    all: Vec<SemanticVecs>,
+    nodes: Vec<Vec<SemanticVecs>>,
+}
+
+/// Try to load a `project_{id}_sem_mn/` bundle compatible with the
+/// current `image_ids`, `nodes`, embedder fingerprint and `dim`
+/// (`dim == 0` = wildcard, same as the single-node loader). Returns the
+/// assembled payload on a full hit; `None` on any mismatch/corruption —
+/// caller rebuilds.
+fn try_load_project_sem_index_multi(
+    dir: &std::path::Path,
+    image_ids: &[i64],
+    nodes: u32,
+    embedder_fingerprint: &str,
+    dim: usize,
+) -> std::io::Result<Option<MnSemVecs>> {
+    let meta_path = dir.join("meta.json");
+    if image_ids.is_empty() || !meta_path.is_file() {
+        return Ok(None);
+    }
+    let meta_bytes = std::fs::read(&meta_path)?;
+    let meta: serde_json::Value = match serde_json::from_slice(&meta_bytes) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let field = |k: &str| meta.get(k).and_then(|v| v.as_u64());
+    if meta.get("magic").and_then(|v| v.as_str()) != Some(PROJECT_SEM_MN_MAGIC)
+        || field("version") != Some(PROJECT_SEM_MN_VERSION)
+        || field("node_count") != Some(nodes as u64)
+        || meta.get("embedder").and_then(|v| v.as_str()) != Some(embedder_fingerprint)
+        || (dim != 0 && field("dim") != Some(dim as u64))
+        || field("image_count") != Some(image_ids.len() as u64)
+    {
+        return Ok(None);
+    }
+    let dim = field("dim").unwrap_or(0) as usize;
+    if dim == 0 {
+        return Ok(None);
+    }
+    // The image set is pinned, so the partition the current scan derives
+    // is the partition the bundle must have been written with — a chunk
+    // set mismatch in any node dir rejects the whole bundle.
+    let mut sorted_ids = image_ids.to_vec();
+    sorted_ids.sort_unstable();
+    let parts = sem_partition(&sorted_ids, nodes);
+    let mut node_vecs: Vec<Vec<SemanticVecs>> = Vec::with_capacity(parts.len());
+    for (i, chunk) in parts.iter().enumerate() {
+        match try_load_project_sem_index(
+            &dir.join(format!("node_{i}")),
+            chunk,
+            embedder_fingerprint,
+            dim,
+        )? {
+            Some(v) => node_vecs.push(v),
+            None => return Ok(None),
+        }
+    }
+    // Global binding: the assembled sorted payload must recompute to the
+    // top-level fingerprint (catches a swapped/mixed node dir that still
+    // passes its own per-node checks).
+    let assembled: Vec<SemanticVecs> = node_vecs.iter().flatten().cloned().collect();
+    let (aids, aflat) = sorted_flat(&assembled);
+    let want_fp = sem_fingerprint(&aids, &aflat, dim);
+    if meta.get("feature_fingerprint").and_then(|v| v.as_str()) != Some(want_fp.as_str()) {
+        return Ok(None);
+    }
+    let by_id: HashMap<i64, SemanticVecs> =
+        assembled.into_iter().map(|e| (e.image_id, e)).collect();
+    Ok(Some(MnSemVecs {
+        all: image_ids
+            .iter()
+            .filter_map(|id| by_id.get(id).cloned())
+            .collect(),
+        nodes: node_vecs,
+    }))
+}
+
+/// Multi-node analogue of [`load_or_build_project_sem_index`]: reuse the
+/// `project_{id}_sem_mn/` bundle when `dir` is set and valid (all node
+/// vectors + graphs restored → `vecs_loaded`/`graphs_loaded`), else
+/// embed each id, partition by sorted-id ownership ranges, build one
+/// HNSW per node, and persist. A node whose graph is stale/missing
+/// rebuilds just that graph from its verified vectors.
+pub fn load_or_build_project_sem_index_multi<F>(
+    dir: Option<&std::path::Path>,
+    image_ids: &[i64],
+    nodes: u32,
+    embedder: &dyn SemanticEmbedder,
+    embed: F,
+) -> std::io::Result<MultiNodeProjectSemIndex>
+where
+    F: Fn(i64) -> Option<Vec<f32>> + Sync,
+{
+    let fp = embedder.fingerprint();
+    if let Some(d) = dir {
+        if let Some(loaded) =
+            try_load_project_sem_index_multi(d, image_ids, nodes, &fp, embedder.dim())?
+        {
+            let mut node_indexes = Vec::with_capacity(loaded.nodes.len());
+            let mut graphs_loaded = true;
+            for (i, nv) in loaded.nodes.iter().enumerate() {
+                let nd = d.join(format!("node_{i}"));
+                let (nids, nflat) = sorted_flat(nv);
+                let ndim = nv.first().map(|e| e.vector.len()).unwrap_or(0);
+                let nfp = sem_fingerprint(&nids, &nflat, ndim);
+                match try_load_project_sem_hnsw(&nd, &nfp, nv.len())? {
+                    Some(index) => node_indexes.push(NodeSemIndex {
+                        owner_ids: nids,
+                        index,
+                    }),
+                    None => {
+                        graphs_loaded = false;
+                        let (index, owner_ids) = build_sem_hnsw(nv);
+                        save_project_sem_hnsw(&nd, &index, &nfp)?;
+                        node_indexes.push(NodeSemIndex { owner_ids, index });
+                    }
+                }
+            }
+            return Ok(MultiNodeProjectSemIndex {
+                entries: loaded.all,
+                nodes: node_indexes,
+                vecs_loaded: true,
+                graphs_loaded,
+            });
+        }
+    }
+    let mut entries: Vec<SemanticVecs> = image_ids
+        .par_iter()
+        .map(|&id| SemanticVecs {
+            image_id: id,
+            vector: embed(id).unwrap_or_default(),
+        })
+        .collect();
+    let dim = entries
+        .iter()
+        .find(|e| !e.vector.is_empty())
+        .map(|e| e.vector.len())
+        .unwrap_or_else(|| embedder.dim());
+    for e in &mut entries {
+        if e.vector.len() != dim {
+            e.vector = vec![0.0; dim];
+        }
+    }
+    let (node_indexes, node_entries) = build_multi_sem_nodes(&entries, nodes);
+    if let Some(d) = dir {
+        save_project_sem_index_multi(d, &node_entries, &entries, nodes, &fp)?;
+        for (i, node) in node_indexes.iter().enumerate() {
+            let (nids, nflat) = sorted_flat(&node_entries[i]);
+            let nfp = sem_fingerprint(&nids, &nflat, dim);
+            save_project_sem_hnsw(&d.join(format!("node_{i}")), &node.index, &nfp)?;
+        }
+    }
+    Ok(MultiNodeProjectSemIndex {
+        entries,
+        nodes: node_indexes,
+        vecs_loaded: false,
+        graphs_loaded: false,
+    })
+}
+
+/// Multi-node sibling of [`semantic_candidates_with_index`]: each probe
+/// scatters to every node graph — `k+1` on the node owning the probe's
+/// image (its own vector takes a slot there, matching the single-node
+/// convention), `k` on the rest — gathers owner slots through each
+/// node's `owner_ids`, and unions the resulting pairs. The emitted set
+/// is a superset of the single-node top-k contract; with `k` covering
+/// each node's vectors it is identical.
+pub fn semantic_candidates_multi(
+    entries: &[SemanticVecs],
+    nodes: &[NodeSemIndex],
+    k: usize,
+    min_cosine: f32,
+) -> Vec<(u32, u32)> {
+    if entries.is_empty() || nodes.is_empty() {
+        return Vec::new();
+    }
+    let id_to_entry: HashMap<i64, u32> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.image_id, i as u32))
+        .collect();
+    let id_to_node: HashMap<i64, usize> = nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(ni, n)| n.owner_ids.iter().map(move |&id| (id, ni)))
+        .collect();
+    let entry_of_owner: Vec<Vec<Option<u32>>> = nodes
+        .iter()
+        .map(|n| {
+            n.owner_ids
+                .iter()
+                .map(|id| id_to_entry.get(id).copied())
+                .collect()
+        })
+        .collect();
+
+    let mut out: Vec<(u32, u32)> = entries
+        .par_iter()
+        .enumerate()
+        .flat_map(|(i, e)| {
+            let i = i as u32;
+            let own = id_to_node.get(&e.image_id).copied();
+            nodes
+                .iter()
+                .enumerate()
+                .flat_map(|(ni, node)| {
+                    let kk = if own == Some(ni) { k + 1 } else { k };
+                    node.index
+                        .query(&e.vector, kk)
+                        .into_iter()
+                        .filter(|(_, sim)| *sim >= min_cosine)
+                        .filter_map(|(owner, _)| {
+                            entry_of_owner[ni].get(owner as usize).copied().flatten()
+                        })
+                        .filter(|&j| j != i)
+                        .map(|j| (j.min(i), j.max(i)))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2012,6 +2385,181 @@ mod tests {
         assert_eq!(calls.load(AOrd::Relaxed), 0);
         let pairs3 = semantic_candidates_with_index(&s3.entries, &s3.index, &s3.owner_ids, 8, 0.5);
         assert_eq!(pairs1, pairs3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Multi-node persist round-trip: `project_{id}_sem_mn/` holds one
+    /// ITSEMP1+ITSEMH1 bundle per sorted-id range; the second call
+    /// restores vectors AND graphs with zero embed calls, and the
+    /// emitted pairs match the single-node path exactly (k covers each
+    /// node's vectors here, so recall is exhaustive).
+    #[test]
+    fn load_or_build_sem_index_multi_persists_and_parity() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        use std::sync::Arc;
+        let dir = tmp_dir("mn-lob").join("project_7_sem_mn");
+        let embedder = StubEmbedder::default();
+        let dim = embedder.dim();
+        let mk_embed = move |calls: &Arc<AtomicUsize>| {
+            let c = Arc::clone(calls);
+            move |id: i64| {
+                c.fetch_add(1, AOrd::Relaxed);
+                let mut v = vec![0.0; dim];
+                let slot = if id == 9 {
+                    1
+                } else {
+                    id.unsigned_abs() as usize
+                } % dim;
+                v[slot] = 10.0;
+                v[2] += id as f32 * 0.001;
+                Some(v)
+            }
+        };
+        let ids = [5i64, 1, 9, 2, 7, 3];
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let s1 =
+            load_or_build_project_sem_index_multi(Some(&dir), &ids, 3, &embedder, mk_embed(&calls))
+                .unwrap();
+        assert!(!s1.vecs_loaded && !s1.graphs_loaded);
+        assert_eq!(calls.load(AOrd::Relaxed), ids.len());
+        assert_eq!(s1.nodes.len(), 3);
+        // top meta + per-node ITSEMP1/ITSEMH1 layout
+        let top: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(top["magic"], "ITSEMN1");
+        assert_eq!(top["node_count"], 3);
+        assert_eq!(top["image_count"], 6);
+        assert_eq!(top["ranges"].as_array().unwrap().len(), 3);
+        for i in 0..3 {
+            let nd = dir.join(format!("node_{i}"));
+            let nm: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(nd.join("meta.json")).unwrap()).unwrap();
+            assert_eq!(nm["magic"], "ITSEMP1");
+            assert!(nd.join("vectors.bin").is_file() && nd.join("hnsw.bin").is_file());
+        }
+        let pairs1 = semantic_candidates_multi(&s1.entries, &s1.nodes, 8, 0.5);
+        assert!(!pairs1.is_empty(), "expected a real near pair (1,9)");
+        // exhaustive-regime parity vs the single-node path
+        assert_eq!(pairs1, semantic_candidates(&s1.entries, 8, 0.5));
+
+        // Second call: full cache hit — vectors AND graphs restored.
+        calls.store(0, AOrd::Relaxed);
+        let s2 =
+            load_or_build_project_sem_index_multi(Some(&dir), &ids, 3, &embedder, mk_embed(&calls))
+                .unwrap();
+        assert!(s2.vecs_loaded && s2.graphs_loaded);
+        assert_eq!(calls.load(AOrd::Relaxed), 0);
+        assert_eq!(
+            pairs1,
+            semantic_candidates_multi(&s2.entries, &s2.nodes, 8, 0.5)
+        );
+
+        // Corrupt one node's graph → vectors hit, that graph rebuilt.
+        let mut b = std::fs::read(dir.join("node_1/hnsw.bin")).unwrap();
+        b[0] ^= 0xff;
+        std::fs::write(dir.join("node_1/hnsw.bin"), &b).unwrap();
+        calls.store(0, AOrd::Relaxed);
+        let s3 =
+            load_or_build_project_sem_index_multi(Some(&dir), &ids, 3, &embedder, mk_embed(&calls))
+                .unwrap();
+        assert!(s3.vecs_loaded && !s3.graphs_loaded);
+        assert_eq!(calls.load(AOrd::Relaxed), 0);
+        assert_eq!(
+            pairs1,
+            semantic_candidates_multi(&s3.entries, &s3.nodes, 8, 0.5)
+        );
+
+        // No dir → pure in-memory multi-node path.
+        let s4 = load_or_build_project_sem_index_multi(None, &ids, 3, &embedder, mk_embed(&calls))
+            .unwrap();
+        assert!(!s4.vecs_loaded && !s4.graphs_loaded && s4.nodes.len() == 3);
+        assert_eq!(
+            pairs1,
+            semantic_candidates_multi(&s4.entries, &s4.nodes, 8, 0.5)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every invalidation axis on the `_sem_mn` bundle forces a rebuild
+    /// (embed called again) — never a silent reuse of a stale partition.
+    #[test]
+    fn multi_node_sem_bundle_invalidation() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        use std::sync::Arc;
+        let dir = tmp_dir("mn-inv").join("project_7_sem_mn");
+        let embedder = StubEmbedder::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        // The mock embeds at whatever width the *current* embedder
+        // reports — an fp/dim change is itself an invalidation axis.
+        let mk_embed = |dim: usize| {
+            let c = Arc::clone(&calls);
+            move |id: i64| {
+                c.fetch_add(1, AOrd::Relaxed);
+                let mut v = vec![0.0; dim];
+                v[id.unsigned_abs() as usize % dim] = 10.0;
+                Some(v)
+            }
+        };
+        let ids = [1i64, 2, 3, 4, 5, 6, 7, 8];
+        let build = |ids: &[i64], nodes: u32, emb: &StubEmbedder| {
+            load_or_build_project_sem_index_multi(Some(&dir), ids, nodes, emb, mk_embed(emb.dim()))
+                .unwrap()
+        };
+
+        let s1 = build(&ids, 4, &embedder);
+        assert!(!s1.vecs_loaded);
+        calls.store(0, AOrd::Relaxed);
+        let s2 = build(&ids, 4, &embedder);
+        assert!(s2.vecs_loaded && s2.graphs_loaded);
+        assert_eq!(calls.load(AOrd::Relaxed), 0);
+
+        // node_count change → full rebuild
+        let s3 = build(&ids, 8, &embedder);
+        assert!(!s3.vecs_loaded);
+        calls.store(0, AOrd::Relaxed);
+        let s3b = build(&ids, 8, &embedder);
+        assert!(s3b.vecs_loaded && s3b.graphs_loaded);
+
+        // embedder fingerprint change → rebuild
+        let other = StubEmbedder::with_grid(8);
+        let s4 = build(&ids, 8, &other);
+        assert!(!s4.vecs_loaded);
+        calls.store(0, AOrd::Relaxed);
+        let s4b = build(&ids, 8, &other);
+        assert!(s4b.vecs_loaded && s4b.graphs_loaded);
+
+        // image-set change → rebuild
+        let mut ids2 = ids.to_vec();
+        ids2.push(99);
+        let s5 = build(&ids2, 8, &other);
+        assert!(!s5.vecs_loaded);
+        calls.store(0, AOrd::Relaxed);
+        let s5b = build(&ids2, 8, &other);
+        assert!(s5b.vecs_loaded);
+
+        // missing node dir → rebuild
+        std::fs::remove_dir_all(dir.join("node_1")).unwrap();
+        let s6 = build(&ids2, 8, &other);
+        assert!(!s6.vecs_loaded);
+        calls.store(0, AOrd::Relaxed);
+        let s6b = build(&ids2, 8, &other);
+        assert!(s6b.vecs_loaded && s6b.graphs_loaded);
+
+        // corrupt node meta magic → rebuild
+        std::fs::write(
+            dir.join("node_0/meta.json"),
+            r#"{"magic":"WRONG","version":1}"#,
+        )
+        .unwrap();
+        let s7 = build(&ids2, 8, &other);
+        assert!(!s7.vecs_loaded);
+
+        // corrupt top meta magic → rebuild
+        std::fs::write(dir.join("meta.json"), r#"{"magic":"WRONG","version":1}"#).unwrap();
+        let s8 = build(&ids2, 8, &other);
+        assert!(!s8.vecs_loaded);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

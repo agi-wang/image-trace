@@ -210,10 +210,12 @@ still forces a rebuild.
 |-------|-------|--------|
 | 1 | `ImageStore` trait extraction + feature-fingerprint MIH invalidation | **done** |
 | 2 | `PostgresStore` backend behind the `ImageStore` trait | **done** |
-| 3 | Multi-node shard ownership + scatter/gather | **in progress — in-process foundation done** |
+| 3 | Multi-node shard ownership + scatter/gather | **done — in-process foundation + `ITMIHN1` persist** |
 | 4 | Semantic DINOv2/HNSW recall channel | **done — foundation** (stub + HNSW + wiring; R3 double regression) |
 | 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **done — R1 ONNX skeleton + R2 `project_{id}_sem/` persist/fingerprint + R3 double regression** |
-| 6 | Persisted HNSW graph + sharded semantic recall | **in progress — R1 `hnsw.bin` + R2 harness done; R3 double regression** |
+| 6 | Persisted HNSW graph + sharded semantic recall | **done — R1 `hnsw.bin` + R2 harness + R3 double regression** |
+| 7 | `ITMIHN1` multi-node MIH project persist | **done — R1 wire + R2 harness + R3 double regression** |
+| 8 | Multi-node semantic/HNSW sharding | **in progress — R1 `project_{id}_sem_mn/` (`ITSEMN1`)** |
 
 ### Phase 1 delivered
 
@@ -503,7 +505,7 @@ or per-node full graph) once the `ITMIHN1` seam is real; graph format
 compaction (u16 neighbour refs, omitting stored vecs by deriving them
 from `vectors.bin`) if bundle size matters.
 
-### Phase 7 (done — R1+R2; R3 evidence gathered) — ITMIHN1 project persist
+### Phase 7 (done — R1–R3) — ITMIHN1 project persist
 
 **R1 — `project_{id}_mn/` (`ITMIHN1` v1).** When `ITRACE_MIH_INDEX_DIR`
 is set *and* `ITRACE_MIH_NODES` > 1, the gate scan persists the
@@ -551,8 +553,63 @@ mono-build → `_mn` build → `_mn` hit → mono-hit transition with
 `datasets/built/reports/PHASE7_R3_DOUBLE_REGRESSION.md`.
 
 Remaining follow-ups: real RPC transport + service discovery (non-goal
-for now), cross-node dedup of `project_{id}_crop/` under multi-node,
-multi-node semantic/HNSW sharding.
+for now), cross-node dedup of `project_{id}_crop/` under multi-node.
+Multi-node semantic/HNSW sharding landed in Phase 8 R1 below.
+
+### Phase 8 (in progress — R1) — multi-node semantic/HNSW sharding
+
+**R1 — `project_{id}_sem_mn/` (`ITSEMN1` v1).** When `ITRACE_SEMANTIC`
+is armed *and* `ITRACE_MIH_NODES` > 1 *and* `ITRACE_MIH_INDEX_DIR` is
+set, the semantic channel shards its HNSW index across the same
+in-process node count as the gate MIH scan. Sorted image ids are split
+into `node_count` contiguous non-empty ranges; each node gets a
+complete single-node semantic bundle over its owned ids:
+
+```text
+project_{id}_sem_mn/
+  meta.json      {"magic":"ITSEMN1","version":1,"node_count":N,
+                  "embedder":"<fp>","dim":D,"image_count":K,
+                  "feature_fingerprint":"<blake3 over all sorted
+                  ids+vecs>","ranges":[{"node":i,"first":id,"count":c}]}
+  node_{i}/      standard bundle — ITSEMP1 meta.json + image_ids.bin +
+                 vectors.bin (owned ids only) + ITSEMH1 hnsw.bin
+```
+
+Load requires the top meta to match `node_count`, embedder
+fingerprint, `dim`, `image_count`, and the recomputed partition ranges;
+each `node_{i}/` then validates through the normal `ITSEMP1` loader
+against its expected chunk, and the assembled sorted payload must match
+the global BLAKE3 `feature_fingerprint`. Per-node `hnsw.bin` graphs
+validate via the existing `ITSEMH1` fingerprint binding — a stale or
+corrupt node graph rebuilds *that* node only. Any vector/meta miss →
+rebuild the whole bundle, never silent reuse. On a full hit
+`vecs_loaded`/`graphs_loaded` report the restore; embedding is skipped
+entirely.
+
+Query: every probe vector scatters to **all** node graphs
+(`semantic_candidates_multi`), results map back through node-local
+owner slots, pairs normalize/sort/dedupe. With `k ≥` total image count
+the candidate set is exactly the single-node set; smaller `k` can
+return a superset (each node answers `k` locally) — harmless because
+semantic output stays candidate-only and the existing hash/crop
+verification decides confirmed merges.
+
+Single-node `project_{id}_sem/` is a different directory: flipping
+`ITRACE_MIH_NODES` between 1 and N>1 never reads a bundle of the wrong
+shape, mirroring the `project_{id}/` vs `project_{id}_mn/` design. CLI
+and server both branch on `index::mih_node_count()` at the same point
+they arm the channel.
+
+Tests: `load_or_build_sem_index_multi_persists_and_parity` (build →
+layout → full cache hit with zero embed calls → graph-corruption
+rebuilds one node → candidate parity vs single-node) and
+`multi_node_sem_bundle_invalidation` (node_count / embedder fp /
+image-set / missing node dir / corrupt node meta / corrupt top meta →
+rebuild; rebuilt bundle cache-hits).
+
+Remaining follow-ups: real RPC/service discovery (non-goal),
+`project_{id}_crop/` multi-node dedup, semantic-mn smoke harness +
+double-regression evidence (R2/R3).
 
 | Variable | Effect |
 |----------|--------|
