@@ -1,0 +1,24 @@
+{
+  "key_count": 56,
+  "magic": "ITMIHN1",
+  "ranges": [
+    {
+      "end": 64,
+      "start": 0
+    },
+    {
+      "end": 128,
+      "start": 64
+    },
+    {
+      "end": 192,
+      "start": 128
+    },
+    {
+      "end": 256,
+      "start": 192
+    }
+  ],
+  "shard_bits": 8,
+  "version": 1
+}

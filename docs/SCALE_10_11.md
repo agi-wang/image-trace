@@ -503,7 +503,7 @@ or per-node full graph) once the `ITMIHN1` seam is real; graph format
 compaction (u16 neighbour refs, omitting stored vecs by deriving them
 from `vectors.bin`) if bundle size matters.
 
-### Phase 7 (in progress — R1 wired) — ITMIHN1 project persist
+### Phase 7 (in progress — R1 done; R2 harness) — ITMIHN1 project persist
 
 **R1 — `project_{id}_mn/` (`ITMIHN1` v1).** When `ITRACE_MIH_INDEX_DIR`
 is set *and* `ITRACE_MIH_NODES` > 1, the gate scan persists the
@@ -531,6 +531,16 @@ Any miss → rebuild + overwrite, never silent reuse. `index_loaded=true`
 on a hit reflects cluster restore, not rebuild. Tests cover round-trip
 parity vs a live multi-node index, and shard_bits/node_count/image-set/
 fingerprint/corrupt-cluster-magic/missing-node-dir invalidation.
+
+**R2 — persist smoke harness.** `scripts/smoke_mih_nodes_persist.sh`
+runs one project through four scans on a shared index dir — mono build
+(`ITMIHP1`, `index_loaded=false`) → multi-node build (`_mn`,
+`index_loaded=false`) → multi-node hit (`index_loaded=true`) → mono hit
+(`index_loaded=true`) — and fails unless the `_mn` bundle has the
+ITMIHN1 top meta + `indexes/{a}/node_N/` layout, `project_{id}/` keeps
+`ITMIHP1`, and all four scans emit identical sorted group membership.
+`scripts/smoke_mih_nodes.sh` (non-persist parity) now compares sorted
+member lines — group emission order is not part of the contract.
 
 Remaining follow-ups: real RPC transport + service discovery (non-goal
 for now), cross-node dedup of `project_{id}_crop/` under multi-node,
