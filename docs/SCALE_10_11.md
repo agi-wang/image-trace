@@ -503,7 +503,7 @@ or per-node full graph) once the `ITMIHN1` seam is real; graph format
 compaction (u16 neighbour refs, omitting stored vecs by deriving them
 from `vectors.bin`) if bundle size matters.
 
-### Phase 7 (in progress — R1 done; R2 harness) — ITMIHN1 project persist
+### Phase 7 (done — R1+R2; R3 evidence gathered) — ITMIHN1 project persist
 
 **R1 — `project_{id}_mn/` (`ITMIHN1` v1).** When `ITRACE_MIH_INDEX_DIR`
 is set *and* `ITRACE_MIH_NODES` > 1, the gate scan persists the
@@ -541,6 +541,14 @@ ITMIHN1 top meta + `indexes/{a}/node_N/` layout, `project_{id}/` keeps
 `ITMIHP1`, and all four scans emit identical sorted group membership.
 `scripts/smoke_mih_nodes.sh` (non-persist parity) now compares sorted
 member lines — group emission order is not part of the contract.
+
+**R3 evidence:** single-node `smoke_itrace_dataset.sh` ×2 reproduced the
+6/6/6/12 baseline with `index_loaded=true` persist hits;
+`smoke_mih_nodes_persist.sh` ×2 (`r7c`, `r7d`) each showed the
+mono-build → `_mn` build → `_mn` hit → mono-hit transition with
+`ITMIHN1`/`ITMIHP1` coexistence and identical membership;
+`smoke_mih_nodes.sh` parity green. See
+`datasets/built/reports/PHASE7_R3_DOUBLE_REGRESSION.md`.
 
 Remaining follow-ups: real RPC transport + service discovery (non-goal
 for now), cross-node dedup of `project_{id}_crop/` under multi-node,

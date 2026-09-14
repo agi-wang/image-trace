@@ -1,0 +1,16 @@
+{
+  "key_count": 8,
+  "magic": "ITMIHN1",
+  "node_id": 3,
+  "range": {
+    "end": 256,
+    "start": 192
+  },
+  "shard_bits": 8,
+  "shard_ids": [
+    206,
+    207,
+    239
+  ],
+  "version": 1
+}
