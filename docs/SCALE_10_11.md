@@ -216,7 +216,7 @@ still forces a rebuild.
 | 6 | Persisted HNSW graph + sharded semantic recall | **done — R1 `hnsw.bin` + R2 harness + R3 double regression** |
 | 7 | `ITMIHN1` multi-node MIH project persist | **done — R1 wire + R2 harness + R3 double regression** |
 | 8 | Multi-node semantic/HNSW sharding | **done — R1 `project_{id}_sem_mn/` (`ITSEMN1`) + R2 harness + R3 double regression** |
-| 9 | Multi-node crop/slice MIH sharding | **in progress — R1 `project_{id}_crop_mn/` (`ITMIHCN1`)** |
+| 9 | Multi-node crop/slice MIH sharding | **in progress — R1 `project_{id}_crop_mn/` (`ITMIHCN1`) + R2 harness done** |
 
 ### Phase 1 delivered
 
@@ -628,7 +628,7 @@ identical membership; `smoke_semantic_persist.sh` (`r8e`) green. See
 Remaining follow-ups: real RPC/service discovery (non-goal).
 Multi-node crop/slice sharding landed in Phase 9 R1 below.
 
-### Phase 9 (in progress — R1) — multi-node crop/slice MIH sharding
+### Phase 9 (in progress — R1+R2 done) — multi-node crop/slice MIH sharding
 
 **R1 — `project_{id}_crop_mn/` (`ITMIHCN1` v1).** When
 `ITRACE_MIH_NODES` > 1 *and* `ITRACE_MIH_INDEX_DIR` is set, the
@@ -673,8 +673,17 @@ still cache-hits) and `crop_index_multi_invalidation` (node_count /
 fingerprint / image-set / missing node dir / corrupt node meta /
 corrupt top meta → rebuild; rebuilt bundle cache-hits).
 
+**R2 — persist smoke harness.** `scripts/smoke_crop_mn_persist.sh`
+runs one project through five scans on a shared index dir — single-node
+build (`project_{id}_crop/`, `crop_index_loaded=false`) → multi-node
+build (`_crop_mn`, `crop_index_loaded=false`) → multi-node hit
+(`crop_index_loaded=true`) → single-node hit → multi-node hit again —
+and fails unless `_crop_mn` has the ITMIHCN1 top meta + contiguous
+`ranges` + `node_{i}/` ITMIHC1 bundles, `project_{id}_crop/` keeps
+`ITMIHC1`, and all five scans emit identical sorted group membership.
+
 Remaining follow-ups: real RPC/service discovery (non-goal),
-crop-mn smoke harness + double-regression evidence (R2/R3).
+double-regression evidence (R3).
 
 | Variable | Effect |
 |----------|--------|

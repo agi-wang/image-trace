@@ -1,43 +1,43 @@
 duplicate group 1:
-  - sem_pollen_wiki__orig.png (7)
-  - sem_pollen_wiki__rot90.png (8)
-  - sem_pollen_wiki__hflip.png (9)
-  - sem_pollen_wiki__crop70.png (10)
-  - sem_pollen_wiki__slice_r0c0.png (11)
-  - sem_pollen_wiki__slice_r1c1.png (12)
-duplicate group 2:
   - skimage_ihc__orig.png (31)
   - skimage_ihc__rot90.png (32)
   - skimage_ihc__hflip.png (33)
   - skimage_ihc__crop70.png (34)
   - skimage_ihc__slice_r0c0.png (35)
   - skimage_ihc__slice_r1c1.png (36)
-duplicate group 3:
-  - fluor_cells__orig.png (19)
-  - fluor_cells__rot90.png (20)
-  - fluor_cells__hflip.png (21)
-  - fluor_cells__crop70.png (22)
-  - fluor_cells__slice_r0c0.png (23)
-  - fluor_cells__slice_r1c1.png (24)
-duplicate group 4:
-  - fluor_synth_1__orig.png (13)
-  - fluor_synth_1__rot90.png (14)
-  - fluor_synth_1__hflip.png (15)
-  - fluor_synth_1__crop70.png (16)
-  - fluor_synth_1__slice_r0c0.png (17)
-  - fluor_synth_1__slice_r1c1.png (18)
-duplicate group 5:
+duplicate group 2:
   - sem_synth_1__orig.png (1)
   - sem_synth_1__rot90.png (2)
   - sem_synth_1__hflip.png (3)
   - sem_synth_1__crop70.png (4)
   - sem_synth_1__slice_r0c0.png (5)
   - sem_synth_1__slice_r1c1.png (6)
-duplicate group 6:
+duplicate group 3:
+  - sem_pollen_wiki__orig.png (7)
+  - sem_pollen_wiki__rot90.png (8)
+  - sem_pollen_wiki__hflip.png (9)
+  - sem_pollen_wiki__crop70.png (10)
+  - sem_pollen_wiki__slice_r0c0.png (11)
+  - sem_pollen_wiki__slice_r1c1.png (12)
+duplicate group 4:
   - histo_synth_1__orig.png (25)
   - histo_synth_1__rot90.png (26)
   - histo_synth_1__hflip.png (27)
   - histo_synth_1__crop70.png (28)
   - histo_synth_1__slice_r0c0.png (29)
   - histo_synth_1__slice_r1c1.png (30)
-scan: 6.08s, 6 dup groups
+duplicate group 5:
+  - fluor_synth_1__orig.png (13)
+  - fluor_synth_1__rot90.png (14)
+  - fluor_synth_1__hflip.png (15)
+  - fluor_synth_1__crop70.png (16)
+  - fluor_synth_1__slice_r0c0.png (17)
+  - fluor_synth_1__slice_r1c1.png (18)
+duplicate group 6:
+  - fluor_cells__orig.png (19)
+  - fluor_cells__rot90.png (20)
+  - fluor_cells__hflip.png (21)
+  - fluor_cells__crop70.png (22)
+  - fluor_cells__slice_r0c0.png (23)
+  - fluor_cells__slice_r1c1.png (24)
+scan: 6.59s, 6 dup groups
