@@ -215,7 +215,7 @@ still forces a rebuild.
 | 5 | ONNX `SemanticEmbedder` backend + persisted semantic bundle | **done — R1 ONNX skeleton + R2 `project_{id}_sem/` persist/fingerprint + R3 double regression** |
 | 6 | Persisted HNSW graph + sharded semantic recall | **done — R1 `hnsw.bin` + R2 harness + R3 double regression** |
 | 7 | `ITMIHN1` multi-node MIH project persist | **done — R1 wire + R2 harness + R3 double regression** |
-| 8 | Multi-node semantic/HNSW sharding | **in progress — R1 `project_{id}_sem_mn/` (`ITSEMN1`)** |
+| 8 | Multi-node semantic/HNSW sharding | **in progress — R1 `project_{id}_sem_mn/` (`ITSEMN1`) + R2 harness done** |
 
 ### Phase 1 delivered
 
@@ -556,7 +556,7 @@ Remaining follow-ups: real RPC transport + service discovery (non-goal
 for now), cross-node dedup of `project_{id}_crop/` under multi-node.
 Multi-node semantic/HNSW sharding landed in Phase 8 R1 below.
 
-### Phase 8 (in progress — R1) — multi-node semantic/HNSW sharding
+### Phase 8 (in progress — R1+R2 done) — multi-node semantic/HNSW sharding
 
 **R1 — `project_{id}_sem_mn/` (`ITSEMN1` v1).** When `ITRACE_SEMANTIC`
 is armed *and* `ITRACE_MIH_NODES` > 1 *and* `ITRACE_MIH_INDEX_DIR` is
@@ -607,9 +607,18 @@ rebuilds one node → candidate parity vs single-node) and
 image-set / missing node dir / corrupt node meta / corrupt top meta →
 rebuild; rebuilt bundle cache-hits).
 
+**R2 — persist smoke harness.** `scripts/smoke_semantic_mn_persist.sh`
+runs one armed-stub project through five scans on a shared index dir —
+single-node build (`project_{id}_sem/`, `sem_hnsw_loaded=false`) →
+multi-node build (`_sem_mn`, `sem_hnsw_loaded=false`) → multi-node hit
+(`+N sem (cached)`, `sem_hnsw_loaded=true`) → single-node hit →
+multi-node hit again — and fails unless `_sem_mn` has the ITSEMN1 top
+meta + contiguous `ranges` + `node_{i}/` ITSEMP1/ITSEMH1 layout,
+`project_{id}_sem/` keeps `ITSEMP1`, and all five scans emit identical
+sorted group membership (semantic stays candidates-only).
+
 Remaining follow-ups: real RPC/service discovery (non-goal),
-`project_{id}_crop/` multi-node dedup, semantic-mn smoke harness +
-double-regression evidence (R2/R3).
+`project_{id}_crop/` multi-node dedup, double-regression evidence (R3).
 
 | Variable | Effect |
 |----------|--------|
