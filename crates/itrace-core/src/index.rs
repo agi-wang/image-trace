@@ -63,6 +63,12 @@
 //! fingerprint catches feature-blob changes that leave the image set
 //! unchanged — recomputed vectors, newly registered features, etc.
 //!
+//! With `ITRACE_MIH_NODES` > 1 the scan runs on in-process
+//! `MultiNodeMihIndex` clusters and persists under the sibling
+//! `project_{id}_mn/` (`ITMIHN1` meta + `indexes/{a}/` cluster dirs +
+//! `node_N/` shards) with the same invalidation axes plus `node_count`.
+//! The single-node `project_{id}/` (`ITMIHP1`) layout stays untouched.
+//!
 //! # Crop/slice recall channel (`project_{id}_crop/`)
 //!
 //! Whole-image gate hashes cannot recall crops/slices (they move too many
@@ -782,11 +788,210 @@ pub fn load_or_build_project_gate_index(
     Ok((indexes, image_ids, false))
 }
 
+// ---------- multi-node project bundle (`project_{id}_mn/`, ITMIHN1) ----------
+
+/// `project_{id}_mn/` — multi-node sibling of the single-node
+/// `project_{id}/` gate bundle, used when `ITRACE_MIH_NODES` > 1 so the
+/// two layouts never collide (flipping the node count can't silently
+/// reuse the wrong format; a nodes change rebuilds the `_mn` bundle):
+///
+/// ```text
+/// project_{id}_mn/
+///   meta.json      {"magic":"ITMIHN1","version":1,"shard_bits":N,
+///                   "node_count":N,"gate_algo_count":M,"image_count":K,
+///                   "feature_fingerprint":"<blake3 hex>"}
+///   image_ids.bin  K × i64 LE — owner slots, sorted ascending
+///   indexes/{a}/   MultiNodeMihIndex::save_dir — top-level ITMIHN1
+///                  meta (shard_bits + ownership ranges) + node_N/
+///                  dirs, each node_N/meta.json + shards/NNNN.bin
+/// ```
+fn project_mih_multi_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut s = dir.as_os_str().to_os_string();
+    s.push("_mn");
+    s.into()
+}
+
+/// Per-algo `MultiNodeMihIndex` build — same owner plan and key
+/// dedup as [`build_sharded_indexes`], even shard ownership split.
+fn build_multi_indexes(
+    entries: &[DedupKeys],
+    shard_bits: u32,
+    nodes: u32,
+    owner_for_entry: &[u32],
+) -> Vec<crate::ownership::MultiNodeMihIndex> {
+    let m = entries[0].variant_keys.len();
+    (0..m)
+        .into_par_iter()
+        .map(|a| {
+            let mut idx = crate::ownership::MultiNodeMihIndex::even(shard_bits, nodes);
+            let mut uniq: Vec<u64> = Vec::new();
+            for (i, e) in entries.iter().enumerate() {
+                uniq.clear();
+                uniq.extend_from_slice(&e.variant_keys[a]);
+                uniq.sort_unstable();
+                uniq.dedup();
+                let owner = owner_for_entry[i];
+                for &key in &uniq {
+                    idx.insert(key, owner);
+                }
+            }
+            idx
+        })
+        .collect()
+}
+
+/// Save a `project_{id}_mn/` bundle (layout above). Overwrites `dir`.
+fn save_project_gate_index_multi(
+    dir: &std::path::Path,
+    indexes: &[crate::ownership::MultiNodeMihIndex],
+    image_ids: &[i64],
+    shard_bits: u32,
+    nodes: u32,
+    fingerprint: &str,
+) -> std::io::Result<()> {
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    let key_count: usize = indexes.iter().map(|i| i.len()).sum();
+    let meta = serde_json::json!({
+        "magic": "ITMIHN1",
+        "version": 1,
+        "shard_bits": shard_bits,
+        "node_count": nodes,
+        "gate_algo_count": indexes.len(),
+        "image_count": image_ids.len(),
+        "key_count": key_count,
+        "feature_fingerprint": fingerprint,
+    });
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_vec_pretty(&meta)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+    )?;
+    write_image_ids_bin(&dir.join("image_ids.bin"), image_ids)?;
+    let indexes_dir = dir.join("indexes");
+    std::fs::create_dir_all(&indexes_dir)?;
+    for (a, idx) in indexes.iter().enumerate() {
+        idx.save_dir(&indexes_dir.join(a.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Try to load a `project_{id}_mn/` bundle compatible with `entries`,
+/// `shard_bits`, and `nodes`. Same invalidation axes as the single-node
+/// [`try_load_project_gate_index`] plus `node_count`; per-algo cluster
+/// dirs are loaded via `MultiNodeMihIndex::load_dir` (which itself
+/// rejects bad magic, incomplete/overlapping ranges, and shard_bits
+/// mismatch). Any failure → `None` (caller rebuilds).
+fn try_load_project_gate_index_multi(
+    dir: &std::path::Path,
+    entries: &[DedupKeys],
+    shard_bits: u32,
+    nodes: u32,
+) -> std::io::Result<Option<(Vec<crate::ownership::MultiNodeMihIndex>, Vec<i64>)>> {
+    if entries.is_empty() || entries[0].variant_keys.is_empty() {
+        return Ok(None);
+    }
+    let meta_path = dir.join("meta.json");
+    if !meta_path.is_file() {
+        return Ok(None);
+    }
+    let meta_bytes = std::fs::read(&meta_path)?;
+    let meta: serde_json::Value = match serde_json::from_slice(&meta_bytes) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let m = entries[0].variant_keys.len();
+    let field = |k: &str| meta.get(k).and_then(|v| v.as_u64());
+    if meta.get("magic").and_then(|v| v.as_str()) != Some("ITMIHN1")
+        || field("version") != Some(1)
+        || field("shard_bits") != Some(shard_bits as u64)
+        || field("node_count") != Some(nodes as u64)
+        || field("gate_algo_count") != Some(m as u64)
+    {
+        return Ok(None);
+    }
+    let image_count = field("image_count").unwrap_or(0) as usize;
+    let image_ids = match read_image_ids_bin(&dir.join("image_ids.bin"), image_count) {
+        Ok(ids) => ids,
+        Err(_) => return Ok(None),
+    };
+    if !image_id_sets_equal(&image_ids, entries.iter().map(|e| e.image_id).collect()) {
+        return Ok(None);
+    }
+    if meta.get("feature_fingerprint").and_then(|v| v.as_str())
+        != Some(gate_fingerprint(entries).as_str())
+    {
+        return Ok(None);
+    }
+    let indexes_dir = dir.join("indexes");
+    let mut indexes = Vec::with_capacity(m);
+    for a in 0..m {
+        let path = indexes_dir.join(a.to_string());
+        if !path.is_dir() {
+            return Ok(None);
+        }
+        match crate::ownership::MultiNodeMihIndex::load_dir(&path) {
+            Ok(idx) if idx.shard_bits() == shard_bits && idx.node_count() == nodes => {
+                indexes.push(idx)
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some((indexes, image_ids)))
+}
+
+/// Load a compatible `project_{id}_mn/` bundle or build+save one.
+/// `index_loaded` is true when an existing on-disk bundle was reused.
+fn load_or_build_project_gate_index_multi(
+    dir: &std::path::Path,
+    entries: &[DedupKeys],
+    shard_bits: u32,
+    nodes: u32,
+) -> std::io::Result<(Vec<crate::ownership::MultiNodeMihIndex>, Vec<i64>, bool)> {
+    if let Some((indexes, image_ids)) =
+        try_load_project_gate_index_multi(dir, entries, shard_bits, nodes)?
+    {
+        return Ok((indexes, image_ids, true));
+    }
+    let (image_ids, owner_for_entry) = owner_plan(entries);
+    let indexes = build_multi_indexes(entries, shard_bits, nodes, &owner_for_entry);
+    save_project_gate_index_multi(
+        dir,
+        &indexes,
+        &image_ids,
+        shard_bits,
+        nodes,
+        &gate_fingerprint(entries),
+    )?;
+    Ok((indexes, image_ids, false))
+}
+
+/// Owner-slot-keyed MIH query contract shared by [`ShardedMihIndex`]
+/// (single-node) and [`crate::ownership::MultiNodeMihIndex`] (in-process
+/// multi-node) — both answer `query_into(key, radius)` with owner slots.
+pub trait MihQueryIndex: Sync {
+    fn query_into(&self, key: u64, radius: u32, out: &mut Vec<u32>);
+}
+
+impl MihQueryIndex for ShardedMihIndex {
+    fn query_into(&self, key: u64, radius: u32, out: &mut Vec<u32>) {
+        ShardedMihIndex::query_into(self, key, radius, out)
+    }
+}
+
+impl MihQueryIndex for crate::ownership::MultiNodeMihIndex {
+    fn query_into(&self, key: u64, radius: u32, out: &mut Vec<u32>) {
+        crate::ownership::MultiNodeMihIndex::query_into(self, key, radius, out)
+    }
+}
+
 /// Query pre-built per-algo indexes. Owners in the indexes are dense slots
 /// into `image_ids`; returned pairs are **entry indices** into `entries`.
-pub fn dedup_candidates_with_indexes(
+pub fn dedup_candidates_with_indexes<I: MihQueryIndex>(
     entries: &[DedupKeys],
-    indexes: &[ShardedMihIndex],
+    indexes: &[I],
     image_ids: &[i64],
     radius: u32,
     min_votes: u32,
@@ -862,12 +1067,23 @@ pub fn dedup_candidates_sharded_cached(
     if entries.is_empty() || entries[0].variant_keys.is_empty() {
         return Ok((Vec::new(), false));
     }
+    let nodes = mih_node_count();
+    if nodes > 1 {
+        // Multi-node scan: persist under the `project_{id}_mn/` sibling
+        // (ITMIHN1) so the single-node `project_{id}/` bundle stays
+        // untouched — flipping `ITRACE_MIH_NODES` back to 1 never reads a
+        // multi-node bundle and vice versa.
+        let mn_dir = project_mih_multi_dir(dir);
+        let (indexes, image_ids, loaded) =
+            load_or_build_project_gate_index_multi(&mn_dir, entries, shard_bits, nodes)?;
+        let pairs = dedup_candidates_with_indexes(entries, &indexes, &image_ids, radius, min_votes);
+        return Ok((pairs, loaded));
+    }
     let (indexes, image_ids, loaded) =
         load_or_build_project_gate_index(dir, entries, shard_bits)?;
     let pairs = dedup_candidates_with_indexes(entries, &indexes, &image_ids, radius, min_votes);
     Ok((pairs, loaded))
 }
-
 
 /// Emit candidate image-index pairs flagged within `radius` bits by at
 /// least `min_votes` DISTINCT gate algorithms (one vote per algorithm,
@@ -936,12 +1152,13 @@ pub fn dedup_candidates(entries: &[DedupKeys], radius: u32, min_votes: u32) -> V
     out
 }
 
-/// Dev/test knob: `ITRACE_MIH_NODES=N` (N > 1) makes the **non-persistent**
-/// candidate scan run on an in-process [`crate::ownership::MultiNodeMihIndex`]
-/// — same recall contract, exercised through shard-ownership routing +
+/// Dev/test knob: `ITRACE_MIH_NODES=N` (N > 1) makes the candidate scan
+/// run on an in-process [`crate::ownership::MultiNodeMihIndex`] — same
+/// recall contract, exercised through shard-ownership routing +
 /// scatter/gather. Default/unset/invalid = 1 → plain `ShardedMihIndex`.
-/// Persistent project bundles (`dedup_candidates_sharded_cached` with a dir)
-/// always use the single-node `ITMIHP1` format.
+/// With `ITRACE_MIH_INDEX_DIR` set the multi-node scan persists under
+/// `project_{id}_mn/` (ITMIHN1); N ≤ 1 keeps the single-node
+/// `ITMIHP1`/`project_{id}/` format untouched.
 fn mih_node_count() -> u32 {
     std::env::var("ITRACE_MIH_NODES")
         .ok()
@@ -1581,11 +1798,16 @@ mod tests {
         assert_eq!(conf0, conf5);
     }
 
+    /// Tests mutating `ITRACE_MIH_NODES` race in the default parallel
+    /// test harness; serialize them behind one lock.
+    static NODES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// `ITRACE_MIH_NODES>1` routes the in-memory scan through
     /// `MultiNodeMihIndex`; candidate pairs must be identical to the
     /// single-node path.
     #[test]
     fn dedup_candidates_sharded_multi_node_env_parity() {
+        let _guard = NODES_ENV_LOCK.lock().unwrap();
         let entries = sample_entries(40);
         let want = dedup_candidates_sharded(&entries, 7, 2, 5); // env unset → mono
         std::env::set_var("ITRACE_MIH_NODES", "4");
@@ -1692,6 +1914,10 @@ mod tests {
 
     #[test]
     fn project_gate_index_save_load_same_candidates() {
+        // Lock + force-unset so the single-node layout assertions can't
+        // race a multi-node env mutation in a parallel test.
+        let _guard = NODES_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ITRACE_MIH_NODES");
         let entries = sample_entries(30);
         let shard_bits = 4u32;
         let dir = std::env::temp_dir().join(format!(
@@ -1724,6 +1950,8 @@ mod tests {
 
     #[test]
     fn project_gate_index_invalidates_on_image_set_change() {
+        let _guard = NODES_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ITRACE_MIH_NODES");
         let mut entries = sample_entries(20);
         let shard_bits = 3u32;
         let dir = std::env::temp_dir().join(format!(
@@ -1769,6 +1997,8 @@ mod tests {
     /// old meta could not see.
     #[test]
     fn project_gate_index_invalidates_on_feature_change() {
+        let _guard = NODES_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ITRACE_MIH_NODES");
         let mut entries = sample_entries(20);
         let shard_bits = 3u32;
         let dir = std::env::temp_dir().join(format!(
@@ -1798,6 +2028,122 @@ mod tests {
             dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
                 .expect("reload after rebuild");
         assert_eq!(pairs3, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ITRACE_MIH_NODES>1` + `ITRACE_MIH_INDEX_DIR`: the multi-node scan
+    /// persists under `project_{id}_mn/` (ITMIHN1), leaves the
+    /// single-node `project_{id}/` slot untouched, and a second scan
+    /// loads the cluster bundles with identical candidate pairs.
+    #[test]
+    fn project_gate_index_multi_node_roundtrip() {
+        let entries = sample_entries(30);
+        let shard_bits = 4u32;
+        let dir =
+            std::env::temp_dir().join(format!("itrace-mih-mn-{}-{}", std::process::id(), 0x4444));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(project_mih_multi_dir(&dir));
+
+        let _guard = NODES_ENV_LOCK.lock().unwrap();
+        std::env::set_var("ITRACE_MIH_NODES", "4");
+        let r1 = dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir));
+        let r2 = dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir));
+        std::env::remove_var("ITRACE_MIH_NODES");
+        let (pairs1, loaded1) = r1.expect("build");
+        let (pairs2, loaded2) = r2.expect("load");
+        assert!(!loaded1, "first multi-node call should build");
+        assert!(loaded2, "second multi-node call should load");
+        assert_eq!(pairs1, pairs2);
+
+        // The _mn sibling got the ITMIHN1 cluster layout; the plain
+        // project_{id}/ dir must NOT have been written.
+        let mn = project_mih_multi_dir(&dir);
+        assert!(mn.join("meta.json").is_file());
+        assert!(mn.join("image_ids.bin").is_file());
+        assert!(mn.join("indexes/0/meta.json").is_file());
+        assert!(mn.join("indexes/0/node_0").is_dir());
+        let top_meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(mn.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(top_meta["magic"], "ITMIHN1");
+        assert_eq!(top_meta["node_count"], 4);
+        assert!(!dir.join("meta.json").exists());
+
+        // Parity: candidate set equals the single-node fresh build.
+        let expected = dedup_candidates_sharded(&entries, 7, 2, shard_bits);
+        assert_eq!(pairs1, expected);
+
+        // Back to nodes=1 on the same dir: uses project_{id}/ (ITMIHP1),
+        // and the _mn bundle is left alone.
+        let (p3, l3) = dedup_candidates_sharded_cached(&entries, 7, 2, shard_bits, Some(&dir))
+            .expect("single-node build");
+        assert!(!l3);
+        let meta1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta1["magic"], "ITMIHP1");
+        assert_eq!(p3, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&mn);
+    }
+
+    /// Every invalidation axis on the `_mn` bundle forces a rebuild —
+    /// never a silent reuse of a stale multi-node index.
+    #[test]
+    fn project_gate_index_multi_node_invalidation() {
+        let mut entries = sample_entries(20);
+        let shard_bits = 3u32;
+        let dir = std::env::temp_dir().join(format!(
+            "itrace-mih-mn-inv-{}-{}",
+            std::process::id(),
+            0x5555
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let build = |e: &[DedupKeys], bits: u32, nodes: u32| {
+            load_or_build_project_gate_index_multi(&dir, e, bits, nodes).unwrap()
+        };
+
+        let (_, _, l1) = build(&entries, shard_bits, 4);
+        assert!(!l1);
+        let (_, _, l2) = build(&entries, shard_bits, 4);
+        assert!(l2, "unchanged bundle must hit");
+
+        // shard_bits mismatch → rebuild
+        let (_, _, l) = build(&entries, shard_bits + 1, 4);
+        assert!(!l);
+        // node_count mismatch → rebuild (stored bits=4,nodes=4 now)
+        let (_, _, l) = build(&entries, shard_bits + 1, 8);
+        assert!(!l);
+        let (_, _, l) = build(&entries, shard_bits + 1, 8);
+        assert!(l, "rebuilt bundle for new geometry must hit");
+
+        // image-set change → rebuild
+        let mut extra = sample_entries(1);
+        extra[0].image_id = 9999;
+        entries.push(extra.remove(0));
+        let (_, _, l) = build(&entries, shard_bits + 1, 8);
+        assert!(!l, "changed image set must invalidate");
+
+        // feature fingerprint change → rebuild
+        entries[0].variant_keys[0][0] ^= 0x1;
+        let (_, _, l) = build(&entries, shard_bits + 1, 8);
+        assert!(!l, "mutated feature must invalidate");
+
+        // missing per-algo cluster dir → rebuild
+        std::fs::remove_dir_all(dir.join("indexes/1")).unwrap();
+        let (_, _, l) = build(&entries, shard_bits + 1, 8);
+        assert!(!l, "incomplete cluster dirs must invalidate");
+
+        // corrupt cluster meta (bad magic) → load_dir fails → rebuild
+        let bad_meta = r#"{"magic":"WRONG","version":1}"#;
+        std::fs::write(dir.join("indexes/0/meta.json"), bad_meta).unwrap();
+        let (_, _, l) = build(&entries, shard_bits + 1, 8);
+        assert!(!l, "bad cluster magic must invalidate");
+
+        // top-level bad magic → rebuild
+        std::fs::write(dir.join("meta.json"), bad_meta).unwrap();
+        let (_, _, l) = build(&entries, shard_bits + 1, 8);
+        assert!(!l, "bad top-level magic must invalidate");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

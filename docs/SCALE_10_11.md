@@ -313,12 +313,13 @@ stay in memory only. Round-trip parity vs the live index and a
 monolithic `ShardedMihIndex` is tested.
 
 **Simulating N nodes.** `ITRACE_MIH_NODES=N` (N > 1) routes the
-non-persistent gate scan (`dedup_candidates_sharded`, used by
-`dedup_confirmed` when no index dir is set) through a
+gate scan (`dedup_candidates_sharded` / `dedup_confirmed`) through a
 `MultiNodeMihIndex` — inserts routed by ownership, queries
 scatter/gathered. Default/unset/invalid = 1 → unchanged
-`ShardedMihIndex`. Persistent `ITMIHP1`/`ITMIHC1` bundles always stay
-single-node. Example:
+`ShardedMihIndex`. With `ITRACE_MIH_INDEX_DIR` set, the persistent
+bundle follows the same switch: `project_{id}/` (`ITMIHP1`) for
+single-node, `project_{id}_mn/` (`ITMIHN1`) for N > 1 (Phase 7 R1).
+Example:
 
 ```bash
 ITRACE_MIH_NODES=4 itrace-cli dedup 7   # 4 logical nodes in-process
@@ -329,9 +330,9 @@ coordinator, replaces each `NodeIndex` with a transport stub
 implementing `insert(shard_id, key, owner)` /
 `query_shards(key, radius, &[shard_ids])`, and merges replies exactly
 as `query_with_nodes` does — no semantic change to probe sets, recall,
-or the downstream `dedup_confirmed` re-scoring. Real transport, service
-discovery, and wiring the `ITMIHN1` per-node dirs into the persistent
-project bundle flow are follow-up work.
+or the downstream `dedup_confirmed` re-scoring. Real transport and
+service discovery are follow-up work; wiring `ITMIHN1` cluster dirs
+into the persistent project bundle flow landed in Phase 7 R1.
 
 ### Phase 4 (done — foundation) — semantic recall channel
 
@@ -501,6 +502,39 @@ Remaining follow-ups: multi-node semantic/HNSW sharding (per-shard graph
 or per-node full graph) once the `ITMIHN1` seam is real; graph format
 compaction (u16 neighbour refs, omitting stored vecs by deriving them
 from `vectors.bin`) if bundle size matters.
+
+### Phase 7 (in progress — R1 wired) — ITMIHN1 project persist
+
+**R1 — `project_{id}_mn/` (`ITMIHN1` v1).** When `ITRACE_MIH_INDEX_DIR`
+is set *and* `ITRACE_MIH_NODES` > 1, the gate scan persists the
+in-process `MultiNodeMihIndex` clusters under a sibling directory of
+`project_{id}/` rather than inside it — the `ITMIHP1` single-node format
+is untouched, so flipping `ITRACE_MIH_NODES` between 1 and N>1 can never
+read a bundle of the wrong shape:
+
+```text
+project_{id}_mn/
+  meta.json      {"magic":"ITMIHN1","version":1,"shard_bits":N,
+                  "node_count":M,"gate_algo_count":A,"image_count":K,
+                  "key_count":T,"feature_fingerprint":"<blake3 hex>"}
+  image_ids.bin  K × i64 LE — owner slots, sorted ascending
+  indexes/{a}/   one MultiNodeMihIndex::save_dir cluster per gate algo:
+                 top-level ITMIHN1 meta (ranges) + node_N/ dirs with
+                 owned non-empty shards (same NNNN.bin LE payload)
+```
+
+Load requires exact match of `shard_bits`, `node_count`,
+`gate_algo_count`, the sorted image_id set, and the BLAKE3
+`feature_fingerprint`; each cluster additionally re-validates its
+`ITMIHN1` ranges and shard geometry through `MultiNodeMihIndex::load_dir`.
+Any miss → rebuild + overwrite, never silent reuse. `index_loaded=true`
+on a hit reflects cluster restore, not rebuild. Tests cover round-trip
+parity vs a live multi-node index, and shard_bits/node_count/image-set/
+fingerprint/corrupt-cluster-magic/missing-node-dir invalidation.
+
+Remaining follow-ups: real RPC transport + service discovery (non-goal
+for now), cross-node dedup of `project_{id}_crop/` under multi-node,
+multi-node semantic/HNSW sharding.
 
 | Variable | Effect |
 |----------|--------|
