@@ -1159,7 +1159,7 @@ pub fn dedup_candidates(entries: &[DedupKeys], radius: u32, min_votes: u32) -> V
 /// With `ITRACE_MIH_INDEX_DIR` set the multi-node scan persists under
 /// `project_{id}_mn/` (ITMIHN1); N ≤ 1 keeps the single-node
 /// `ITMIHP1`/`project_{id}/` format untouched.
-fn mih_node_count() -> u32 {
+pub fn mih_node_count() -> u32 {
     std::env::var("ITRACE_MIH_NODES")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
