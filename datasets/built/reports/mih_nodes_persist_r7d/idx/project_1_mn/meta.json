@@ -1,0 +1,10 @@
+{
+  "feature_fingerprint": "88b10c660eb34a59997647c739438b6cfa87c2104c1592fbf3877da98ac9cee6",
+  "gate_algo_count": 4,
+  "image_count": 8,
+  "key_count": 240,
+  "magic": "ITMIHN1",
+  "node_count": 4,
+  "shard_bits": 8,
+  "version": 1
+}

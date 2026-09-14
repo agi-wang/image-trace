@@ -1,0 +1,11 @@
+duplicate group 1 (confidence 1.0000):
+  - sem_synth_1__orig.png (1)
+  - sem_synth_1__rot90.png (2)
+  - sem_synth_1__hflip.png (3)
+  - sem_synth_1__crop70.png (4)
+  - sem_synth_1__slice_r0c0.png (5)
+duplicate group 2 (confidence 1.0000):
+  - fluor_synth_1__orig.png (6)
+  - fluor_synth_1__rot90.png (7)
+  - fluor_synth_1__crop70.png (8)
+indexed 8, candidates 4 (+12 crop), naive 28, 2 dup groups / 8 images, scan 0.249s, index_loaded=false, crop_index_loaded=true
